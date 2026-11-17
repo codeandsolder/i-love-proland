@@ -1,0 +1,16 @@
+[package]
+name = "i-love-proland"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Deterministic, topology-aware placement of forests and general world objects"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/codeandsolder/i-love-proland"
+readme = "README.md"
+keywords = ["procedural", "scatter", "terrain", "planet", "deterministic"]
+categories = ["game-development", "graphics", "algorithms"]
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
