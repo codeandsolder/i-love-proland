@@ -337,12 +337,13 @@ mod tests {
             bake_colored_mesh(&vertices, &indices, 32, 2).unwrap()
         );
         let width = usize::try_from(atlas.width()).unwrap();
+        let pixels = atlas.rgba();
         for row in 0..4 {
             for col in 0..8 {
                 let samples = (0..32_usize).flat_map(|y| {
                     (0..32_usize).map(move |x| {
                         let idx = 4 * ((row * 32 + y) * width + col * 32 + x);
-                        atlas.rgba()[idx + 3]
+                        pixels[idx + 3]
                     })
                 });
                 assert!(
