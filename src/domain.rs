@@ -22,6 +22,10 @@ impl CubeFace {
         Self::NegativeZ,
     ];
 
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "layout v1 freezes arithmetic order"
+    )]
     fn direction(self, u: f64, v: f64) -> [f64; 3] {
         let xyz = match self {
             Self::PositiveX => [1.0, v, -u],
@@ -45,10 +49,12 @@ pub struct TileKey {
 }
 
 impl TileKey {
+    #[must_use]
     pub const fn planar(x: i64, y: i64) -> Self {
         Self { face: None, x, y }
     }
 
+    #[must_use]
     pub const fn spherical(face: CubeFace, x: i64, y: i64) -> Self {
         Self {
             face: Some(face),
@@ -57,14 +63,17 @@ impl TileKey {
         }
     }
 
+    #[must_use]
     pub const fn face(self) -> Option<CubeFace> {
         self.face
     }
 
+    #[must_use]
     pub const fn x(self) -> i64 {
         self.x
     }
 
+    #[must_use]
     pub const fn y(self) -> i64 {
         self.y
     }
@@ -130,15 +139,15 @@ impl Domain {
         Ok(())
     }
 
-    pub fn tiles_per_face(self, cells_per_tile: u32) -> Option<u32> {
+    #[must_use]
+    pub const fn tiles_per_face(self, cells_per_tile: u32) -> Option<u32> {
         match self {
-            Self::Planar { .. } => None,
             Self::Spherical { face_cells, .. }
                 if cells_per_tile != 0 && face_cells % cells_per_tile == 0 =>
             {
                 Some(face_cells / cells_per_tile)
             }
-            Self::Spherical { .. } => None,
+            _ => None,
         }
     }
 
@@ -169,13 +178,14 @@ pub struct SurfaceCell {
 }
 
 impl SurfaceCell {
-    pub(crate) fn new(domain: Domain, face: Option<CubeFace>, x: i64, y: i64) -> Self {
+    pub(crate) const fn new(domain: Domain, face: Option<CubeFace>, x: i64, y: i64) -> Self {
         Self { face, x, y, domain }
     }
 
     /// Upper bound of the physical area density under the cell's cube-map
     /// parameterization. This is an exact Jacobian supremum, not a centre
     /// approximation, so thinning produces uniform spherical intensity.
+    #[must_use]
     pub fn upper_area_m2(self) -> f64 {
         match self.domain {
             Domain::Planar { cell_size_m } => cell_size_m * cell_size_m,
@@ -192,12 +202,27 @@ impl SurfaceCell {
         }
     }
 
-    /// Given parameter-space uniform numbers, return an anchor and the
-    /// thinning ratio in [0,1]. For a planar cell the ratio is always 1.
-    pub fn sample(self, u: f64, v: f64) -> (Anchor, f64) {
-        debug_assert!((0.0..1.0).contains(&u) && (0.0..1.0).contains(&v));
-        match self.domain {
-            Domain::Planar { cell_size_m } => (
+    /// Given parameter-space uniform numbers, return an anchor and a
+    /// sphere-Jacobian thinning ratio in [0,1].
+    ///
+    /// # Errors
+    /// Rejects nonfinite/out-of-range fractions or inconsistent domain faces.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "integer cell coordinates are projected to f64 space"
+    )]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "layout v1 freezes arithmetic order"
+    )]
+    pub fn sample(self, u: f64, v: f64) -> Result<(Anchor, f64)> {
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return Err(Error::InvalidConfiguration(
+                "sample fractions must be finite in [0,1)",
+            ));
+        }
+        let result = match self.domain {
+            Domain::Planar { cell_size_m } if self.face.is_none() => (
                 Anchor::Planar {
                     x_m: (self.x as f64 + u) * cell_size_m,
                     y_m: (self.y as f64 + v) * cell_size_m,
@@ -205,6 +230,7 @@ impl SurfaceCell {
                 1.0,
             ),
             Domain::Spherical { face_cells, .. } => {
+                let face = self.face.ok_or(Error::InvalidTile)?;
                 let (u0, u1) = bounds(self.x, face_cells);
                 let (v0, v1) = bounds(self.y, face_cells);
                 let a = u0 + (u1 - u0) * u;
@@ -213,15 +239,21 @@ impl SurfaceCell {
                 let ratio = ((1.0 + min2) / (1.0 + a * a + b * b)).powf(1.5);
                 (
                     Anchor::Spherical {
-                        direction: self.face.expect("validated spherical tile").direction(a, b),
+                        direction: face.direction(a, b),
                     },
                     ratio.min(1.0),
                 )
             }
-        }
+            Domain::Planar { .. } => return Err(Error::InvalidTile),
+        };
+        Ok(result)
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "cube face indices are validated as u32 and exactly representable"
+)]
 fn bounds(index: i64, face_cells: u32) -> (f64, f64) {
     let lo = -1.0 + 2.0 * index as f64 / f64::from(face_cells);
     let hi = -1.0 + 2.0 * (index + 1) as f64 / f64::from(face_cells);
@@ -256,7 +288,7 @@ mod tests {
                 24,
                 31,
             );
-            let (Anchor::Spherical { direction }, weight) = cell.sample(0.3, 0.7) else {
+            let (Anchor::Spherical { direction }, weight) = cell.sample(0.3, 0.7).unwrap() else {
                 panic!("expected sphere");
             };
             assert!((weight > 0.0) && weight <= 1.0);
@@ -268,6 +300,24 @@ mod tests {
     }
 
     #[test]
+    fn invalid_public_sampling_inputs_return_errors() {
+        let planar = SurfaceCell::new(Domain::Planar { cell_size_m: 4.0 }, None, 1, -2);
+        assert!(planar.sample(f64::NAN, 0.5).is_err());
+        assert!(planar.sample(-0.01, 0.5).is_err());
+        assert!(planar.sample(1.0, 0.5).is_err());
+        let invalid_face = SurfaceCell::new(
+            Domain::Spherical {
+                radius_m: 100.0,
+                face_cells: 16,
+            },
+            None,
+            0,
+            0,
+        );
+        assert!(invalid_face.sample(0.5, 0.5).is_err());
+    }
+
+    #[test]
     fn cubemap_jacobian_decreases_toward_corners() {
         let domain = Domain::Spherical {
             radius_m: 100.0,
@@ -276,6 +326,6 @@ mod tests {
         let centre = SurfaceCell::new(domain, Some(CubeFace::PositiveZ), 7, 7);
         let corner = SurfaceCell::new(domain, Some(CubeFace::PositiveZ), 0, 0);
         assert!(centre.upper_area_m2() > corner.upper_area_m2());
-        assert!(corner.sample(0.8, 0.8).1 <= 1.0);
+        assert!(corner.sample(0.8, 0.8).unwrap().1 <= 1.0);
     }
 }

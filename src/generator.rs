@@ -41,6 +41,8 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// # Errors
+    /// Rejects invalid densities, duplicate model IDs and invalid weights.
     pub fn new(
         id: u64,
         density_per_m2: f64,
@@ -78,6 +80,7 @@ impl Layer {
         })
     }
 
+    #[must_use]
     pub fn variants(&self) -> &[Variant] {
         &self.variants
     }
@@ -110,6 +113,9 @@ pub struct Candidate {
     pub layer_id: u64,
     pub cell: CellAddress,
     pub serial: u64,
+    /// Exact canonical sub-cell fractions, retaining precision even when a
+    /// planet-scale renderer cannot store huge absolute XY values precisely.
+    pub local_uv: [f64; 2],
     pub anchor: Anchor,
     /// Stable fraction in [0,1) for biome/density/thinning acceptance.
     pub habitat_mark: f64,
@@ -133,6 +139,8 @@ pub struct Generator {
 }
 
 impl Generator {
+    /// # Errors
+    /// Rejects invalid topologies, cell sizes and zero candidate budgets.
     pub fn new(domain: Domain, config: GeneratorConfig) -> Result<Self> {
         domain.validate(config.cells_per_tile)?;
         if config.max_proposals_per_tile == 0 {
@@ -151,24 +159,31 @@ impl Generator {
         Ok(Self { domain, config })
     }
 
-    pub fn domain(self) -> Domain {
+    #[must_use]
+    pub const fn domain(self) -> Domain {
         self.domain
     }
 
-    pub fn config(self) -> GeneratorConfig {
+    #[must_use]
+    pub const fn config(self) -> GeneratorConfig {
         self.config
     }
 
     /// Generate a tile without any habitat filtering. Order and placement do
     /// not depend on camera, thread scheduling or neighbouring tile requests.
+    /// # Errors
+    /// Rejects invalid tile addresses or exhausted candidate budgets.
     pub fn tile(self, tile: TileKey, layer: &Layer) -> Result<Vec<Instance>> {
         self.tile_with_habitat(tile, layer, |_| 1.0)
     }
 
-    /// A pure acceptance function should return a deterministic fraction
-    /// [0,1] based on *canonical* terrain/biome data and this fixed candidate.
-    /// For runtime visual placement, transform `candidate.anchor` separately
-    /// onto whatever mesh LOD is currently displayed.
+    /// A pure acceptance function returns a deterministic fraction [0,1]
+    /// based on canonical habitat data. Visual mesh LOD must not decide
+    /// object *existence*; only project the fixed object anchor.
+    ///
+    /// # Errors
+    /// Rejects invalid tiles, invalid habitat fractions, excessive densities
+    /// for stratification, and proposal budget or coordinate overflow.
     pub fn tile_with_habitat<F>(
         self,
         tile: TileKey,
@@ -180,122 +195,136 @@ impl Generator {
     {
         self.domain
             .validate_tile(tile, self.config.cells_per_tile)?;
-        let n = i64::from(self.config.cells_per_tile);
-        let origin_x = tile.x().checked_mul(n).ok_or(Error::IndexOverflow)?;
-        let origin_y = tile.y().checked_mul(n).ok_or(Error::IndexOverflow)?;
+        let edge = i64::from(self.config.cells_per_tile);
+        let origin_x = tile.x().checked_mul(edge).ok_or(Error::IndexOverflow)?;
+        let origin_y = tile.y().checked_mul(edge).ok_or(Error::IndexOverflow)?;
         let mut out = Vec::new();
         let mut proposals = 0_usize;
-        for dy in 0..n {
-            for dx in 0..n {
-                let x = origin_x.checked_add(dx).ok_or(Error::IndexOverflow)?;
-                let y = origin_y.checked_add(dy).ok_or(Error::IndexOverflow)?;
-                let cell = SurfaceCell::new(self.domain, tile.face(), x, y);
-                let address = CellAddress {
-                    face: tile.face(),
-                    x,
-                    y,
-                };
-                let seed = hash_words(&[
-                    0xd1d5_4cf6_1fe7_2b63,
-                    u64::from(LAYOUT_VERSION),
-                    self.config.world_seed,
-                    layer.id,
-                    u64::from(tile.face().map_or(0, |v| v as u8)),
-                    x as u64,
-                    y as u64,
-                ]);
-                let mut random = Rng::new(seed);
-                let intensity = cell.upper_area_m2() * layer.density_per_m2;
-                if !intensity.is_finite() {
-                    return Err(Error::InvalidConfiguration(
-                        "cell expected population overflows f64",
-                    ));
-                }
-
-                let mut emit = |serial: u64, local_u: f64, local_v: f64, random: &mut Rng| {
-                    let (anchor, jacobian_fraction) = cell.sample(local_u, local_v);
-                    if random.unit() > jacobian_fraction {
-                        return Ok(());
-                    }
-                    let id = (u128::from(hash_words(&[seed, serial, 0xb441_cac6_cafe_bab1])) << 64)
-                        | u128::from(hash_words(&[seed, serial, 0x7265_6e64_6572_6572]));
-                    let candidate = Candidate {
-                        id,
-                        layer_id: layer.id,
-                        cell: address,
-                        serial,
-                        anchor,
-                        habitat_mark: random.unit(),
-                        yaw_turns: random.unit(),
-                        size_unit: random.unit(),
-                        appearance_unit: random.unit(),
-                    };
-                    let habitat_fraction = habitat(&candidate);
-                    if !habitat_fraction.is_finite() || !(0.0..=1.0).contains(&habitat_fraction) {
-                        return Err(Error::InvalidHabitat);
-                    }
-                    if candidate.habitat_mark < habitat_fraction {
-                        out.push(Instance {
-                            variant_id: choose_variant_validated(id, layer.variants()),
-                            candidate,
-                        });
-                    }
-                    Ok::<(), Error>(())
-                };
-
-                match layer.distribution {
-                    Distribution::Poisson => {
-                        // The exponential interarrival construction creates
-                        // a true homogeneous PPP over parameter-space cells;
-                        // exact Jacobian thinning gives homogeneous physical
-                        // surface density on the cube sphere.
-                        let mut distance = 0.0_f64;
-                        let mut serial = 0_u64;
-                        loop {
-                            let step = -random.unit().ln();
-                            let next = distance + step;
-                            if next <= distance {
-                                return Err(Error::CandidateLimitExceeded);
-                            }
-                            distance = next;
-                            if distance > intensity {
-                                break;
-                            }
-                            proposals = proposals
-                                .checked_add(1)
-                                .ok_or(Error::CandidateLimitExceeded)?;
-                            if proposals > self.config.max_proposals_per_tile {
-                                return Err(Error::CandidateLimitExceeded);
-                            }
-                            let u = random.unit();
-                            let v = random.unit();
-                            emit(serial, u, v, &mut random)?;
-                            serial = serial.checked_add(1).ok_or(Error::CandidateLimitExceeded)?;
-                        }
-                    }
-                    Distribution::Stratified => {
-                        if intensity > 1.0 {
-                            return Err(Error::DensityExceedsStratification);
-                        }
-                        if random.unit() < intensity {
-                            proposals = proposals
-                                .checked_add(1)
-                                .ok_or(Error::CandidateLimitExceeded)?;
-                            if proposals > self.config.max_proposals_per_tile {
-                                return Err(Error::CandidateLimitExceeded);
-                            }
-                            // A quarter-cell margin across tile and cube-face
-                            // boundaries gives a finite minimum separation
-                            // between candidates on adjacent planar cells.
-                            let u = 0.25 + 0.5 * random.unit();
-                            let v = 0.25 + 0.5 * random.unit();
-                            emit(0, u, v, &mut random)?;
-                        }
-                    }
-                }
+        for offset_y in 0..edge {
+            for offset_x in 0..edge {
+                let cell_x = origin_x.checked_add(offset_x).ok_or(Error::IndexOverflow)?;
+                let cell_y = origin_y.checked_add(offset_y).ok_or(Error::IndexOverflow)?;
+                let cell = SurfaceCell::new(self.domain, tile.face(), cell_x, cell_y);
+                self.collect_cell(cell, layer, &habitat, &mut out, &mut proposals)?;
             }
         }
         Ok(out)
+    }
+
+    /// Canonical cells, not visible render tiles, seed every placement.
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "layout v1 freezes the jitter arithmetic order"
+    )]
+    fn collect_cell<F>(
+        self,
+        cell: SurfaceCell,
+        layer: &Layer,
+        habitat: &F,
+        out: &mut Vec<Instance>,
+        proposals: &mut usize,
+    ) -> Result<()>
+    where
+        F: Fn(&Candidate) -> f64,
+    {
+        let address = CellAddress {
+            face: cell.face,
+            x: cell.x,
+            y: cell.y,
+        };
+        let seed = hash_words(&[
+            0xd1d5_4cf6_1fe7_2b63,
+            u64::from(LAYOUT_VERSION),
+            self.config.world_seed,
+            layer.id,
+            u64::from(cell.face.map_or(0, |face| face as u8)),
+            u64::from_ne_bytes(cell.x.to_ne_bytes()),
+            u64::from_ne_bytes(cell.y.to_ne_bytes()),
+        ]);
+        let mut random = Rng::new(seed);
+        let intensity = cell.upper_area_m2() * layer.density_per_m2;
+        if !intensity.is_finite() {
+            return Err(Error::InvalidConfiguration(
+                "cell expected population overflows f64",
+            ));
+        }
+
+        let mut emit = |serial: u64, local_u: f64, local_v: f64, random: &mut Rng| {
+            let (anchor, jacobian_fraction) = cell.sample(local_u, local_v)?;
+            if random.unit() > jacobian_fraction {
+                return Ok(());
+            }
+            let id = (u128::from(hash_words(&[seed, serial, 0xb441_cac6_cafe_bab1])) << 64)
+                | u128::from(hash_words(&[seed, serial, 0x7265_6e64_6572_6572]));
+            let candidate = Candidate {
+                id,
+                layer_id: layer.id,
+                cell: address,
+                serial,
+                local_uv: [local_u, local_v],
+                anchor,
+                habitat_mark: random.unit(),
+                yaw_turns: random.unit(),
+                size_unit: random.unit(),
+                appearance_unit: random.unit(),
+            };
+            let fraction = habitat(&candidate);
+            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+                return Err(Error::InvalidHabitat);
+            }
+            if candidate.habitat_mark < fraction {
+                out.push(Instance {
+                    variant_id: choose_variant_validated(id, layer.variants()),
+                    candidate,
+                });
+            }
+            Ok::<(), Error>(())
+        };
+
+        match layer.distribution {
+            Distribution::Poisson => {
+                let mut distance = 0.0_f64;
+                let mut serial = 0_u64;
+                loop {
+                    let step = -random.unit().ln();
+                    let next = distance + step;
+                    if next <= distance {
+                        return Err(Error::CandidateLimitExceeded);
+                    }
+                    distance = next;
+                    if distance > intensity {
+                        break;
+                    }
+                    *proposals = proposals
+                        .checked_add(1)
+                        .ok_or(Error::CandidateLimitExceeded)?;
+                    if *proposals > self.config.max_proposals_per_tile {
+                        return Err(Error::CandidateLimitExceeded);
+                    }
+                    let u = random.unit();
+                    let v = random.unit();
+                    emit(serial, u, v, &mut random)?;
+                    serial = serial.checked_add(1).ok_or(Error::CandidateLimitExceeded)?;
+                }
+            }
+            Distribution::Stratified => {
+                if intensity > 1.0 {
+                    return Err(Error::DensityExceedsStratification);
+                }
+                if random.unit() < intensity {
+                    *proposals = proposals
+                        .checked_add(1)
+                        .ok_or(Error::CandidateLimitExceeded)?;
+                    if *proposals > self.config.max_proposals_per_tile {
+                        return Err(Error::CandidateLimitExceeded);
+                    }
+                    let u = 0.25 + 0.5 * random.unit();
+                    let v = 0.25 + 0.5 * random.unit();
+                    emit(0, u, v, &mut random)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -517,6 +546,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn layout_v1_golden_spherical_placement() {
+        // Frozen vectors from the first public v1 generator. Refactors must
+        // not silently relocate persistent objects or change model selection.
+        let scene = Generator::new(
+            Domain::Spherical {
+                radius_m: 600_000.0,
+                face_cells: 1 << 18,
+            },
+            GeneratorConfig {
+                world_seed: 0x5ec0_ffee,
+                cells_per_tile: 16,
+                ..GeneratorConfig::default()
+            },
+        )
+        .unwrap();
+        let oak = Layer::new(
+            0x004f_414b,
+            0.015,
+            Distribution::Stratified,
+            vec![
+                Variant {
+                    id: 1001,
+                    weight: 3.0,
+                },
+                Variant {
+                    id: 1002,
+                    weight: 1.0,
+                },
+            ],
+        )
+        .unwrap();
+        let instances = scene
+            .tile_with_habitat(
+                TileKey::spherical(CubeFace::PositiveZ, 65_000 / 16, 66_000 / 16),
+                &oak,
+                |candidate| if candidate.cell.x % 7 == 0 { 0.2 } else { 0.9 },
+            )
+            .unwrap();
+        assert_eq!(instances.len(), 42);
+        let first = instances.first().unwrap();
+        assert_eq!(
+            first.candidate.id,
+            154533613205574063414866829586011445627_u128
+        );
+        assert_eq!(first.variant_id, 1002);
+        assert_eq!(
+            first.candidate.anchor,
+            Anchor::Spherical {
+                direction: [
+                    -0.4115419164003406,
+                    -0.40527162064537636,
+                    0.8163260160897758
+                ],
+            }
+        );
     }
 
     #[test]

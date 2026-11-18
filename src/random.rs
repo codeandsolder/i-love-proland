@@ -1,7 +1,7 @@
-//! Fixed, specification-independent hashing. Never substitute DefaultHasher
+//! Fixed, specification-independent hashing. Never substitute the standard-library default hasher
 //! or a platform RNG: persistent object IDs rely on these exact bits.
 
-pub(crate) fn mix64(mut x: u64) -> u64 {
+pub const fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;
@@ -9,7 +9,7 @@ pub(crate) fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-pub(crate) fn hash_words(words: &[u64]) -> u64 {
+pub fn hash_words(words: &[u64]) -> u64 {
     let mut h = 0x6a09_e667_f3bc_c909_u64;
     for &w in words {
         h = mix64(h ^ mix64(w.wrapping_add(0x9e37_79b9_7f4a_7c15)));
@@ -18,20 +18,24 @@ pub(crate) fn hash_words(words: &[u64]) -> u64 {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct Rng(u64);
+pub struct Rng(u64);
 
 impl Rng {
-    pub(crate) fn new(seed: u64) -> Self {
+    pub const fn new(seed: u64) -> Self {
         Self(seed)
     }
 
-    pub(crate) fn next_u64(&mut self) -> u64 {
+    pub const fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         mix64(self.0)
     }
 
     /// Uniform open interval (0,1). The half-unit offset prevents ln(0).
-    pub(crate) fn unit(&mut self) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "shifted integer has only 53 bits and converts exactly to f64"
+    )]
+    pub fn unit(&mut self) -> f64 {
         (((self.next_u64() >> 11) as f64) + 1.0) / 9_007_199_254_740_994.0
     }
 }
