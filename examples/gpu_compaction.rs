@@ -217,7 +217,7 @@ fn gpu_parity(
         let bytes = readback(device, buffer)?;
         let visible_bytes = usize::try_from(count)? * core::mem::size_of::<PackedInstance>();
         let mut gpu = BTreeMap::new();
-        for record in bytes[..visible_bytes].chunks_exact(64) {
+        for record in bytes[..visible_bytes].as_chunks::<64>().0 {
             let object = bytemuck::pod_read_unaligned::<PackedInstance>(record);
             assert!(gpu.insert(object.stable_id(), object).is_none());
             assert!(unique.insert(object.stable_id()));

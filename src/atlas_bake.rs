@@ -20,9 +20,9 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0].mul_add(b[0], a[1].mul_add(b[1], a[2] * b[2]))
 }
 
-fn basis(azimuth: u32, elevation: u32) -> ([f32; 3], [f32; 3], [f32; 3]) {
-    let azi = azimuth as f32 * TAU / AZIMUTH_VIEWS as f32;
-    let elev = elevation as f32 * FRAC_PI_2 / (ELEVATION_VIEWS - 1) as f32;
+fn basis(azimuth: u16, elevation: u16) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let azi = f32::from(azimuth) * TAU / 8.0;
+    let elev = f32::from(elevation) * FRAC_PI_2 / 3.0;
     let (sin_azi, cos_azi) = azi.sin_cos();
     let (sin_elev, cos_elev) = elev.sin_cos();
     let eye = [sin_azi * cos_elev, sin_elev, cos_azi * cos_elev];
@@ -53,13 +53,13 @@ fn edge(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
     (p[0] - a[0]).mul_add(b[1] - a[1], -(p[1] - a[1]) * (b[0] - a[0]))
 }
 
-fn raster_triangle(triangle: [Sample; 3], side: usize, depth: &mut [f32], color: &mut [[f32; 4]]) {
+fn raster_triangle(triangle: [Sample; 3], side: u16, depth: &mut [f32], color: &mut [[f32; 4]]) {
     let [a, b, c] = triangle;
     let area = edge(a.pixel, b.pixel, c.pixel);
     if area.abs() < 0.00001 {
         return;
     }
-    let upper = side.saturating_sub(1) as f32;
+    let upper = f32::from(side.saturating_sub(1));
     let lower_x = a.pixel[0]
         .min(b.pixel[0])
         .min(c.pixel[0])
@@ -85,28 +85,31 @@ fn raster_triangle(triangle: [Sample; 3], side: usize, depth: &mut [f32], color:
     // are finite because model vertices were validated before projection.
     #[expect(
         clippy::cast_possible_truncation,
+        reason = "finite raster values are clamped into the allocated square"
+    )]
+    #[expect(
         clippy::cast_sign_loss,
-        reason = "finite clamped raster coordinates are within the allocated square"
+        reason = "clamping to zero excludes negative raster coordinates"
     )]
     let (min_x, max_x, min_y, max_y) = (
-        lower_x as usize,
-        upper_x as usize,
-        lower_y as usize,
-        upper_y as usize,
+        lower_x as u16,
+        upper_x as u16,
+        lower_y as u16,
+        upper_y as u16,
     );
     for y in min_y..=max_y {
         for x in min_x..=max_x {
-            let point = [x as f32 + 0.5, y as f32 + 0.5];
+            let point = [f32::from(x) + 0.5, f32::from(y) + 0.5];
             let weights = [
                 edge(b.pixel, c.pixel, point) / area,
                 edge(c.pixel, a.pixel, point) / area,
                 edge(a.pixel, b.pixel, point) / area,
             ];
-            if weights.iter().any(|&w| w < -0.000001) {
+            if weights.iter().any(|&w| w < -0.000_001) {
                 continue;
             }
             let z = weights[0].mul_add(a.depth, weights[1].mul_add(b.depth, weights[2] * c.depth));
-            let at = y * side + x;
+            let at = usize::from(y) * usize::from(side) + usize::from(x);
             if z <= depth[at] {
                 continue;
             }
@@ -128,18 +131,19 @@ fn raster_triangle(triangle: [Sample; 3], side: usize, depth: &mut [f32], color:
 fn render_view(
     vertices: &[TreeVertex],
     indices: &[usize],
-    side: usize,
-    azi: u32,
-    elev: u32,
+    side: u16,
+    azi: u16,
+    elev: u16,
 ) -> Vec<[f32; 4]> {
-    let mut depth = vec![f32::NEG_INFINITY; side * side];
-    let mut color = vec![[0.0_f32; 4]; side * side];
+    let extent = usize::from(side);
+    let mut depth = vec![f32::NEG_INFINITY; extent * extent];
+    let mut color = vec![[0.0_f32; 4]; extent * extent];
     let (eye, right, up) = basis(azi, elev);
     let projected: Vec<_> = vertices
         .iter()
-        .map(|vertex| project(vertex, eye, right, up, side as f32))
+        .map(|vertex| project(vertex, eye, right, up, f32::from(side)))
         .collect();
-    for face in indices.chunks_exact(3) {
+    for face in indices.as_chunks::<3>().0 {
         let samples = [projected[face[0]], projected[face[1]], projected[face[2]]];
         raster_triangle(samples, side, &mut depth, &mut color);
     }
@@ -149,6 +153,10 @@ fn render_view(
 #[expect(
     clippy::cast_possible_truncation,
     reason = "caller explicitly clamps the float to [0,1] before 8-bit quantization"
+)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "saturating clamp excludes negative values before u8 quantization"
 )]
 fn to_byte(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
@@ -231,7 +239,7 @@ fn downsample(
 /// Geometry is in a unit bounding sphere around the canonical object center.
 /// This basic reference baker uses vertex colors and cutout opacity. Hosts
 /// with textured or wind-animated source foliage may instead supply their
-/// own pre-rendered AtlasImage using the same camera-basis/view ordering.
+/// own pre-rendered `AtlasImage` using the same camera-basis/view ordering.
 ///
 /// # Errors
 /// Rejects empty/non-triangular/out-of-range meshes, non-finite geometry,
@@ -278,23 +286,17 @@ pub fn bake_colored_mesh(
         .iter()
         .map(|&i| usize::try_from(i).map_err(|_| Error::IndexOverflow))
         .collect::<Result<Vec<_>>>()?;
+    let row_count = u16::try_from(ELEVATION_VIEWS).map_err(|_| Error::IndexOverflow)?;
+    let col_count = u16::try_from(AZIMUTH_VIEWS).map_err(|_| Error::IndexOverflow)?;
+    let side = u16::try_from((tile - 2 * padding) * 2).map_err(|_| Error::IndexOverflow)?;
     let mut rgba = vec![0_u8; width * height * 4];
-    for row in 0..ELEVATION_VIEWS {
-        for col in 0..AZIMUTH_VIEWS {
-            let supersampled = render_view(
-                vertices,
-                &checked_indices,
-                (tile - 2 * padding) * 2,
-                col,
-                row,
-            );
+    for row in 0..row_count {
+        for col in 0..col_count {
+            let supersampled = render_view(vertices, &checked_indices, side, col, row);
             downsample(
                 &mut rgba,
                 width,
-                [
-                    usize::try_from(col).map_err(|_| Error::IndexOverflow)? * tile,
-                    usize::try_from(row).map_err(|_| Error::IndexOverflow)? * tile,
-                ],
+                [usize::from(col) * tile, usize::from(row) * tile],
                 tile,
                 padding,
                 &supersampled,

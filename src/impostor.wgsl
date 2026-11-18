@@ -80,21 +80,18 @@ fn impostor_vs(
     let radius = object.position_radius.w;
     let to_eye = normalize(-center);
 
-    // Camera-facing orthonormal frame, with a stable fallback straight above
-    // the tree. The upright silhouette stays legible looking straight down.
-    var right = cross(to_eye, vec3<f32>(0.0, 1.0, 0.0));
-    if (dot(right, right) < 0.00001) {
-        right = vec3<f32>(1.0, 0.0, 0.0);
-    }
-    right = normalize(right);
-    let up = normalize(cross(right, to_eye));
+    // Analytic billboard frame: remains continuous into directly overhead
+    // views and shares the same azimuth convention as the atlas baker.
+    let world_azimuth = atan2(to_eye.x, to_eye.z);
+    let right = vec3<f32>(-cos(world_azimuth), 0.0, sin(world_azimuth));
+    let up = cross(right, to_eye);
 
     // The source atlas uses a 2-radii orthographic footprint for all views.
     let uv = vec2<f32>(f32(vertex_id & 1u), f32(vertex_id >> 1u));
     let corners = uv * 2.0 - vec2<f32>(1.0);
     let world = center + radius * (right * corners.x + up * corners.y);
 
-    let azimuth = fract(atan2(to_eye.x, to_eye.z) / TAU - object.attributes.x)
+    let azimuth = fract(world_azimuth / TAU - object.attributes.x)
         * AZIMUTH_VIEWS;
     let a0 = floor(azimuth);
     let a1 = (a0 + 1.0) % AZIMUTH_VIEWS;

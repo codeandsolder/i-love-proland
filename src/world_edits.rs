@@ -166,10 +166,10 @@ impl<T> WorldEdits<T> {
     /// Remove an edit and resume the canonical generated instance.
     pub fn restore_generated(&mut self, id: u128) -> Option<GeneratedChange<T>> {
         let old = self.generated.remove(&id);
-        if let Some(GeneratedChange::Modified(modification)) = &old {
-            if modification.destination != modification.source {
-                self.unindex(modification.destination, ObjectKey::Generated(id));
-            }
+        if let Some(GeneratedChange::Modified(modification)) = &old
+            && modification.destination != modification.source
+        {
+            self.unindex(modification.destination, ObjectKey::Generated(id));
         }
         old
     }
@@ -269,15 +269,15 @@ impl<T> WorldEdits<T> {
         change: GeneratedChange<T>,
     ) -> Option<GeneratedChange<T>> {
         let old = self.generated.remove(&id);
-        if let Some(GeneratedChange::Modified(modification)) = &old {
-            if modification.destination != modification.source {
-                self.unindex(modification.destination, ObjectKey::Generated(id));
-            }
+        if let Some(GeneratedChange::Modified(modification)) = &old
+            && modification.destination != modification.source
+        {
+            self.unindex(modification.destination, ObjectKey::Generated(id));
         }
-        if let GeneratedChange::Modified(modification) = &change {
-            if modification.destination != modification.source {
-                self.index(modification.destination, ObjectKey::Generated(id));
-            }
+        if let GeneratedChange::Modified(modification) = &change
+            && modification.destination != modification.source
+        {
+            self.index(modification.destination, ObjectKey::Generated(id));
         }
         self.generated.insert(id, change);
         old

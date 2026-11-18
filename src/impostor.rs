@@ -84,7 +84,10 @@ impl AtlasImage {
     /// # Errors
     /// Rejects inconsistent image byte lengths and inadequate tile padding.
     pub fn new(tile_size: u32, gutter: u32, rgba: Vec<u8>) -> Result<Self> {
-        if tile_size < 8 || gutter == 0 || u64::from(gutter) * 4 >= u64::from(tile_size) {
+        if !(8..=512).contains(&tile_size)
+            || gutter == 0
+            || u64::from(gutter) * 4 >= u64::from(tile_size)
+        {
             return Err(Error::InvalidConfiguration(
                 "invalid impostor tile size/gutter",
             ));
@@ -160,11 +163,13 @@ impl AtlasImage {
             wgpu::util::TextureDataOrder::LayerMajor,
             &self.rgba,
         );
-        let view = texture.create_view(&Default::default());
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let tile = f32::from(u16::try_from(self.tile_size).map_err(|_| Error::IndexOverflow)?);
+        let gutter = f32::from(u16::try_from(self.gutter).map_err(|_| Error::IndexOverflow)?);
         Ok(AtlasTexture {
             _texture: texture,
             view,
-            gutter_fraction: self.gutter as f32 / self.tile_size as f32,
+            gutter_fraction: gutter / tile,
         })
     }
 }
@@ -244,19 +249,17 @@ fn render_pipeline(
     pipeline_layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
     name: &'static str,
-    vertex_entry: &'static str,
-    fragment_entry: &'static str,
+    entry_points: (&'static str, &'static str),
     vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-    color_format: wgpu::TextureFormat,
-    depth_format: wgpu::TextureFormat,
+    formats: (wgpu::TextureFormat, wgpu::TextureFormat),
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(name),
         layout: Some(pipeline_layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some(vertex_entry),
-            compilation_options: Default::default(),
+            entry_point: Some(entry_points.0),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: vertex_buffers,
         },
         primitive: wgpu::PrimitiveState {
@@ -265,19 +268,19 @@ fn render_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: depth_format,
+            format: formats.1,
             depth_write_enabled: Some(true),
             depth_compare: Some(wgpu::CompareFunction::Less),
-            stencil: Default::default(),
-            bias: Default::default(),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(fragment_entry),
-            compilation_options: Default::default(),
+            entry_point: Some(entry_points.1),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: color_format,
+                format: formats.0,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -433,22 +436,18 @@ impl TreeRenderer {
             &pipeline_layout,
             &shader,
             "i-love-proland instanced source trees",
-            "mesh_vs",
-            "mesh_fs",
+            ("mesh_vs", "mesh_fs"),
             &vertex_layout,
-            color_format,
-            depth_format,
+            (color_format, depth_format),
         );
         let impostor_pipeline = render_pipeline(
             device,
             &pipeline_layout,
             &shader,
             "i-love-proland instanced impostors",
-            "impostor_vs",
-            "impostor_fs",
+            ("impostor_vs", "impostor_fs"),
             &[],
-            color_format,
-            depth_format,
+            (color_format, depth_format),
         );
         let quad_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("i-love-proland billboard quad 6 indices"),
@@ -470,12 +469,7 @@ impl TreeRenderer {
     pub fn set_camera(&self, queue: &wgpu::Queue, camera: TreeCamera) {
         let uniform = DrawUniform {
             projection: camera.projection,
-            atlas: [
-                AZIMUTH_VIEWS as f32,
-                ELEVATION_VIEWS as f32,
-                self.gutter_fraction,
-                0.0,
-            ],
+            atlas: [8.0, 4.0, self.gutter_fraction, 0.0],
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniform));
     }
