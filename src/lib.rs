@@ -23,11 +23,16 @@ mod generator;
 mod random;
 mod selection;
 mod stream;
+mod world_edits;
 
 pub use domain::{Anchor, CubeFace, Domain, SurfaceCell, TileKey};
 pub use error::{Error, Result};
 pub use generator::{
-    Candidate, Distribution, Generator, GeneratorConfig, Instance, LAYOUT_VERSION, Layer,
+    Candidate, CellAddress, Distribution, Generator, GeneratorConfig, Instance, LAYOUT_VERSION,
+    Layer,
 };
 pub use selection::{Variant, choose_variant};
 pub use stream::{CellRect, TileWindow};
+pub use world_edits::{
+    AddedObject, GeneratedChange, GeneratedState, Modification, ObjectKey, VisibleExtra, WorldEdits,
+};
