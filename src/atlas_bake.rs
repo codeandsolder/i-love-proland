@@ -378,6 +378,9 @@ pub fn bake_scene(surfaces: &[BakeSurface<'_>], tile_size: u32, gutter: u32) -> 
 }
 
 /// Convenience entrypoint for a source with one material.
+///
+/// # Errors
+/// Returns an error for invalid geometry, UVs, material cutoff or atlas dimensions.
 pub fn bake_mesh(
     vertices: &[TreeVertex],
     indices: &[u32],
