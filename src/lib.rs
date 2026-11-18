@@ -18,7 +18,11 @@
 //! No source code or assets from the original Proland project are included.
 
 #[cfg(feature = "gpu")]
+pub mod atlas_bake;
+#[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(feature = "gpu")]
+pub mod impostor;
 
 mod domain;
 mod error;

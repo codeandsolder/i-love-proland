@@ -2,7 +2,7 @@
 name = "i-love-proland"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.100"
 description = "Deterministic, topology-aware placement of forests and general world objects"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/codeandsolder/i-love-proland"
@@ -26,4 +26,8 @@ pollster = "0.4"
 
 [[example]]
 name = "gpu_compaction"
+required-features = ["gpu"]
+
+[[example]]
+name = "forest_render"
 required-features = ["gpu"]

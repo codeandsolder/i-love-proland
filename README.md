@@ -163,6 +163,29 @@ enable wgpu. See the [GPU architecture, ABI and integration guide](docs/gpu.md)
 for shader bindings, indirect-draw layouts, reproducibility boundaries and
 resource limits.
 
+### Actual near-tree meshes and 32-angle impostor draws
+
+The GPU feature also provides `impostor::TreeMesh` and `TreeRenderer`, which
+consume the two compacted instance buffers and **indexed-indirect draw counts**
+inside an existing wgpu render pass. It draws source triangle geometry nearby
+and upright camera-facing impostors at middle distance. The fixed
+**8 azimuth × 4 elevation** atlas supports overhead aircraft views and blends
+adjacent view angles without changing canonical object identities.
+
+A generic Rust reference baker (`atlas_bake::bake_colored_mesh`) generates the
+32-view atlas from colored triangles with depth testing, 2× supersampling and
+independently padded tiles. A headless Vulkan example creates a deterministic
+forest and actually renders both stages at **1280×720, 90° FOV**:
+
+```bash
+cargo +stable run --release --locked --features gpu --example forest_render -- /path/to/output-prefix
+```
+
+This is a generic colored-mesh sample; importing original KSP leaf textures,
+adding production alpha-coverage/mipmaps and the distant terrain canopy are
+separate integration tasks. See [impostor and rendering documentation](docs/impostors.md)
+for the GPU drawing contract and atlas convention.
+
 ### Planetary surfaces
 
 ```rust

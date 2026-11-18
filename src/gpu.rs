@@ -408,6 +408,16 @@ impl GpuCompactor {
     }
 
     #[must_use]
+    pub const fn mesh_index_count(&self) -> u32 {
+        self.mesh_template.index_count
+    }
+
+    #[must_use]
+    pub const fn impostor_index_count(&self) -> u32 {
+        self.impostor_template.index_count
+    }
+
+    #[must_use]
     pub const fn mesh_instances(&self) -> &wgpu::Buffer {
         &self.mesh
     }
