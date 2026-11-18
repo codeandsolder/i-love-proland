@@ -2,9 +2,12 @@
 //! and multi-angle impostors. Output PPM files can be converted to PNG with
 //! external conversion tools without adding runtime dependencies to the library.
 
-use i_love_proland::atlas_bake::bake_colored_mesh;
+use i_love_proland::atlas_bake::bake_mesh;
 use i_love_proland::gpu::{GpuCompactor, GpuView, PackedInstance, RenderPose};
-use i_love_proland::impostor::{AtlasImage, TreeCamera, TreeMesh, TreeRenderer, TreeVertex};
+use i_love_proland::impostor::{
+    AtlasImage, TreeCamera, TreeMesh, TreeRenderConfig, TreeRenderer, TreeVertex,
+};
+use i_love_proland::material::SourceImage;
 use i_love_proland::{Distribution, Domain, Generator, GeneratorConfig, Layer, TileKey, Variant};
 use std::error::Error;
 use std::fs;
@@ -35,7 +38,14 @@ fn append_ellipsoid(
                 (radii[2] * sin_lat).mul_add(cos_azi, center[2]),
                 1.0,
             ];
-            vertices.push(TreeVertex { position, color });
+            vertices.push(TreeVertex {
+                position,
+                color,
+                uv: [
+                    f32::from(side) / f32::from(SIDES),
+                    f32::from(layer) / f32::from(STACKS),
+                ],
+            });
         }
     }
     for layer in 0..STACKS {
@@ -60,10 +70,12 @@ fn sample_tree() -> Result<(Vec<TreeVertex>, Vec<u32>), Box<dyn Error>> {
         vertices.push(TreeVertex {
             position: [0.085 * sin_angle, -0.89, 0.085 * cos_angle, 1.0],
             color: brown,
+            uv: [0.5, 0.5],
         });
         vertices.push(TreeVertex {
             position: [0.069 * sin_angle, 0.37, 0.069 * cos_angle, 1.0],
             color: brown,
+            uv: [0.5, 0.5],
         });
     }
     for side in 0..SIDES {
@@ -542,13 +554,27 @@ fn benchmark_forest(device: &wgpu::Device, scene: &ForestPass<'_>) -> Result<f64
     Ok(start.elapsed().as_secs_f64() * 1000.0 / f64::from(FRAMES))
 }
 
+fn load_source_image(args: &[String]) -> Result<SourceImage, Box<dyn Error>> {
+    match args {
+        [] => Ok(SourceImage::white()),
+        [path, width, height] => Ok(SourceImage::new(
+            width.parse()?,
+            height.parse()?,
+            fs::read(path)?,
+        )?),
+        _ => Err("expected no material or <rgba-file> <width> <height>".into()),
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let prefix = std::env::args().nth(1).ok_or(
+    let mut args = std::env::args().skip(1);
+    let prefix = args.next().ok_or(
         "usage: cargo run --features gpu --example forest_render -- /path/to/output-prefix",
     )?;
     let (vertices, indices) = sample_tree()?;
+    let source = load_source_image(&args.collect::<Vec<_>>())?;
     let start = Instant::now();
-    let atlas = bake_colored_mesh(&vertices, &indices, 64, 2)?;
+    let atlas = bake_mesh(&vertices, &indices, &source, 0.45, 64, 2)?;
     let atlas_ms = start.elapsed().as_secs_f64() * 1000.0;
     write_atlas_preview(&format!("{prefix}-atlas.ppm"), &atlas)?;
 
@@ -562,13 +588,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         6,
     )?;
     let atlas_texture = atlas.upload(&device, &queue)?;
+    let source_texture = source.upload(&device, &queue)?;
     let renderer = TreeRenderer::new(
         &device,
         &compactor,
         &gpu_mesh,
         &atlas_texture,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-        wgpu::TextureFormat::Depth24Plus,
+        &source_texture,
+        TreeRenderConfig {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            depth_format: wgpu::TextureFormat::Depth24Plus,
+            sample_count: 1,
+            alpha_cutoff: 0.45,
+        },
     )?;
     let (low_camera, view) = pitched_view(0.0)?;
     renderer.set_camera(&queue, low_camera);

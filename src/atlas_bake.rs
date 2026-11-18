@@ -6,6 +6,7 @@
 //! per-view depth, and independent padded cells are deterministic.
 
 use crate::impostor::{AZIMUTH_VIEWS, AtlasImage, ELEVATION_VIEWS, TreeVertex};
+use crate::material::{SourceImage, linear_to_srgb};
 use crate::{Error, Result};
 use core::f32::consts::{FRAC_PI_2, TAU};
 
@@ -14,6 +15,14 @@ struct Sample {
     pixel: [f32; 2],
     depth: f32,
     color: [f32; 4],
+    uv: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+struct RasterMaterial<'a> {
+    source: &'a SourceImage,
+    texels: &'a [[f32; 4]],
+    cutoff: f32,
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -46,6 +55,7 @@ fn project(
         pixel: [(u + 1.0) * pixels * 0.5, (1.0 - v) * pixels * 0.5],
         depth: dot(position, eye),
         color: vertex.color,
+        uv: vertex.uv,
     }
 }
 
@@ -53,7 +63,13 @@ fn edge(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
     (p[0] - a[0]).mul_add(b[1] - a[1], -(p[1] - a[1]) * (b[0] - a[0]))
 }
 
-fn raster_triangle(triangle: [Sample; 3], side: u16, depth: &mut [f32], color: &mut [[f32; 4]]) {
+fn raster_triangle(
+    triangle: [Sample; 3],
+    side: u16,
+    depth: &mut [f32],
+    color: &mut [[f32; 4]],
+    material: RasterMaterial<'_>,
+) {
     let [a, b, c] = triangle;
     let area = edge(a.pixel, b.pixel, c.pixel);
     if area.abs() < 0.00001 {
@@ -113,17 +129,26 @@ fn raster_triangle(triangle: [Sample; 3], side: u16, depth: &mut [f32], color: &
             if z <= depth[at] {
                 continue;
             }
-            let rgba = core::array::from_fn(|i| {
+            let rgba: [f32; 4] = core::array::from_fn(|i| {
                 weights[0].mul_add(
                     a.color[i],
                     weights[1].mul_add(b.color[i], weights[2] * c.color[i]),
                 )
             });
-            if rgba[3] < 0.45 {
+            let uv: [f32; 2] = core::array::from_fn(|i| {
+                weights[0].mul_add(a.uv[i], weights[1].mul_add(b.uv[i], weights[2] * c.uv[i]))
+            });
+            let texel = material.source.sample(material.texels, uv);
+            if texel[3] * rgba[3] < material.cutoff {
                 continue;
             }
             depth[at] = z;
-            color[at] = rgba;
+            color[at] = [
+                texel[0] * rgba[0],
+                texel[1] * rgba[1],
+                texel[2] * rgba[2],
+                1.0,
+            ];
         }
     }
 }
@@ -134,6 +159,7 @@ fn render_view(
     side: u16,
     azi: u16,
     elev: u16,
+    material: RasterMaterial<'_>,
 ) -> Vec<[f32; 4]> {
     let extent = usize::from(side);
     let mut depth = vec![f32::NEG_INFINITY; extent * extent];
@@ -145,7 +171,7 @@ fn render_view(
         .collect();
     for face in indices.as_chunks::<3>().0 {
         let samples = [projected[face[0]], projected[face[1]], projected[face[2]]];
-        raster_triangle(samples, side, &mut depth, &mut color);
+        raster_triangle(samples, side, &mut depth, &mut color, material);
     }
     color
 }
@@ -192,9 +218,9 @@ fn downsample(
             }
             let color = if alpha > 0.0 {
                 [
-                    to_byte(premultiplied[0] / alpha),
-                    to_byte(premultiplied[1] / alpha),
-                    to_byte(premultiplied[2] / alpha),
+                    to_byte(linear_to_srgb(premultiplied[0] / alpha)),
+                    to_byte(linear_to_srgb(premultiplied[1] / alpha)),
+                    to_byte(linear_to_srgb(premultiplied[2] / alpha)),
                     to_byte(alpha * 0.25),
                 ]
             } else {
@@ -234,19 +260,24 @@ fn downsample(
     }
 }
 
-/// Bake a deterministic 32-angle, 2× supersampled atlas from colored triangles.
+/// Bake a deterministic 32-angle, 2× supersampled atlas using the original
+/// UV-mapped, alpha-masked sRGB texture and linear-light vertex tints.
 ///
-/// Geometry is in a unit bounding sphere around the canonical object center.
-/// This basic reference baker uses vertex colors and cutout opacity. Hosts
-/// with textured or wind-animated source foliage may instead supply their
-/// own pre-rendered `AtlasImage` using the same camera-basis/view ordering.
+/// The source geometry is normalized to the unit bounding sphere around
+/// the canonical object center. Each supersample independently tests the
+/// interpolated texture alpha * vertex alpha against the source cutoff,
+/// with a depth buffer so foliage behind holes remains visible.
+/// Resolve uses premultiplied linear color and preserves fractional pixel
+/// coverage. The output atlas is encoded back to sRGB.
 ///
 /// # Errors
 /// Rejects empty/non-triangular/out-of-range meshes, non-finite geometry,
 /// source points outside the unit sphere, and invalid tile parameters.
-pub fn bake_colored_mesh(
+pub fn bake_mesh(
     vertices: &[TreeVertex],
     indices: &[u32],
+    source: &SourceImage,
+    alpha_cutoff: f32,
     tile_size: u32,
     gutter: u32,
 ) -> Result<AtlasImage> {
@@ -257,6 +288,7 @@ pub fn bake_colored_mesh(
     }
     if vertices.iter().any(|v| {
         !v.position.iter().all(|x| x.is_finite())
+            || !v.uv.iter().all(|x| x.is_finite())
             || !v
                 .color
                 .iter()
@@ -271,6 +303,11 @@ pub fn bake_colored_mesh(
     {
         return Err(Error::InvalidConfiguration(
             "invalid atlas source vertex/index",
+        ));
+    }
+    if !alpha_cutoff.is_finite() || !(0.0..=1.0).contains(&alpha_cutoff) {
+        return Err(Error::InvalidConfiguration(
+            "invalid source material alpha cutoff",
         ));
     }
     if !(8..=512).contains(&tile_size) || gutter == 0 || gutter * 4 >= tile_size {
@@ -289,10 +326,16 @@ pub fn bake_colored_mesh(
     let row_count = u16::try_from(ELEVATION_VIEWS).map_err(|_| Error::IndexOverflow)?;
     let col_count = u16::try_from(AZIMUTH_VIEWS).map_err(|_| Error::IndexOverflow)?;
     let side = u16::try_from((tile - 2 * padding) * 2).map_err(|_| Error::IndexOverflow)?;
+    let texels = source.linear_texels();
+    let material = RasterMaterial {
+        source,
+        texels: &texels,
+        cutoff: alpha_cutoff,
+    };
     let mut rgba = vec![0_u8; width * height * 4];
     for row in 0..row_count {
         for col in 0..col_count {
-            let supersampled = render_view(vertices, &checked_indices, side, col, row);
+            let supersampled = render_view(vertices, &checked_indices, side, col, row, material);
             downsample(
                 &mut rgba,
                 width,
@@ -322,6 +365,7 @@ mod tests {
             .map(|position| TreeVertex {
                 position,
                 color: [0.1, 0.8, 0.2, 1.0],
+                uv: [0.0, 0.0],
             })
             .collect();
         (vertices, vec![0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2])
@@ -330,11 +374,11 @@ mod tests {
     #[test]
     fn atlas_baker_deterministic_and_populated_for_all_view_rows() {
         let (vertices, indices) = tetra();
-        let atlas = bake_colored_mesh(&vertices, &indices, 32, 2).unwrap();
+        let atlas = bake_mesh(&vertices, &indices, &SourceImage::white(), 0.45, 32, 2).unwrap();
         assert_eq!((atlas.width(), atlas.height()), (256, 128));
         assert_eq!(
             atlas,
-            bake_colored_mesh(&vertices, &indices, 32, 2).unwrap()
+            bake_mesh(&vertices, &indices, &SourceImage::white(), 0.45, 32, 2).unwrap()
         );
         let width = usize::try_from(atlas.width()).unwrap();
         let pixels = atlas.rgba();
@@ -357,7 +401,7 @@ mod tests {
     #[test]
     fn atlas_padding_is_filled_only_from_its_own_tile() {
         let (vertices, indices) = tetra();
-        let atlas = bake_colored_mesh(&vertices, &indices, 16, 2).unwrap();
+        let atlas = bake_mesh(&vertices, &indices, &SourceImage::white(), 0.45, 16, 2).unwrap();
         let width = usize::try_from(atlas.width()).unwrap();
         for row in 0..4_usize {
             for col in 0..8_usize {
@@ -380,9 +424,101 @@ mod tests {
     #[test]
     fn invalid_bake_source_rejected() {
         let (mut vertices, indices) = tetra();
-        assert!(bake_colored_mesh(&vertices, &[999, 1, 2], 16, 2).is_err());
-        assert!(bake_colored_mesh(&vertices, &indices, 16, 5).is_err());
+        assert!(bake_mesh(&vertices, &[999, 1, 2], &SourceImage::white(), 0.45, 16, 2).is_err());
+        assert!(bake_mesh(&vertices, &indices, &SourceImage::white(), 0.45, 16, 5).is_err());
         vertices[0].position[0] = f32::NAN;
-        assert!(bake_colored_mesh(&vertices, &indices, 16, 2).is_err());
+        assert!(bake_mesh(&vertices, &indices, &SourceImage::white(), 0.45, 16, 2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod textured_tests {
+    use super::*;
+
+    fn leaf_card() -> (Vec<TreeVertex>, Vec<u32>) {
+        // A single front-facing 1.6m wide card (normalized local units).
+        // The UVs must be interpolated per supersample, not pre-baked to
+        // per-vertex colors: transparent texel holes expose the background.
+        let corners = [
+            ([-0.8, -0.6, 0.0, 1.0], [0.0, 1.0]),
+            ([0.8, -0.6, 0.0, 1.0], [1.0, 1.0]),
+            ([-0.8, 0.6, 0.0, 1.0], [0.0, 0.0]),
+            ([0.8, 0.6, 0.0, 1.0], [1.0, 0.0]),
+        ];
+        let vertices = corners
+            .into_iter()
+            .map(|(position, uv)| TreeVertex {
+                position,
+                color: [1.0; 4],
+                uv,
+            })
+            .collect();
+        (vertices, vec![0, 1, 2, 2, 1, 3])
+    }
+
+    fn alpha_coverage(atlas: &AtlasImage) -> usize {
+        let width = usize::try_from(atlas.width()).unwrap();
+        let pixels = atlas.rgba();
+        // First atlas view, seen face-on (source viewing direction +Z).
+        (0..32_usize)
+            .flat_map(|row| {
+                (0..32_usize).map(move |col| {
+                    let index = 4 * (row * width + col);
+                    usize::from(pixels[index + 3] > 0)
+                })
+            })
+            .sum()
+    }
+
+    #[test]
+    fn alpha_masked_uvs_produce_half_coverage_not_opaque_cards() {
+        let (vertices, indices) = leaf_card();
+        let white = SourceImage::white();
+        let opaque = bake_mesh(&vertices, &indices, &white, 0.5, 32, 2).unwrap();
+        let masked_rgba = (0..8_u32)
+            .flat_map(|_row| {
+                (0..8_u32).flat_map(|col| [40_u8, 210, 50, if col < 4 { 255 } else { 0 }])
+            })
+            .collect();
+        let masked = SourceImage::new(8, 8, masked_rgba).unwrap();
+        let cutout = bake_mesh(&vertices, &indices, &masked, 0.5, 32, 2).unwrap();
+        let total = alpha_coverage(&opaque);
+        let masked_count = alpha_coverage(&cutout);
+        assert!(total > 100, "front-facing source geometry missing");
+        assert!(masked_count > total / 4, "alpha test removed too much");
+        assert!(
+            masked_count < total * 3 / 4,
+            "transparent half was incorrectly opaque"
+        );
+        assert_eq!(
+            cutout,
+            bake_mesh(&vertices, &indices, &masked, 0.5, 32, 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn atlas_baking_preserves_srgb_and_uses_source_tint() {
+        let (mut vertices, indices) = leaf_card();
+        let gray = SourceImage::new(1, 1, vec![128, 128, 128, 255]).unwrap();
+        let atlas = bake_mesh(&vertices, &indices, &gray, 0.5, 32, 2).unwrap();
+        let w = usize::try_from(atlas.width()).unwrap();
+        let center = 4 * (16 * w + 16);
+        for channel in &atlas.rgba()[center..center + 3] {
+            assert!((i32::from(*channel) - 128).abs() <= 1);
+        }
+        for vertex in &mut vertices {
+            vertex.color = [0.5, 0.5, 0.5, 1.0];
+        }
+        let tinted = bake_mesh(&vertices, &indices, &gray, 0.5, 32, 2).unwrap();
+        assert!(tinted.rgba()[center] < 128);
+        assert!(tinted.rgba()[center] > 75);
+    }
+
+    #[test]
+    fn malformed_cutoff_and_uv_are_rejected() {
+        let (mut vertices, indices) = leaf_card();
+        assert!(bake_mesh(&vertices, &indices, &SourceImage::white(), f32::NAN, 32, 2).is_err());
+        vertices[0].uv = [f32::INFINITY, 0.0];
+        assert!(bake_mesh(&vertices, &indices, &SourceImage::white(), 0.5, 32, 2).is_err());
     }
 }

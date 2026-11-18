@@ -23,6 +23,8 @@ pub mod atlas_bake;
 pub mod gpu;
 #[cfg(feature = "gpu")]
 pub mod impostor;
+#[cfg(feature = "gpu")]
+pub mod material;
 
 mod domain;
 mod error;
