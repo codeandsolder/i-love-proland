@@ -27,3 +27,7 @@ pollster = "0.4"
 [[example]]
 name = "gpu_compaction"
 required-features = ["gpu"]
+
+[[example]]
+name = "forest_render"
+required-features = ["gpu"]
