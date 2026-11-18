@@ -104,6 +104,26 @@ are used regardless of which view or render tile requested them.
 cargo +stable run --locked --example streaming
 ```
 
+### Sparse saved-world edits
+
+`WorldEdits<T>` stores only **changes**, never the procedural world. It is
+generic over the application's model/transform payload and keeps generated
+IDs separate from user-added IDs. Removed objects are suppressed by ID;
+modified objects can remain at their original cell or move to another.
+Moved and added objects are indexed by their current canonical cell, so
+loading a visible region does not require loading the original tile.
+
+Applications can serialize the sorted records returned by
+`generated_changes()` and `added_objects()` with their preferred format,
+together with `LAYOUT_VERSION`, the world seed and layer metadata.
+`WorldEdits::from_records` reconstructs the spatial index on load, rejects
+duplicate IDs and validates source-cell/layer consistency when applying
+generated edits. No scene-size-sized save files are required.
+
+```bash
+cargo +stable run --locked --example edits
+```
+
 ### Planetary surfaces
 
 ```rust
@@ -140,13 +160,13 @@ renderer. In particular it does not yet contain:
 - GPU/WGSL compute generation, indirect draws, forest mesh LOD or impostor
   atlas baking;
 - the Proland-style distance-dependent terrain canopy BRDF;
-- persistent scene mutation-delta storage, spatial streaming, or direct
-  integration with KSP's `planetmap`;
+- a built-in save-file serializer or direct integration with KSP's `planetmap`;
+  the mutation record schema and streaming queries are already provided;
 - an exact global Poisson-disk hard-core rejection between arbitrary
   neighbourhood candidates (stratified mode is a practical, not mathematically
   identical, alternative).
 
-Those rendering, cache and persistence layers will compose around the
+These rendering and engine-specific cache layers will compose around the
 canonical IDs rather than own them. No source assets, C++ or GL dependencies
 are part of this crate.
 

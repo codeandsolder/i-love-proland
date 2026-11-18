@@ -11,6 +11,7 @@ pub enum Error {
     InvalidHabitat,
     InvalidBounds,
     TileLimitExceeded,
+    InvalidEdit,
 }
 
 impl fmt::Display for Error {
@@ -31,6 +32,10 @@ impl fmt::Display for Error {
             Self::InvalidHabitat => write!(f, "habitat fraction must be finite and in [0, 1]"),
             Self::InvalidBounds => write!(f, "cell or world-space rectangle has invalid bounds"),
             Self::TileLimitExceeded => write!(f, "explicit streaming tile budget exceeded"),
+            Self::InvalidEdit => write!(
+                f,
+                "saved-world edit has duplicate IDs or mismatched canonical identity"
+            ),
         }
     }
 }
