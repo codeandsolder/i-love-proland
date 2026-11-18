@@ -462,6 +462,97 @@ fn make_source_sampler(device: &wgpu::Device) -> wgpu::Sampler {
     })
 }
 
+fn new_uniform(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("i-love-proland material camera uniforms"),
+        size: core::mem::size_of::<DrawUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn build_mesh_draw(
+    device: &wgpu::Device,
+    compactor: &GpuCompactor,
+    source: TreeMaterial<'_>,
+    layout: &wgpu::BindGroupLayout,
+    atlas: &AtlasTexture,
+    atlas_sampler: &wgpu::Sampler,
+    source_sampler: &wgpu::Sampler,
+) -> MeshDraw {
+    let uniforms = new_uniform(device);
+    let bind = make_draw_bind(
+        device,
+        layout,
+        compactor.mesh_instances(),
+        &uniforms,
+        &MaterialBindings {
+            atlas,
+            atlas_sampler,
+            source_view: source.source_view,
+            source_sampler,
+        },
+    );
+    let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("i-love-proland material indirect arguments"),
+        contents: bytemuck::bytes_of(&IndexedDraw {
+            index_count: source.mesh.index_count(),
+            instance_count: 0,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        }),
+        usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+    });
+    MeshDraw {
+        mesh: source.mesh,
+        bind,
+        uniforms,
+        indirect,
+        cutoff: source.alpha_cutoff,
+    }
+}
+
+fn make_impostor_bind(
+    device: &wgpu::Device,
+    compactor: &GpuCompactor,
+    layout: &wgpu::BindGroupLayout,
+    uniforms: &wgpu::Buffer,
+    atlas: &AtlasTexture,
+    atlas_sampler: &wgpu::Sampler,
+    source_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    // The impostor shader uses only the composite atlas, while the common
+    // render layout still requires a valid source-albedo binding.
+    let placeholder = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("i-love-proland unused impostor source texture"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let source_view = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
+    make_draw_bind(
+        device,
+        layout,
+        compactor.impostor_instances(),
+        uniforms,
+        &MaterialBindings {
+            atlas,
+            atlas_sampler,
+            source_view: &source_view,
+            source_sampler,
+        },
+    )
+}
+
 impl TreeRenderer {
     /// Compile the near mesh materials and one shared middle impostor pass.
     /// The first mesh provides the compactor's base indirect index count.
@@ -512,79 +603,29 @@ impl TreeRenderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let new_uniform = || {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("i-love-proland material camera uniforms"),
-                size: core::mem::size_of::<DrawUniform>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
         let mesh_draws = sources
             .into_iter()
             .map(|source| {
-                let uniforms = new_uniform();
-                let bind = make_draw_bind(
+                build_mesh_draw(
                     device,
+                    compactor,
+                    source,
                     &layout,
-                    compactor.mesh_instances(),
-                    &uniforms,
-                    &MaterialBindings {
-                        atlas,
-                        atlas_sampler: &sampler,
-                        source_view: source.source_view,
-                        source_sampler: &source_sampler,
-                    },
-                );
-                let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("i-love-proland material indirect arguments"),
-                    contents: bytemuck::bytes_of(&IndexedDraw {
-                        index_count: source.mesh.index_count(),
-                        instance_count: 0,
-                        first_index: 0,
-                        base_vertex: 0,
-                        first_instance: 0,
-                    }),
-                    usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
-                });
-                MeshDraw {
-                    mesh: source.mesh,
-                    bind,
-                    uniforms,
-                    indirect,
-                    cutoff: source.alpha_cutoff,
-                }
+                    atlas,
+                    &sampler,
+                    &source_sampler,
+                )
             })
             .collect();
-        let impostor_uniforms = new_uniform();
-        // Fragment stage for impostors samples only the composite angular atlas.
-        // Its source texture slot is unused but required by the common layout.
-        let placeholder = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("i-love-proland unused impostor source texture"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let placeholder_view = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
-        let impostor_bind = make_draw_bind(
+        let impostor_uniforms = new_uniform(device);
+        let impostor_bind = make_impostor_bind(
             device,
+            compactor,
             &layout,
-            compactor.impostor_instances(),
             &impostor_uniforms,
-            &MaterialBindings {
-                atlas,
-                atlas_sampler: &sampler,
-                source_view: &placeholder_view,
-                source_sampler: &source_sampler,
-            },
+            atlas,
+            &sampler,
+            &source_sampler,
         );
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: core::mem::size_of::<TreeVertex>() as u64,
