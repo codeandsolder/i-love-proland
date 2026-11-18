@@ -16,22 +16,27 @@ struct Instance {
 
 struct RenderUniform {
     projection: mat4x4<f32>,
-    atlas: vec4<f32>, // (8,4, tile-gutter fraction, 0)
+    atlas: vec4<f32>, // (8,4, gutter fraction, reserved)
+    material: vec4<f32>, // source alpha cutoff, 1 for multisample alpha-to-coverage
 }
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
 @group(0) @binding(1) var<storage, read> objects: array<Instance>;
 @group(0) @binding(2) var atlas_texture: texture_2d<f32>;
 @group(0) @binding(3) var atlas_sampler: sampler;
+@group(0) @binding(4) var source_texture: texture_2d<f32>;
+@group(0) @binding(5) var source_sampler: sampler;
 
 struct MeshVertex {
     @location(0) position: vec4<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) uv: vec2<f32>,
 }
 
 struct MeshOutput {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
 }
 
 @vertex
@@ -49,17 +54,18 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
     let world = object.position_radius.xyz + rotated * object.position_radius.w;
     var out: MeshOutput;
     out.clip = camera.projection * vec4<f32>(world, 1.0);
-    let brightness = 0.77 + 0.23 * clamp(local.y * 0.5 + 0.5, 0.0, 1.0);
-    out.color = vec4<f32>(input.color.rgb * brightness, input.color.a);
+    out.color = input.color;
+    out.uv = input.uv;
     return out;
 }
 
 @fragment
 fn mesh_fs(input: MeshOutput) -> @location(0) vec4<f32> {
-    if (input.color.a < 0.45) {
+    let texel = textureSample(source_texture, source_sampler, input.uv);
+    if (texel.a * input.color.a < camera.material.x) {
         discard;
     }
-    return vec4<f32>(input.color.rgb, 1.0);
+    return vec4<f32>(texel.rgb * input.color.rgb, 1.0);
 }
 
 struct ImpostorOutput {
@@ -78,7 +84,7 @@ fn impostor_vs(
     let object = objects[instance_id];
     let center = object.position_radius.xyz;
     let radius = object.position_radius.w;
-    let to_eye = normalize(-center);
+    let to_eye = select(normalize(-center), vec3<f32>(0.0, 0.0, 1.0), dot(center, center) < 0.000001);
 
     // Analytic billboard frame: remains continuous into directly overhead
     // views and shares the same azimuth convention as the atlas baker.
@@ -140,8 +146,23 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
         input.blend.x
     );
     let color = mix(lower, upper, input.blend.y);
-    if (color.a < 0.45) {
+    if (color.a <= 0.0) {
         discard;
     }
-    return vec4<f32>(color.rgb * input.tint, 1.0);
+    if (camera.material.y < 0.5) {
+        // Stable 4x4 ordered alpha coverage: no sorting or camera-dependent
+        // RNG, and each accepted fragment writes normal hardware depth.
+        let x = u32(input.clip.x) & 3u;
+        let y = u32(input.clip.y) & 3u;
+        let bayer = array<u32, 16>(
+            0u, 8u, 2u, 10u, 12u, 4u, 14u, 6u,
+            3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u
+        );
+        let threshold = (f32(bayer[y * 4u + x]) + 0.5) / 16.0;
+        if (color.a < threshold) {
+            discard;
+        }
+    }
+    // With multisample targets, hardware alpha-to-coverage uses this alpha.
+    return vec4<f32>(color.rgb * input.tint, color.a);
 }

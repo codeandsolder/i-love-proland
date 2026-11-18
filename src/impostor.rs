@@ -16,6 +16,8 @@ const SHADER: &str = include_str!("impostor.wgsl");
 pub struct TreeVertex {
     pub position: [f32; 4],
     pub color: [f32; 4],
+    /// Source UVs are normalized texture coordinates (may repeat outside 0..1).
+    pub uv: [f32; 2],
 }
 
 pub struct TreeMesh {
@@ -35,6 +37,7 @@ impl TreeMesh {
         }
         if vertices.iter().any(|v| {
             !v.position.iter().all(|p| p.is_finite())
+                || !v.uv.iter().all(|p| p.is_finite())
                 || !v
                     .color
                     .iter()
@@ -232,7 +235,24 @@ impl TreeCamera {
 struct DrawUniform {
     projection: [[f32; 4]; 4],
     atlas: [f32; 4],
+    material: [f32; 4],
 }
+
+/// Render targets and material alpha-cutoff semantics.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeRenderConfig {
+    pub color_format: wgpu::TextureFormat,
+    pub depth_format: wgpu::TextureFormat,
+    pub sample_count: u32,
+    pub alpha_cutoff: f32,
+}
+
+#[derive(Clone, Copy)]
+enum PassKind {
+    Mesh,
+    Impostor,
+}
+
 /// Draw two indexed-indirect batches directly from GPU-compacted instances.
 pub struct TreeRenderer {
     mesh_pipeline: wgpu::RenderPipeline,
@@ -242,23 +262,38 @@ pub struct TreeRenderer {
     uniforms: wgpu::Buffer,
     quad_indices: wgpu::Buffer,
     gutter_fraction: f32,
+    cutoff: f32,
+    alpha_to_coverage: bool,
 }
 
 fn render_pipeline(
     device: &wgpu::Device,
     pipeline_layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
-    name: &'static str,
-    entry_points: (&'static str, &'static str),
+    pass_kind: PassKind,
     vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-    formats: (wgpu::TextureFormat, wgpu::TextureFormat),
+    config: TreeRenderConfig,
 ) -> wgpu::RenderPipeline {
+    let (name, vertex_entry, fragment_entry, alpha_to_coverage) = match pass_kind {
+        PassKind::Mesh => (
+            "i-love-proland instanced source trees",
+            "mesh_vs",
+            "mesh_fs",
+            false,
+        ),
+        PassKind::Impostor => (
+            "i-love-proland instanced textured impostors",
+            "impostor_vs",
+            "impostor_fs",
+            config.sample_count > 1,
+        ),
+    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(name),
         layout: Some(pipeline_layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some(entry_points.0),
+            entry_point: Some(vertex_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: vertex_buffers,
         },
@@ -268,19 +303,23 @@ fn render_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: formats.1,
+            format: config.depth_format,
             depth_write_enabled: Some(true),
             depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: config.sample_count,
+            alpha_to_coverage_enabled: alpha_to_coverage,
+            ..Default::default()
+        },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(entry_points.1),
+            entry_point: Some(fragment_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: formats.0,
+                format: config.color_format,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -331,8 +370,31 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
+}
+
+struct MaterialBindings<'a> {
+    atlas: &'a AtlasTexture,
+    atlas_sampler: &'a wgpu::Sampler,
+    source_view: &'a wgpu::TextureView,
+    source_sampler: &'a wgpu::Sampler,
 }
 
 fn make_draw_bind(
@@ -340,8 +402,7 @@ fn make_draw_bind(
     layout: &wgpu::BindGroupLayout,
     instances: &wgpu::Buffer,
     uniforms: &wgpu::Buffer,
-    atlas: &AtlasTexture,
-    sampler: &wgpu::Sampler,
+    materials: &MaterialBindings<'_>,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("i-love-proland tree indirect draw bindings"),
@@ -357,13 +418,33 @@ fn make_draw_bind(
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::TextureView(&atlas.view),
+                resource: wgpu::BindingResource::TextureView(&materials.atlas.view),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: wgpu::BindingResource::Sampler(sampler),
+                resource: wgpu::BindingResource::Sampler(materials.atlas_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(materials.source_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(materials.source_sampler),
             },
         ],
+    })
+}
+
+fn make_source_sampler(device: &wgpu::Device) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("i-love-proland source UV repeat and linear sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
     })
 }
 
@@ -377,9 +458,16 @@ impl TreeRenderer {
         compactor: &GpuCompactor,
         mesh: &TreeMesh,
         atlas: &AtlasTexture,
-        color_format: wgpu::TextureFormat,
-        depth_format: wgpu::TextureFormat,
+        source_view: &wgpu::TextureView,
+        config: TreeRenderConfig,
     ) -> Result<Self> {
+        if !config.alpha_cutoff.is_finite()
+            || !(0.0..=1.0).contains(&config.alpha_cutoff)
+            || config.sample_count == 0
+            || !config.sample_count.is_power_of_two()
+        {
+            return Err(Error::InvalidConfiguration("invalid tree render config"));
+        }
         if compactor.mesh_index_count() != mesh.index_count()
             || compactor.impostor_index_count() != 6
         {
@@ -394,6 +482,7 @@ impl TreeRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        let source_sampler = make_source_sampler(device);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("i-love-proland mesh and 32-angle impostor shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -410,44 +499,46 @@ impl TreeRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let materials = MaterialBindings {
+            atlas,
+            atlas_sampler: &sampler,
+            source_view,
+            source_sampler: &source_sampler,
+        };
         let mesh_bind = make_draw_bind(
             device,
             &layout,
             compactor.mesh_instances(),
             &uniforms,
-            atlas,
-            &sampler,
+            &materials,
         );
         let impostor_bind = make_draw_bind(
             device,
             &layout,
             compactor.impostor_instances(),
             &uniforms,
-            atlas,
-            &sampler,
+            &materials,
         );
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: core::mem::size_of::<TreeVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
         })];
         let mesh_pipeline = render_pipeline(
             device,
             &pipeline_layout,
             &shader,
-            "i-love-proland instanced source trees",
-            ("mesh_vs", "mesh_fs"),
+            PassKind::Mesh,
             &vertex_layout,
-            (color_format, depth_format),
+            config,
         );
         let impostor_pipeline = render_pipeline(
             device,
             &pipeline_layout,
             &shader,
-            "i-love-proland instanced impostors",
-            ("impostor_vs", "impostor_fs"),
+            PassKind::Impostor,
             &[],
-            (color_format, depth_format),
+            config,
         );
         let quad_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("i-love-proland billboard quad 6 indices"),
@@ -462,6 +553,8 @@ impl TreeRenderer {
             uniforms,
             quad_indices,
             gutter_fraction: atlas.gutter_fraction,
+            cutoff: config.alpha_cutoff,
+            alpha_to_coverage: config.sample_count > 1,
         })
     }
 
@@ -470,6 +563,12 @@ impl TreeRenderer {
         let uniform = DrawUniform {
             projection: camera.projection,
             atlas: [8.0, 4.0, self.gutter_fraction, 0.0],
+            material: [
+                self.cutoff,
+                f32::from(u8::from(self.alpha_to_coverage)),
+                0.0,
+                0.0,
+            ],
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniform));
     }
