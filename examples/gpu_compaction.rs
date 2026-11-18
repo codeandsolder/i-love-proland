@@ -1,5 +1,7 @@
-//! Run a real headless Vulkan instance-filtering pass with readback and an
-//! order-independent CPU-reference comparison. No source assets required.
+//! Validate an actual Vulkan compute pass against the Rust reference.
+//! Full readback verifies stable IDs, variants, attributes and indirect args.
+//! This is an end-to-end latency probe, not a shader-only timestamp benchmark.
+
 use i_love_proland::gpu::{
     GpuCompactor, GpuView, IndexedDraw, PackedInstance, RenderPose, VisualLod, classify_cpu,
 };
@@ -7,6 +9,8 @@ use i_love_proland::{Distribution, Domain, Generator, GeneratorConfig, Layer, Ti
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::time::Instant;
+
+type Expected = [BTreeMap<u128, PackedInstance>; 2];
 
 fn readback(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>, Box<dyn Error>> {
     let slice = buffer.slice(..);
@@ -21,7 +25,8 @@ fn readback(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>, Box
     Ok(bytes)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+/// Generate real canonical IDs/variants for two unrelated object layers.
+fn generate_sample() -> Result<(Vec<PackedInstance>, f64), Box<dyn Error>> {
     let generator = Generator::new(
         Domain::Planar { cell_size_m: 8.0 },
         GeneratorConfig {
@@ -32,7 +37,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let layers = [
         Layer::new(
-            0x4f41_4b,
+            0x004f_414b,
             0.015,
             Distribution::Poisson,
             vec![
@@ -56,21 +61,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             }],
         )?,
     ];
-    let before_generate = Instant::now();
-    let mut candidates = Vec::new();
+
+    let start = Instant::now();
+    let mut result = Vec::new();
     for y in -6..6 {
         for x in -6..6 {
             for layer in &layers {
-                for instance in generator.tile(TileKey::planar(x, y), layer)? {
-                    let id = instance.candidate.id;
+                for original in generator.tile(TileKey::planar(x, y), layer)? {
+                    let cell = original.candidate.cell;
+                    let id_bytes = original.candidate.id.to_le_bytes();
+                    let distance_seed = u32::from_le_bytes(id_bytes[4..8].try_into()?);
+                    let depth = 60.0 + f32::from(u16::try_from(distance_seed % 14_000)?);
+                    let radius = 4.0 + f32::from(id_bytes[10] % 18);
                     let position = [
-                        (instance.candidate.cell.x as f32) * 1.75,
-                        (instance.candidate.cell.y as f32) * 1.75,
-                        60.0 + ((id >> 32) as u32 % 14_000) as f32,
+                        f32::from(i16::try_from(cell.x)?) * 1.75,
+                        f32::from(i16::try_from(cell.y)?) * 1.75,
+                        depth,
                     ];
-                    let radius = 4.0 + ((id >> 80) as u8 % 18) as f32;
-                    candidates.push(PackedInstance::from_instance(
-                        &instance,
+                    result.push(PackedInstance::from_instance(
+                        &original,
                         RenderPose {
                             camera_relative_position: position,
                             crown_radius_m: radius,
@@ -81,32 +90,36 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    let generation_ms = before_generate.elapsed().as_secs_f64() * 1000.0;
+    Ok((result, start.elapsed().as_secs_f64() * 1000.0))
+}
 
-    let view = GpuView::unculled(540.0, 32.0, 1.0)?;
-    let mut expected = [BTreeMap::new(), BTreeMap::new()];
-    let mut expected_canopy = 0_usize;
-    for candidate in &candidates {
+fn reference(candidates: &[PackedInstance], view: GpuView) -> (Expected, usize) {
+    let mut accepted = [BTreeMap::new(), BTreeMap::new()];
+    let mut canopy = 0;
+    for candidate in candidates {
         match classify_cpu(candidate, view) {
             VisualLod::Mesh => {
                 assert!(
-                    expected[0]
+                    accepted[0]
                         .insert(candidate.stable_id(), *candidate)
                         .is_none()
                 );
             }
             VisualLod::Impostor => {
                 assert!(
-                    expected[1]
+                    accepted[1]
                         .insert(candidate.stable_id(), *candidate)
                         .is_none()
                 );
             }
-            VisualLod::TerrainCanopy => expected_canopy += 1,
+            VisualLod::TerrainCanopy => canopy += 1,
             VisualLod::OutsideFrustum => {}
         }
     }
+    (accepted, canopy)
+}
 
+fn device() -> Result<(wgpu::Device, wgpu::Queue), Box<dyn Error>> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(descriptor);
@@ -121,99 +134,165 @@ fn main() -> Result<(), Box<dyn Error>> {
         adapter.get_info().name,
         adapter.get_info().backend,
     );
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("i-love-proland GPU correctness and timing"),
-        ..Default::default()
-    }))?;
-    let compactor = GpuCompactor::new(&device, candidates.len() as u32, 369, 6)?;
+    Ok(pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("i-love-proland GPU correctness and timing"),
+            ..Default::default()
+        },
+    ))?)
+}
 
-    let before_gpu = Instant::now();
+/// Verify both output lists and both indirect arguments byte-for-byte
+/// against the same canonical CPU objects, regardless of atomic append order.
+fn gpu_parity(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    compactor: &GpuCompactor,
+    candidates: &[PackedInstance],
+    view: GpuView,
+    expected: &Expected,
+) -> Result<(IndexedDraw, IndexedDraw, f64), Box<dyn Error>> {
+    let start = Instant::now();
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("i-love-proland first GPU scatter pass"),
+        label: Some("i-love-proland correctness and readback"),
     });
-    compactor.encode(&queue, &mut encoder, &candidates, view)?;
-    let draw_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("indirect args readback"),
+    compactor.encode(queue, &mut encoder, candidates, view)?;
+    let args = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("indexed draw readback"),
         size: 64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let bytes = candidates.len() as u64 * 64;
+    let output_bytes = u64::try_from(candidates.len())? * 64;
     let make_readback = |label| {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: bytes,
+            size: output_bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         })
     };
-    let mesh_readback = make_readback("mesh instance readback");
-    let impostor_readback = make_readback("impostor instance readback");
-    encoder.copy_buffer_to_buffer(compactor.mesh_indirect(), 0, &draw_buffer, 0, 20);
-    encoder.copy_buffer_to_buffer(compactor.impostor_indirect(), 0, &draw_buffer, 32, 20);
-    encoder.copy_buffer_to_buffer(compactor.mesh_instances(), 0, &mesh_readback, 0, bytes);
+    let mesh = make_readback("mesh instances readback");
+    let impostor = make_readback("impostor instances readback");
+
+    encoder.copy_buffer_to_buffer(compactor.mesh_indirect(), 0, &args, 0, 20);
+    encoder.copy_buffer_to_buffer(compactor.impostor_indirect(), 0, &args, 32, 20);
+    encoder.copy_buffer_to_buffer(compactor.mesh_instances(), 0, &mesh, 0, output_bytes);
     encoder.copy_buffer_to_buffer(
         compactor.impostor_instances(),
         0,
-        &impostor_readback,
+        &impostor,
         0,
-        bytes,
+        output_bytes,
     );
     queue.submit(Some(encoder.finish()));
     device.poll(wgpu::PollType::wait_indefinitely())?;
-    let first_gpu_ms = before_gpu.elapsed().as_secs_f64() * 1000.0;
+    let gpu_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let draw_bytes = readback(&device, &draw_buffer)?;
-    let mesh_draw = bytemuck::pod_read_unaligned::<IndexedDraw>(&draw_bytes[..20]);
-    let imp_draw = bytemuck::pod_read_unaligned::<IndexedDraw>(&draw_bytes[32..52]);
-    assert_eq!(mesh_draw.index_count, 369);
-    assert_eq!(imp_draw.index_count, 6);
-    assert_eq!(mesh_draw.first_instance, 0);
-    assert_eq!(imp_draw.first_instance, 0);
-    assert_eq!(mesh_draw.instance_count as usize, expected[0].len());
-    assert_eq!(imp_draw.instance_count as usize, expected[1].len());
+    let bytes = readback(device, &args)?;
+    let mesh_draw = bytemuck::pod_read_unaligned::<IndexedDraw>(&bytes[..20]);
+    let impostor_draw = bytemuck::pod_read_unaligned::<IndexedDraw>(&bytes[32..52]);
+    assert_eq!((mesh_draw.index_count, impostor_draw.index_count), (369, 6));
+    assert_eq!(
+        (mesh_draw.first_instance, impostor_draw.first_instance),
+        (0, 0)
+    );
+    assert_eq!(
+        usize::try_from(mesh_draw.instance_count)?,
+        expected[0].len()
+    );
+    assert_eq!(
+        usize::try_from(impostor_draw.instance_count)?,
+        expected[1].len()
+    );
 
-    let bytes_per_instance = core::mem::size_of::<PackedInstance>();
-    let mut all_ids = BTreeSet::new();
-    for (i, (buffer, count)) in [
-        (&mesh_readback, mesh_draw.instance_count),
-        (&impostor_readback, imp_draw.instance_count),
+    let mut unique = BTreeSet::new();
+    for (lod, (buffer, count)) in [
+        (&mesh, mesh_draw.instance_count),
+        (&impostor, impostor_draw.instance_count),
     ]
     .into_iter()
     .enumerate()
     {
-        let bytes = readback(&device, buffer)?;
-        let mut actual = BTreeMap::new();
-        for chunk in bytes[..count as usize * bytes_per_instance].chunks_exact(bytes_per_instance) {
-            let item = bytemuck::pod_read_unaligned::<PackedInstance>(chunk);
-            assert!(actual.insert(item.stable_id(), item).is_none());
-            assert!(all_ids.insert(item.stable_id()));
+        let bytes = readback(device, buffer)?;
+        let visible_bytes = usize::try_from(count)? * core::mem::size_of::<PackedInstance>();
+        let mut gpu = BTreeMap::new();
+        for record in bytes[..visible_bytes].chunks_exact(64) {
+            let object = bytemuck::pod_read_unaligned::<PackedInstance>(record);
+            assert!(gpu.insert(object.stable_id(), object).is_none());
+            assert!(unique.insert(object.stable_id()));
         }
         assert_eq!(
-            actual, expected[i],
-            "GPU LOD={i} differs from CPU reference"
+            gpu, expected[lod],
+            "GPU LOD={lod} differs from the CPU reference"
         );
     }
+    Ok((mesh_draw, impostor_draw, gpu_ms))
+}
 
-    // No readback or GPU→CPU sync per frame in the benchmark loop.
-    let repetitions = 30_u32;
+fn benchmark(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    compactor: &GpuCompactor,
+    candidates: &[PackedInstance],
+    view: GpuView,
+) -> Result<f64, Box<dyn Error>> {
+    const REPETITIONS: u32 = 30;
     let start = Instant::now();
-    for _ in 0..repetitions {
+    for _ in 0..REPETITIONS {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("i-love-proland GPU compaction steady-state benchmark"),
+            label: Some("i-love-proland end-to-end GPU latency probe"),
         });
-        compactor.encode(&queue, &mut encoder, &candidates, view)?;
+        compactor.encode(queue, &mut encoder, candidates, view)?;
         queue.submit(Some(encoder.finish()));
         device.poll(wgpu::PollType::wait_indefinitely())?;
     }
-    let ms_per_frame = start.elapsed().as_secs_f64() * 1000.0 / f64::from(repetitions);
+    Ok(start.elapsed().as_secs_f64() * 1000.0 / f64::from(REPETITIONS))
+}
 
+fn main() -> Result<(), Box<dyn Error>> {
+    let (candidates, generation_ms) = generate_sample()?;
+    let view = GpuView::unculled(540.0, 32.0, 1.0)?;
+    let (expected, canopy) = reference(&candidates, view);
+    let (device, queue) = device()?;
+    let compactor = GpuCompactor::new(&device, u32::try_from(candidates.len())?, 369, 6)?;
+
+    let (mesh, impostor, first_gpu_ms) =
+        gpu_parity(&device, &queue, &compactor, &candidates, view, &expected)?;
+
+    // Exercise nonzero frustum planes, not just projected-size classification.
+    let frustum = GpuView::new(
+        540.0,
+        32.0,
+        1.0,
+        [0.0, 0.0, 1.0],
+        [
+            [1.0, 0.0, 0.0, 50.0],
+            [0.0, 1.0, 0.0, 90.0],
+            [0.0; 4],
+            [0.0; 4],
+            [0.0; 4],
+            [0.0; 4],
+        ],
+    )?;
+    let (frustum_reference, _) = reference(&candidates, frustum);
+    let (culled_mesh, culled_impostor, _) = gpu_parity(
+        &device,
+        &queue,
+        &compactor,
+        &candidates,
+        frustum,
+        &frustum_reference,
+    )?;
+    let frame_ms = benchmark(&device, &queue, &compactor, &candidates, view)?;
+
+    let generated = candidates.len();
+    let mesh_count = mesh.instance_count;
+    let impostor_count = impostor.instance_count;
+    let frustum_mesh = culled_mesh.instance_count;
+    let frustum_impostor = culled_impostor.instance_count;
     println!(
-        "GPU_SCATTER_PARITY PASS generated={} mesh={} impostor={} far_canopy={} generation_ms={generation_ms:.2} first_gpu_ms={first_gpu_ms:.2} cpu_upload_gpu_sync_ms_per_frame={ms_per_frame:.4}",
-        candidates.len(),
-        mesh_draw.instance_count,
-        imp_draw.instance_count,
-        expected_canopy,
+        "GPU_SCATTER_PARITY PASS generated={generated} mesh={mesh_count} impostor={impostor_count} far_canopy={canopy} frustum_mesh={frustum_mesh} frustum_impostor={frustum_impostor} generation_ms={generation_ms:.2} first_gpu_ms={first_gpu_ms:.2} cpu_upload_gpu_sync_ms_per_frame={frame_ms:.4}",
     );
     Ok(())
 }

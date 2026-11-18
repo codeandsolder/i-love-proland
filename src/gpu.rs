@@ -106,10 +106,11 @@ impl PackedInstance {
     }
 }
 
-/// Camera parameters for conservative sphere/frustum culling. Plane equation
-/// is dot(normal, camera_relative_position) + offset >= -crown_radius.
-/// The caller must supply six inward-facing, unit-normal planes, or a plane
-/// with all components zero to explicitly disable that particular plane.
+/// Conservative camera frustum and LOD parameters.
+///
+/// The plane equation is `dot(normal, camera_relative_position) + offset >= -crown_radius`.
+/// Supply six inward-facing, normalized planes, or a zero plane to disable
+/// that particular culling boundary.
 #[derive(Clone, Copy, Debug)]
 pub struct GpuView {
     focal_length_px: f32,
@@ -173,7 +174,9 @@ impl GpuView {
 
     /// Disable frustum plane rejection while keeping correct size-based LOD.
     /// Suitable for tests or when the host has already done tile-level culling.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Rejects invalid focal length or size thresholds.
     pub fn unculled(
         focal_length_px: f32,
         mesh_threshold_px: f32,
@@ -220,9 +223,11 @@ pub enum VisualLod {
     OutsideFrustum,
 }
 
-/// The reference uses the exact f32 shader input values; floating-point
-/// threshold boundary comparisons across different GPU architectures can
-/// still differ by rounding, which changes only visual LOD, never object ID.
+/// Reference classifier for parity testing with the WGSL shader.
+///
+/// Both paths use the same f32 inputs and cross-multiplied pixel thresholds;
+/// GPU math can still differ slightly near boundaries, affecting visual
+/// LOD only, never canonical object identity.
 #[must_use]
 pub fn classify_cpu(object: &PackedInstance, view: GpuView) -> VisualLod {
     let pos = &object.position_radius[..3];
@@ -271,6 +276,21 @@ pub struct GpuCompactor {
     impostor_template: IndexedDraw,
 }
 
+fn create_compaction_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("i-love-proland visibility + LOD compaction WGSL"),
+        source: wgpu::ShaderSource::Wgsl(WGSL_COMPACTION.into()),
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("i-love-proland GPU compaction"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("classify_and_compact"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    })
+}
+
 impl GpuCompactor {
     /// # Errors
     /// Rejects capacity exceeding the GPU's storage/workgroup limits.
@@ -283,7 +303,7 @@ impl GpuCompactor {
         let limits = device.limits();
         let bytes = u64::from(capacity) * INSTANCE_BYTES;
         if capacity == 0
-            || bytes > u64::from(limits.max_storage_buffer_binding_size)
+            || bytes > limits.max_storage_buffer_binding_size
             || bytes > limits.max_buffer_size
             || capacity.div_ceil(WORKGROUP_SIZE) > limits.max_compute_workgroups_per_dimension
         {
@@ -335,18 +355,7 @@ impl GpuCompactor {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("i-love-proland visibility + LOD compaction WGSL"),
-            source: wgpu::ShaderSource::Wgsl(WGSL_COMPACTION.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("i-love-proland GPU compaction"),
-            layout: None,
-            module: &shader,
-            entry_point: Some("classify_and_compact"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+        let pipeline = create_compaction_pipeline(device);
         let layout = pipeline.get_bind_group_layout(0);
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("i-love-proland GPU buffers"),
@@ -399,22 +408,22 @@ impl GpuCompactor {
     }
 
     #[must_use]
-    pub fn mesh_instances(&self) -> &wgpu::Buffer {
+    pub const fn mesh_instances(&self) -> &wgpu::Buffer {
         &self.mesh
     }
 
     #[must_use]
-    pub fn impostor_instances(&self) -> &wgpu::Buffer {
+    pub const fn impostor_instances(&self) -> &wgpu::Buffer {
         &self.impostor
     }
 
     #[must_use]
-    pub fn mesh_indirect(&self) -> &wgpu::Buffer {
+    pub const fn mesh_indirect(&self) -> &wgpu::Buffer {
         &self.mesh_indirect
     }
 
     #[must_use]
-    pub fn impostor_indirect(&self) -> &wgpu::Buffer {
+    pub const fn impostor_indirect(&self) -> &wgpu::Buffer {
         &self.impostor_indirect
     }
 
