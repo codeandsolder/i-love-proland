@@ -11,6 +11,19 @@ keywords = ["procedural", "scatter", "terrain", "planet", "deterministic"]
 categories = ["game-development", "graphics", "algorithms"]
 
 [dependencies]
+bytemuck = { version = "1.23", features = ["derive"], optional = true }
+wgpu = { version = "30.0.2", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:bytemuck"]
+
+[dev-dependencies]
+pollster = "0.4"
+
+[[example]]
+name = "gpu_compaction"
+required-features = ["gpu"]

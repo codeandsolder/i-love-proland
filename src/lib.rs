@@ -17,6 +17,9 @@
 //!
 //! No source code or assets from the original Proland project are included.
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 mod domain;
 mod error;
 mod generator;

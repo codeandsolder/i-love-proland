@@ -124,6 +124,45 @@ generated edits. No scene-size-sized save files are required.
 cargo +stable run --locked --example edits
 ```
 
+### GPU visibility and mesh/impostor compaction (opt-in)
+
+The optional `gpu` feature enables a standalone **wgpu 30** compute pipeline.
+The CPU generator still owns object existence, stable 128-bit IDs, habitat
+decisions, model variants and saved-world changes. After the host projects
+those objects onto the current terrain LOD and converts their positions to
+camera-relative floats, `gpu::PackedInstance::from_instance` produces a fixed
+64-byte shader record. It retains all four object-ID words, two model-ID words
+and two layer-ID words through GPU filtering.
+
+`gpu::GpuCompactor` accepts an arbitrary candidate batch and a camera
+frustum, then dispatches a WGSL compute pass that culls bounding spheres,
+chooses detailed mesh vs impostor by **projected canopy diameter in pixels**,
+and atomically compacts survivors into two separate storage buffers. Each has
+its own GPU-written indexed-indirect draw arguments; the host can bind
+`mesh_instances()/mesh_indirect()` or
+`impostor_instances()/impostor_indirect()` directly in its render passes.
+
+Very small trees are handled by the future aggregate canopy shading path;
+they are excluded from mesh/impostor lists without deleting canonical world
+objects. The GPU's parallel append order is deliberately unspecified: neither
+save files nor gameplay should depend on draw-buffer ordering. Group calls by
+mesh/material batch when using different source geometries; variant IDs
+survive in the GPU record for shader variation and batching.
+
+```bash
+cargo +stable test --locked --all-features --all-targets
+cargo +stable run --release --features gpu --example gpu_compaction
+```
+
+The headless example uses a real Vulkan adapter, copies both GPU result
+buffers back, and compares **every 128-bit ID and complete instance record**
+against the CPU reference classifier, independent of GPU workgroup ordering.
+It also reports end-to-end upload, compaction and GPU-synchronization timing.
+A Vulkan-capable device is required for that example; CPU-only users never
+enable wgpu. See the [GPU architecture, ABI and integration guide](docs/gpu.md)
+for shader bindings, indirect-draw layouts, reproducibility boundaries and
+resource limits.
+
 ### Planetary surfaces
 
 ```rust
@@ -157,8 +196,9 @@ these values can intentionally regenerate positions; changing
 This first release is the **portable placement core**, not the complete forest
 renderer. In particular it does not yet contain:
 
-- GPU/WGSL compute generation, indirect draws, forest mesh LOD or impostor
-  atlas baking;
+- GPU-side *canonical world generation*, habitat texture filtering, model
+  geometry selection or impostor atlas baking (the current GPU feature covers
+  frustum/LOD filtering, compaction and indirect draw arguments);
 - the Proland-style distance-dependent terrain canopy BRDF;
 - a built-in save-file serializer or direct integration with KSP's `planetmap`;
   the mutation record schema and streaming queries are already provided;
