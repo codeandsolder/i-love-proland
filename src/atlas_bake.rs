@@ -25,6 +25,27 @@ struct RasterMaterial<'a> {
     cutoff: f32,
 }
 
+/// A textured source-mesh draw within a shared impostor atlas.
+///
+/// All surfaces must be expressed in the same normalized local coordinate
+/// system. Depth is resolved across surfaces, including transparency cutouts:
+/// separate leaf/trunk atlases cannot correctly represent those overlaps.
+#[derive(Clone, Copy)]
+pub struct BakeSurface<'a> {
+    pub vertices: &'a [TreeVertex],
+    pub indices: &'a [u32],
+    pub source: &'a SourceImage,
+    pub alpha_cutoff: f32,
+}
+
+struct PreparedSurface<'a> {
+    vertices: &'a [TreeVertex],
+    indices: Vec<usize>,
+    source: &'a SourceImage,
+    texels: Vec<[f32; 4]>,
+    alpha_cutoff: f32,
+}
+
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0].mul_add(b[0], a[1].mul_add(b[1], a[2] * b[2]))
 }
@@ -153,25 +174,26 @@ fn raster_triangle(
     }
 }
 
-fn render_view(
-    vertices: &[TreeVertex],
-    indices: &[usize],
-    side: u16,
-    azi: u16,
-    elev: u16,
-    material: RasterMaterial<'_>,
-) -> Vec<[f32; 4]> {
+fn render_view(surfaces: &[PreparedSurface<'_>], side: u16, azi: u16, elev: u16) -> Vec<[f32; 4]> {
     let extent = usize::from(side);
     let mut depth = vec![f32::NEG_INFINITY; extent * extent];
     let mut color = vec![[0.0_f32; 4]; extent * extent];
     let (eye, right, up) = basis(azi, elev);
-    let projected: Vec<_> = vertices
-        .iter()
-        .map(|vertex| project(vertex, eye, right, up, f32::from(side)))
-        .collect();
-    for face in indices.as_chunks::<3>().0 {
-        let samples = [projected[face[0]], projected[face[1]], projected[face[2]]];
-        raster_triangle(samples, side, &mut depth, &mut color, material);
+    for surface in surfaces {
+        let projected: Vec<_> = surface
+            .vertices
+            .iter()
+            .map(|vertex| project(vertex, eye, right, up, f32::from(side)))
+            .collect();
+        let material = RasterMaterial {
+            source: surface.source,
+            texels: &surface.texels,
+            cutoff: surface.alpha_cutoff,
+        };
+        for face in surface.indices.as_chunks::<3>().0 {
+            let samples = [projected[face[0]], projected[face[1]], projected[face[2]]];
+            raster_triangle(samples, side, &mut depth, &mut color, material);
+        }
     }
     color
 }
@@ -260,10 +282,10 @@ fn downsample(
     }
 }
 
-/// Bake a deterministic 32-angle, 2× supersampled atlas using the original
-/// UV-mapped, alpha-masked sRGB texture and linear-light vertex tints.
+/// Bake a 32-angle, 2× supersampled atlas from multiple source-material
+/// surfaces with a single shared per-sample depth buffer.
 ///
-/// The source geometry is normalized to the unit bounding sphere around
+/// Every source is normalized to the same unit bounding sphere around
 /// the canonical object center. Each supersample independently tests the
 /// interpolated texture alpha * vertex alpha against the source cutoff,
 /// with a depth buffer so foliage behind holes remains visible.
@@ -273,42 +295,42 @@ fn downsample(
 /// # Errors
 /// Rejects empty/non-triangular/out-of-range meshes, non-finite geometry,
 /// source points outside the unit sphere, and invalid tile parameters.
-pub fn bake_mesh(
-    vertices: &[TreeVertex],
-    indices: &[u32],
-    source: &SourceImage,
-    alpha_cutoff: f32,
-    tile_size: u32,
-    gutter: u32,
-) -> Result<AtlasImage> {
-    if vertices.is_empty() || indices.is_empty() || !indices.len().is_multiple_of(3) {
-        return Err(Error::InvalidConfiguration(
-            "atlas source must contain triangles",
-        ));
+pub fn bake_scene(surfaces: &[BakeSurface<'_>], tile_size: u32, gutter: u32) -> Result<AtlasImage> {
+    if surfaces.is_empty() {
+        return Err(Error::InvalidConfiguration("atlas scene has no surfaces"));
     }
-    if vertices.iter().any(|v| {
-        !v.position.iter().all(|x| x.is_finite())
-            || !v.uv.iter().all(|x| x.is_finite())
-            || !v
-                .color
-                .iter()
-                .all(|x| x.is_finite() && (0.0..=1.0).contains(x))
-            || dot(
-                [v.position[0], v.position[1], v.position[2]],
-                [v.position[0], v.position[1], v.position[2]],
-            ) > 1.00001
-    }) || indices
-        .iter()
-        .any(|&i| usize::try_from(i).map_or(true, |i| i >= vertices.len()))
-    {
-        return Err(Error::InvalidConfiguration(
-            "invalid atlas source vertex/index",
-        ));
-    }
-    if !alpha_cutoff.is_finite() || !(0.0..=1.0).contains(&alpha_cutoff) {
-        return Err(Error::InvalidConfiguration(
-            "invalid source material alpha cutoff",
-        ));
+    for surface in surfaces {
+        let vertices = surface.vertices;
+        let indices = surface.indices;
+        if vertices.is_empty() || indices.is_empty() || !indices.len().is_multiple_of(3) {
+            return Err(Error::InvalidConfiguration(
+                "atlas source must contain triangles",
+            ));
+        }
+        if vertices.iter().any(|v| {
+            !v.position.iter().all(|x| x.is_finite())
+                || !v.uv.iter().all(|x| x.is_finite())
+                || !v
+                    .color
+                    .iter()
+                    .all(|x| x.is_finite() && (0.0..=1.0).contains(x))
+                || dot(
+                    [v.position[0], v.position[1], v.position[2]],
+                    [v.position[0], v.position[1], v.position[2]],
+                ) > 1.00001
+        }) || indices
+            .iter()
+            .any(|&i| usize::try_from(i).map_or(true, |i| i >= vertices.len()))
+        {
+            return Err(Error::InvalidConfiguration(
+                "invalid atlas source vertex/index",
+            ));
+        }
+        if !surface.alpha_cutoff.is_finite() || !(0.0..=1.0).contains(&surface.alpha_cutoff) {
+            return Err(Error::InvalidConfiguration(
+                "invalid source material alpha cutoff",
+            ));
+        }
     }
     if !(8..=512).contains(&tile_size) || gutter == 0 || gutter * 4 >= tile_size {
         return Err(Error::InvalidConfiguration(
@@ -319,23 +341,29 @@ pub fn bake_mesh(
     let height = usize::try_from(tile_size * ELEVATION_VIEWS).map_err(|_| Error::IndexOverflow)?;
     let tile = usize::try_from(tile_size).map_err(|_| Error::IndexOverflow)?;
     let padding = usize::try_from(gutter).map_err(|_| Error::IndexOverflow)?;
-    let checked_indices = indices
+    let prepared = surfaces
         .iter()
-        .map(|&i| usize::try_from(i).map_err(|_| Error::IndexOverflow))
+        .map(|surface| {
+            Ok(PreparedSurface {
+                vertices: surface.vertices,
+                indices: surface
+                    .indices
+                    .iter()
+                    .map(|&i| usize::try_from(i).map_err(|_| Error::IndexOverflow))
+                    .collect::<Result<Vec<_>>>()?,
+                source: surface.source,
+                texels: surface.source.linear_texels(),
+                alpha_cutoff: surface.alpha_cutoff,
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     let row_count = u16::try_from(ELEVATION_VIEWS).map_err(|_| Error::IndexOverflow)?;
     let col_count = u16::try_from(AZIMUTH_VIEWS).map_err(|_| Error::IndexOverflow)?;
     let side = u16::try_from((tile - 2 * padding) * 2).map_err(|_| Error::IndexOverflow)?;
-    let texels = source.linear_texels();
-    let material = RasterMaterial {
-        source,
-        texels: &texels,
-        cutoff: alpha_cutoff,
-    };
     let mut rgba = vec![0_u8; width * height * 4];
     for row in 0..row_count {
         for col in 0..col_count {
-            let supersampled = render_view(vertices, &checked_indices, side, col, row, material);
+            let supersampled = render_view(&prepared, side, col, row);
             downsample(
                 &mut rgba,
                 width,
@@ -347,6 +375,27 @@ pub fn bake_mesh(
         }
     }
     AtlasImage::new(tile_size, gutter, rgba)
+}
+
+/// Convenience entrypoint for a source with one material.
+pub fn bake_mesh(
+    vertices: &[TreeVertex],
+    indices: &[u32],
+    source: &SourceImage,
+    alpha_cutoff: f32,
+    tile_size: u32,
+    gutter: u32,
+) -> Result<AtlasImage> {
+    bake_scene(
+        &[BakeSurface {
+            vertices,
+            indices,
+            source,
+            alpha_cutoff,
+        }],
+        tile_size,
+        gutter,
+    )
 }
 
 #[cfg(test)]
@@ -520,5 +569,103 @@ mod textured_tests {
         assert!(bake_mesh(&vertices, &indices, &SourceImage::white(), f32::NAN, 32, 2).is_err());
         vertices[0].uv = [f32::INFINITY, 0.0];
         assert!(bake_mesh(&vertices, &indices, &SourceImage::white(), 0.5, 32, 2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod multi_material_tests {
+    use super::*;
+
+    fn square(z: f32) -> (Vec<TreeVertex>, Vec<u32>) {
+        let vertices = [
+            ([-0.6, -0.6, z, 1.0], [0.0, 0.0]),
+            ([0.6, -0.6, z, 1.0], [1.0, 0.0]),
+            ([-0.6, 0.6, z, 1.0], [0.0, 1.0]),
+            ([0.6, 0.6, z, 1.0], [1.0, 1.0]),
+        ]
+        .map(|(position, uv)| TreeVertex {
+            position,
+            uv,
+            color: [1.0; 4],
+        });
+        (vertices.into(), vec![0, 1, 2, 2, 1, 3])
+    }
+
+    #[test]
+    fn multi_material_depth_and_alpha_cutout_are_draw_order_independent() {
+        let (trunk, indices) = square(-0.2);
+        let (leaves, leaf_indices) = square(0.2);
+        let red = SourceImage::new(1, 1, vec![255, 20, 20, 255]).unwrap();
+        let green = SourceImage::new(
+            8,
+            8,
+            (0..64)
+                .flat_map(|pixel| [20, 230, 20, if pixel % 8 < 4 { 255 } else { 0 }])
+                .collect(),
+        )
+        .unwrap();
+        let materials = [
+            BakeSurface {
+                vertices: &trunk,
+                indices: &indices,
+                source: &red,
+                alpha_cutoff: 0.0,
+            },
+            BakeSurface {
+                vertices: &leaves,
+                indices: &leaf_indices,
+                source: &green,
+                alpha_cutoff: 0.5,
+            },
+        ];
+        let a = bake_scene(&materials, 32, 2).unwrap();
+        let b = bake_scene(&[materials[1], materials[0]], 32, 2).unwrap();
+        assert_eq!(a, b, "independent materials must share one depth buffer");
+        let width = usize::try_from(a.width()).unwrap();
+        let rgba = a.rgba();
+        let colors = (3..29)
+            .flat_map(|y| {
+                (3..29).map(move |x| {
+                    let at = 4 * (y * width + x);
+                    [rgba[at], rgba[at + 1], rgba[at + 3]]
+                })
+            })
+            .filter(|pixel| pixel[2] > 100)
+            .collect::<Vec<_>>();
+        assert!(
+            colors.iter().filter(|p| p[0] > p[1]).count() > 20,
+            "opaque trunk should show through leaf holes"
+        );
+        assert!(
+            colors.iter().filter(|p| p[1] > p[0]).count() > 20,
+            "cutout leaves should occlude trunk where opaque"
+        );
+    }
+
+    #[test]
+    fn scene_validates_every_source_draw() {
+        let (vertices, indices) = square(0.0);
+        let white = SourceImage::white();
+        let valid = BakeSurface {
+            vertices: &vertices,
+            indices: &indices,
+            source: &white,
+            alpha_cutoff: 0.1,
+        };
+        let invalid = BakeSurface {
+            vertices: &vertices,
+            indices: &[4, 1, 2],
+            source: &white,
+            alpha_cutoff: 0.1,
+        };
+        assert!(bake_scene(&[], 32, 2).is_err());
+        assert!(bake_scene(&[valid, invalid], 32, 2).is_err());
+        let invalid_cutoff = BakeSurface {
+            vertices: &vertices,
+            indices: &indices,
+            source: &white,
+            alpha_cutoff: f32::NAN,
+        };
+        assert!(bake_scene(&[invalid_cutoff], 32, 2).is_err());
     }
 }

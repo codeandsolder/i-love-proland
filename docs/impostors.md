@@ -61,8 +61,11 @@ The quad faces the camera but remains dimensioned to the source bounding
 sphere. Right/up axes are constructed from the view direction and world-up,
 including a stable vertical fallback.
 
-`atlas_bake::bake_mesh()` is a deterministic Rust reference baker for
-**UV-textured triangles and per-vertex tints**, with 32 orthographic view
+`atlas_bake::bake_scene()` accepts a slice of `BakeSurface` records containing
+original UV-textured triangles, source texture, and material-specific alpha
+cutoff. All surfaces share one per-supersample depth buffer so leaves, branches
+and trunks occlude each other correctly even through alpha cutouts.
+`bake_mesh()` is a single-material convenience wrapper. The baker uses 32 orthographic view
 cameras, bilinear source sampling and sRGB-to-linear decoding. It performs
 per-supersample alpha cutout, per-view depth testing, 2× raster
 supersampling, premultiplied linear-light resolve, alpha coverage preservation
