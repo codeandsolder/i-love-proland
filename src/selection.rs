@@ -15,6 +15,8 @@ pub struct Variant {
 ///
 /// When additional variants are registered, existing object **identities** and
 /// coordinates remain unchanged; only some model variants can change.
+/// # Errors
+/// Rejects missing variants, duplicate IDs and nonfinite or nonpositive weights.
 pub fn choose_variant(object_id: u128, variants: &[Variant]) -> Result<u64> {
     if variants.is_empty() {
         return Err(Error::InvalidConfiguration(
@@ -38,7 +40,11 @@ pub fn choose_variant(object_id: u128, variants: &[Variant]) -> Result<u64> {
 }
 
 /// Hot-path version for a Layer whose variants were checked once at creation.
-pub(crate) fn choose_variant_validated(object_id: u128, variants: &[Variant]) -> u64 {
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "extract low and high 64-bit limbs of the stable u128 object ID"
+)]
+pub fn choose_variant_validated(object_id: u128, variants: &[Variant]) -> u64 {
     let mut best = (f64::INFINITY, u64::MAX);
     for variant in variants {
         let mut random = Rng::new(hash_words(&[

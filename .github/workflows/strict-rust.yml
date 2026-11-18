@@ -18,3 +18,4 @@ jobs:
     with:
       cargo-args: "--locked --workspace --all-targets"
       ban-python-outside-ci: true
+      allow-test-panics: true # tests use ordinary assertion and Result unwrap ergonomics
