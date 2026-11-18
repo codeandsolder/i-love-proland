@@ -127,7 +127,7 @@ fn raster_triangle(triangle: [Sample; 3], side: usize, depth: &mut [f32], color:
 
 fn render_view(
     vertices: &[TreeVertex],
-    indices: &[u32],
+    indices: &[usize],
     side: usize,
     azi: u32,
     elev: u32,
@@ -140,11 +140,7 @@ fn render_view(
         .map(|vertex| project(vertex, eye, right, up, side as f32))
         .collect();
     for face in indices.chunks_exact(3) {
-        let samples = [
-            projected[usize::try_from(face[0]).expect("indices validated by baker")],
-            projected[usize::try_from(face[1]).expect("indices validated by baker")],
-            projected[usize::try_from(face[2]).expect("indices validated by baker")],
-        ];
+        let samples = [projected[face[0]], projected[face[1]], projected[face[2]]];
         raster_triangle(samples, side, &mut depth, &mut color);
     }
     color
@@ -278,10 +274,20 @@ pub fn bake_colored_mesh(
     let height = usize::try_from(tile_size * ELEVATION_VIEWS).map_err(|_| Error::IndexOverflow)?;
     let tile = usize::try_from(tile_size).map_err(|_| Error::IndexOverflow)?;
     let padding = usize::try_from(gutter).map_err(|_| Error::IndexOverflow)?;
+    let checked_indices = indices
+        .iter()
+        .map(|&i| usize::try_from(i).map_err(|_| Error::IndexOverflow))
+        .collect::<Result<Vec<_>>>()?;
     let mut rgba = vec![0_u8; width * height * 4];
     for row in 0..ELEVATION_VIEWS {
         for col in 0..AZIMUTH_VIEWS {
-            let supersampled = render_view(vertices, indices, (tile - 2 * padding) * 2, col, row);
+            let supersampled = render_view(
+                vertices,
+                &checked_indices,
+                (tile - 2 * padding) * 2,
+                col,
+                row,
+            );
             downsample(
                 &mut rgba,
                 width,

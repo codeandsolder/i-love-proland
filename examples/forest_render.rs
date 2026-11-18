@@ -130,8 +130,8 @@ fn generate_forest() -> Result<(Vec<PackedInstance>, f64), Box<dyn Error>> {
                 let radius = 8.0 + 5.0 * instance.candidate.size_unit as f32;
                 let p = [
                     ((cell.x as f64 + xy[0]) * 12.0) as f32,
-                    -9.0 + instance.candidate.size_unit as f32,
-                    (140.0 + (cell.y as f64 + xy[1]) * 12.0) as f32,
+                    -6.0 + instance.candidate.size_unit as f32,
+                    (45.0 + (cell.y as f64 + xy[1]) * 12.0) as f32,
                 ];
                 packed.push(PackedInstance::from_instance(
                     &instance,
