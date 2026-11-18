@@ -2,10 +2,10 @@
 //! and multi-angle impostors. Output PPM files can be converted to PNG with
 //! external conversion tools without adding runtime dependencies to the library.
 
-use i_love_proland::atlas_bake::bake_mesh;
+use i_love_proland::atlas_bake::{BakeSurface, bake_scene};
 use i_love_proland::gpu::{GpuCompactor, GpuView, PackedInstance, RenderPose};
 use i_love_proland::impostor::{
-    AtlasImage, TreeCamera, TreeMesh, TreeRenderConfig, TreeRenderer, TreeVertex,
+    AtlasImage, TreeCamera, TreeMaterial, TreeMesh, TreeRenderConfig, TreeRenderer, TreeVertex,
 };
 use i_love_proland::material::SourceImage;
 use i_love_proland::{Distribution, Domain, Generator, GeneratorConfig, Layer, TileKey, Variant};
@@ -330,7 +330,6 @@ struct ForestPass<'a> {
     queue: &'a wgpu::Queue,
     compactor: &'a GpuCompactor,
     renderer: &'a TreeRenderer,
-    mesh: &'a TreeMesh,
     candidates: &'a [PackedInstance],
     view: GpuView,
     color: &'a wgpu::TextureView,
@@ -345,6 +344,7 @@ fn render_frame(
     scene
         .compactor
         .encode(scene.queue, encoder, scene.candidates, scene.view)?;
+    scene.renderer.encode_mesh_draws(encoder, scene.compactor);
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("i-love-proland real forest GPU draw"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -370,7 +370,7 @@ fn render_frame(
     });
     pass.set_pipeline(scene.background);
     pass.draw(0..3, 0..1);
-    scene.renderer.draw(&mut pass, scene.mesh, scene.compactor);
+    scene.renderer.draw(&mut pass, scene.compactor);
     Ok(())
 }
 
@@ -573,35 +573,75 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let (vertices, indices) = sample_tree()?;
     let source = load_source_image(&args.collect::<Vec<_>>())?;
+    // The synthetic source consists of a 10-sided trunk (20 vertices, 60
+    // indices), followed by several UV-mapped crowns. They use different
+    // source textures and alpha cutoffs but share one physical tree instance.
+    let trunk_vertices = &vertices[..20];
+    let trunk_indices = &indices[..60];
+    let leaf_vertices = &vertices[20..];
+    let leaf_indices = indices[60..]
+        .iter()
+        .map(|index| index - 20)
+        .collect::<Vec<_>>();
+    let bark = SourceImage::white();
     let start = Instant::now();
-    let atlas = bake_mesh(&vertices, &indices, &source, 0.45, 64, 2)?;
+    let atlas = bake_scene(
+        &[
+            BakeSurface {
+                vertices: trunk_vertices,
+                indices: trunk_indices,
+                source: &bark,
+                alpha_cutoff: 0.0,
+            },
+            BakeSurface {
+                vertices: leaf_vertices,
+                indices: &leaf_indices,
+                source: &source,
+                alpha_cutoff: 0.45,
+            },
+        ],
+        64,
+        2,
+    )?;
     let atlas_ms = start.elapsed().as_secs_f64() * 1000.0;
     write_atlas_preview(&format!("{prefix}-atlas.ppm"), &atlas)?;
 
     let (candidates, generation_ms) = generate_forest()?;
     let (device, queue) = create_device()?;
-    let gpu_mesh = TreeMesh::new(&device, &vertices, &indices)?;
+    let trunk_mesh = TreeMesh::new(&device, trunk_vertices, trunk_indices)?;
+    let leaf_mesh = TreeMesh::new(&device, leaf_vertices, &leaf_indices)?;
     let compactor = GpuCompactor::new(
         &device,
         u32::try_from(candidates.len())?,
-        gpu_mesh.index_count(),
+        trunk_mesh.index_count(),
         6,
     )?;
     let atlas_texture = atlas.upload(&device, &queue)?;
+    let bark_texture = bark.upload(&device, &queue)?;
     let source_texture = source.upload(&device, &queue)?;
     let renderer = TreeRenderer::new(
         &device,
         &compactor,
-        &gpu_mesh,
+        vec![
+            TreeMaterial {
+                mesh: trunk_mesh,
+                source_view: bark_texture.view(),
+                alpha_cutoff: 0.0,
+            },
+            TreeMaterial {
+                mesh: leaf_mesh,
+                source_view: source_texture.view(),
+                alpha_cutoff: 0.45,
+            },
+        ],
         &atlas_texture,
-        source_texture.view(),
         TreeRenderConfig {
             color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
             depth_format: wgpu::TextureFormat::Depth24Plus,
             sample_count: 1,
-            alpha_cutoff: 0.45,
         },
     )?;
+    assert_eq!(renderer.material_count(), 2);
     let (low_camera, view) = pitched_view(0.0)?;
     renderer.set_camera(&queue, low_camera);
     let targets = make_frame_targets(&device);
@@ -617,7 +657,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         queue: &queue,
         compactor: &compactor,
         renderer: &renderer,
-        mesh: &gpu_mesh,
         candidates: &candidates,
         view,
         color: color_view,
@@ -650,7 +689,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "FOREST_RENDER_PASS candidates={} mesh_indices={} atlas_ms={atlas_ms:.2} canonical_ms={generation_ms:.2} capture_green_pixels={greens} gpu_compact_and_indirect_render_ms={frame_ms:.3} images={prefix}-scene.ppm,{prefix}-atlas.ppm",
         candidates.len(),
-        gpu_mesh.index_count(),
+        trunk_indices.len() + leaf_indices.len(),
     );
     Ok(())
 }

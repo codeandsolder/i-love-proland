@@ -1,7 +1,7 @@
 //! Actual instanced source-mesh and multi-angle impostor rendering.
 //! Consumes compacted GPU buffers without reading back their contents.
 
-use crate::gpu::GpuCompactor;
+use crate::gpu::{GpuCompactor, IndexedDraw};
 use crate::{Error, Result};
 use wgpu::util::DeviceExt;
 
@@ -244,7 +244,6 @@ pub struct TreeRenderConfig {
     pub color_format: wgpu::TextureFormat,
     pub depth_format: wgpu::TextureFormat,
     pub sample_count: u32,
-    pub alpha_cutoff: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -253,16 +252,31 @@ enum PassKind {
     Impostor,
 }
 
-/// Draw two indexed-indirect batches directly from GPU-compacted instances.
+/// One textured source mesh. The renderer takes ownership of its GPU mesh.
+pub struct TreeMaterial<'a> {
+    pub mesh: TreeMesh,
+    pub source_view: &'a wgpu::TextureView,
+    pub alpha_cutoff: f32,
+}
+
+struct MeshDraw {
+    mesh: TreeMesh,
+    bind: wgpu::BindGroup,
+    uniforms: wgpu::Buffer,
+    indirect: wgpu::Buffer,
+    cutoff: f32,
+}
+
+/// Original near-material draws share one GPU-visible instance list and one
+/// distant impostor draw, without reclassifying the same tree per material.
 pub struct TreeRenderer {
     mesh_pipeline: wgpu::RenderPipeline,
     impostor_pipeline: wgpu::RenderPipeline,
-    mesh_bind: wgpu::BindGroup,
+    mesh_draws: Vec<MeshDraw>,
     impostor_bind: wgpu::BindGroup,
-    uniforms: wgpu::Buffer,
+    impostor_uniforms: wgpu::Buffer,
     quad_indices: wgpu::Buffer,
     gutter_fraction: f32,
-    cutoff: f32,
     alpha_to_coverage: bool,
 }
 
@@ -449,30 +463,35 @@ fn make_source_sampler(device: &wgpu::Device) -> wgpu::Sampler {
 }
 
 impl TreeRenderer {
-    /// Compile the near source-mesh and middle billboard pipelines.
+    /// Compile the near mesh materials and one shared middle impostor pass.
+    /// The first mesh provides the compactor's base indirect index count.
     ///
     /// # Errors
-    /// Rejects mismatched compactor geometry index counts.
+    /// Rejects empty/invalid materials, invalid sample count and incompatible
+    /// compactor mesh/impostor arguments.
     pub fn new(
         device: &wgpu::Device,
         compactor: &GpuCompactor,
-        mesh: &TreeMesh,
+        sources: Vec<TreeMaterial<'_>>,
         atlas: &AtlasTexture,
-        source_view: &wgpu::TextureView,
         config: TreeRenderConfig,
     ) -> Result<Self> {
-        if !config.alpha_cutoff.is_finite()
-            || !(0.0..=1.0).contains(&config.alpha_cutoff)
+        if sources.is_empty()
             || config.sample_count == 0
             || !config.sample_count.is_power_of_two()
+            || sources
+                .iter()
+                .any(|s| !s.alpha_cutoff.is_finite() || !(0.0..=1.0).contains(&s.alpha_cutoff))
         {
-            return Err(Error::InvalidConfiguration("invalid tree render config"));
+            return Err(Error::InvalidConfiguration(
+                "invalid forest materials or sample count",
+            ));
         }
-        if compactor.mesh_index_count() != mesh.index_count()
+        if compactor.mesh_index_count() != sources[0].mesh.index_count()
             || compactor.impostor_index_count() != 6
         {
             return Err(Error::InvalidConfiguration(
-                "compactor draw index counts must match tree mesh and billboard quad",
+                "incompatible compactor draw indexes",
             ));
         }
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -493,31 +512,79 @@ impl TreeRenderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("i-love-proland tree view/projection uniform"),
-            size: core::mem::size_of::<DrawUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let materials = MaterialBindings {
-            atlas,
-            atlas_sampler: &sampler,
-            source_view,
-            source_sampler: &source_sampler,
+        let new_uniform = || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("i-love-proland material camera uniforms"),
+                size: core::mem::size_of::<DrawUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         };
-        let mesh_bind = make_draw_bind(
-            device,
-            &layout,
-            compactor.mesh_instances(),
-            &uniforms,
-            &materials,
-        );
+        let mesh_draws = sources
+            .into_iter()
+            .map(|source| {
+                let uniforms = new_uniform();
+                let bind = make_draw_bind(
+                    device,
+                    &layout,
+                    compactor.mesh_instances(),
+                    &uniforms,
+                    &MaterialBindings {
+                        atlas,
+                        atlas_sampler: &sampler,
+                        source_view: source.source_view,
+                        source_sampler: &source_sampler,
+                    },
+                );
+                let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("i-love-proland material indirect arguments"),
+                    contents: bytemuck::bytes_of(&IndexedDraw {
+                        index_count: source.mesh.index_count(),
+                        instance_count: 0,
+                        first_index: 0,
+                        base_vertex: 0,
+                        first_instance: 0,
+                    }),
+                    usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                });
+                MeshDraw {
+                    mesh: source.mesh,
+                    bind,
+                    uniforms,
+                    indirect,
+                    cutoff: source.alpha_cutoff,
+                }
+            })
+            .collect();
+        let impostor_uniforms = new_uniform();
+        // Fragment stage for impostors samples only the composite angular atlas.
+        // Its source texture slot is unused but required by the common layout.
+        let placeholder = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("i-love-proland unused impostor source texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let placeholder_view = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
         let impostor_bind = make_draw_bind(
             device,
             &layout,
             compactor.impostor_instances(),
-            &uniforms,
-            &materials,
+            &impostor_uniforms,
+            &MaterialBindings {
+                atlas,
+                atlas_sampler: &sampler,
+                source_view: &placeholder_view,
+                source_sampler: &source_sampler,
+            },
         );
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: core::mem::size_of::<TreeVertex>() as u64,
@@ -548,51 +615,62 @@ impl TreeRenderer {
         Ok(Self {
             mesh_pipeline,
             impostor_pipeline,
-            mesh_bind,
+            mesh_draws,
             impostor_bind,
-            uniforms,
+            impostor_uniforms,
             quad_indices,
             gutter_fraction: atlas.gutter_fraction,
-            cutoff: config.alpha_cutoff,
             alpha_to_coverage: config.sample_count > 1,
         })
     }
 
-    /// Upload the camera view before dispatch/render recording.
+    /// Upload one camera matrix, keeping original alpha cutoffs per material.
     pub fn set_camera(&self, queue: &wgpu::Queue, camera: TreeCamera) {
-        let uniform = DrawUniform {
+        let mut uniform = DrawUniform {
             projection: camera.projection,
             atlas: [8.0, 4.0, self.gutter_fraction, 0.0],
-            material: [
-                self.cutoff,
-                f32::from(u8::from(self.alpha_to_coverage)),
-                0.0,
-                0.0,
-            ],
+            material: [0.0, f32::from(u8::from(self.alpha_to_coverage)), 0.0, 0.0],
         };
-        queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniform));
+        for material in &self.mesh_draws {
+            uniform.material[0] = material.cutoff;
+            queue.write_buffer(&material.uniforms, 0, bytemuck::bytes_of(&uniform));
+        }
+        uniform.material[0] = 0.0;
+        queue.write_buffer(&self.impostor_uniforms, 0, bytemuck::bytes_of(&uniform));
     }
 
-    /// Record near-mesh and billboard indexed-indirect draws.
-    ///
-    /// Encode the compactor compute pass before the rendering pass. The host
-    /// owns target clearing, MSAA, depth and all render-pass synchronization.
+    /// Copy the GPU-computed near instance count into each material's indirect
+    /// draw arguments, preserving its original index count. This must happen
+    /// after compaction and before drawing, in the same encoder.
+    pub fn encode_mesh_draws(&self, encoder: &mut wgpu::CommandEncoder, compactor: &GpuCompactor) {
+        for material in &self.mesh_draws {
+            encoder.copy_buffer_to_buffer(compactor.mesh_indirect(), 4, &material.indirect, 4, 4);
+        }
+    }
+
+    /// Draw every near material with the compacted shared instance set,
+    /// then emit precisely one composite middle-distance impostor draw.
     pub fn draw<'pass>(
         &'pass self,
         pass: &mut wgpu::RenderPass<'pass>,
-        mesh: &'pass TreeMesh,
         compactor: &'pass GpuCompactor,
     ) {
         pass.set_pipeline(&self.mesh_pipeline);
-        pass.set_bind_group(0, &self.mesh_bind, &[]);
-        pass.set_vertex_buffer(0, mesh.vertex.slice(..));
-        pass.set_index_buffer(mesh.index.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed_indirect(compactor.mesh_indirect(), 0);
-
+        for material in &self.mesh_draws {
+            pass.set_bind_group(0, &material.bind, &[]);
+            pass.set_vertex_buffer(0, material.mesh.vertex.slice(..));
+            pass.set_index_buffer(material.mesh.index.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed_indirect(&material.indirect, 0);
+        }
         pass.set_pipeline(&self.impostor_pipeline);
         pass.set_bind_group(0, &self.impostor_bind, &[]);
         pass.set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed_indirect(compactor.impostor_indirect(), 0);
+    }
+
+    #[must_use]
+    pub fn material_count(&self) -> usize {
+        self.mesh_draws.len()
     }
 }
 
