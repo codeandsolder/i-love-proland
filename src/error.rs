@@ -9,6 +9,8 @@ pub enum Error {
     DensityExceedsStratification,
     CandidateLimitExceeded,
     InvalidHabitat,
+    InvalidBounds,
+    TileLimitExceeded,
 }
 
 impl fmt::Display for Error {
@@ -27,6 +29,8 @@ impl fmt::Display for Error {
                 write!(f, "explicit per-tile candidate budget exhausted")
             }
             Self::InvalidHabitat => write!(f, "habitat fraction must be finite and in [0, 1]"),
+            Self::InvalidBounds => write!(f, "cell or world-space rectangle has invalid bounds"),
+            Self::TileLimitExceeded => write!(f, "explicit streaming tile budget exceeded"),
         }
     }
 }
