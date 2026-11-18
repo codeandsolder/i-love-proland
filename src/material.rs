@@ -135,28 +135,20 @@ impl SourceImage {
             position_x - position_x.floor(),
             position_y - position_y.floor(),
         ];
-        let w = i32::from(self.width);
-        let h = i32::from(self.height);
+        let width_i32 = i32::from(self.width);
+        let height_i32 = i32::from(self.height);
         let texel = |dx: i32, dy: i32| {
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "rem_euclid produces nonnegative image indices"
-            )]
-            let x = (left + dx).rem_euclid(w) as usize;
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "rem_euclid produces nonnegative image indices"
-            )]
-            let y = (top + dy).rem_euclid(h) as usize;
+            let x = (left + dx).rem_euclid(width_i32) as usize;
+            let y = (top + dy).rem_euclid(height_i32) as usize;
             texels[y * usize::from(self.width) + x]
         };
-        let a = texel(0, 0);
-        let b = texel(1, 0);
-        let c = texel(0, 1);
-        let d = texel(1, 1);
+        let top_left = texel(0, 0);
+        let top_right = texel(1, 0);
+        let bottom_left = texel(0, 1);
+        let bottom_right = texel(1, 1);
         core::array::from_fn(|i| {
-            let upper = a[i].mul_add(1.0 - fractions[0], b[i] * fractions[0]);
-            let lower = c[i].mul_add(1.0 - fractions[0], d[i] * fractions[0]);
+            let upper = top_left[i].mul_add(1.0 - fractions[0], top_right[i] * fractions[0]);
+            let lower = bottom_left[i].mul_add(1.0 - fractions[0], bottom_right[i] * fractions[0]);
             upper.mul_add(1.0 - fractions[1], lower * fractions[1])
         })
     }
@@ -177,7 +169,7 @@ pub(crate) fn linear_to_srgb(value: f32) -> f32 {
     if c <= 0.003_130_8 {
         12.92 * c
     } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
+        1.055_f32.mul_add(c.powf(1.0 / 2.4), -0.055)
     }
 }
 

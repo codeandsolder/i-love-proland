@@ -391,15 +391,19 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+struct MaterialBindings<'a> {
+    atlas: &'a AtlasTexture,
+    atlas_sampler: &'a wgpu::Sampler,
+    source: &'a SourceTexture,
+    source_sampler: &'a wgpu::Sampler,
+}
+
 fn make_draw_bind(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     instances: &wgpu::Buffer,
     uniforms: &wgpu::Buffer,
-    atlas: &AtlasTexture,
-    sampler: &wgpu::Sampler,
-    source: &SourceTexture,
-    source_sampler: &wgpu::Sampler,
+    materials: &MaterialBindings<'_>,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("i-love-proland tree indirect draw bindings"),
@@ -415,21 +419,33 @@ fn make_draw_bind(
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: wgpu::BindingResource::TextureView(&atlas.view),
+                resource: wgpu::BindingResource::TextureView(&materials.atlas.view),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: wgpu::BindingResource::Sampler(sampler),
+                resource: wgpu::BindingResource::Sampler(materials.atlas_sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: wgpu::BindingResource::TextureView(&source.view),
+                resource: wgpu::BindingResource::TextureView(&materials.source.view),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
-                resource: wgpu::BindingResource::Sampler(source_sampler),
+                resource: wgpu::BindingResource::Sampler(materials.source_sampler),
             },
         ],
+    })
+}
+
+fn make_source_sampler(device: &wgpu::Device) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("i-love-proland source UV repeat and linear sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
     })
 }
 
@@ -467,15 +483,7 @@ impl TreeRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        let source_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("i-love-proland source UV repeat and linear sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let source_sampler = make_source_sampler(device);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("i-love-proland mesh and 32-angle impostor shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -492,25 +500,25 @@ impl TreeRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let materials = MaterialBindings {
+            atlas,
+            atlas_sampler: &sampler,
+            source,
+            source_sampler: &source_sampler,
+        };
         let mesh_bind = make_draw_bind(
             device,
             &layout,
             compactor.mesh_instances(),
             &uniforms,
-            atlas,
-            &sampler,
-            source,
-            &source_sampler,
+            &materials,
         );
         let impostor_bind = make_draw_bind(
             device,
             &layout,
             compactor.impostor_instances(),
             &uniforms,
-            atlas,
-            &sampler,
-            source,
-            &source_sampler,
+            &materials,
         );
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: core::mem::size_of::<TreeVertex>() as u64,

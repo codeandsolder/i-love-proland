@@ -613,20 +613,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("low-altitude forest test scene"),
     });
-    render_frame(
-        &mut encoder,
-        &ForestPass {
-            queue: &queue,
-            compactor: &compactor,
-            renderer: &renderer,
-            mesh: &gpu_mesh,
-            candidates: &candidates,
-            view,
-            color: color_view,
-            depth: depth_view,
-            background: &background,
-        },
-    )?;
+    let scene = ForestPass {
+        queue: &queue,
+        compactor: &compactor,
+        renderer: &renderer,
+        mesh: &gpu_mesh,
+        candidates: &candidates,
+        view,
+        color: color_view,
+        depth: depth_view,
+        background: &background,
+    };
+    render_frame(&mut encoder, &scene)?;
     let image = capture(&device, &queue, encoder, color)?;
     let greens = image
         .as_chunks::<4>()
@@ -641,37 +639,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     render_overhead(
         &device,
-        &ForestPass {
-            queue: &queue,
-            compactor: &compactor,
-            renderer: &renderer,
-            mesh: &gpu_mesh,
-            candidates: &candidates,
-            view,
-            color: color_view,
-            depth: depth_view,
-            background: &background,
-        },
+        &scene,
         low_camera,
         &overhead_background,
         color,
         &prefix,
     )?;
 
-    let frame_ms = benchmark_forest(
-        &device,
-        &ForestPass {
-            queue: &queue,
-            compactor: &compactor,
-            renderer: &renderer,
-            mesh: &gpu_mesh,
-            candidates: &candidates,
-            view,
-            color: color_view,
-            depth: depth_view,
-            background: &background,
-        },
-    )?;
+    let frame_ms = benchmark_forest(&device, &scene)?;
     println!(
         "FOREST_RENDER_PASS candidates={} mesh_indices={} atlas_ms={atlas_ms:.2} canonical_ms={generation_ms:.2} capture_green_pixels={greens} gpu_compact_and_indirect_render_ms={frame_ms:.3} images={prefix}-scene.ppm,{prefix}-atlas.ppm",
         candidates.len(),

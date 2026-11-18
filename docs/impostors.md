@@ -6,15 +6,18 @@ a CPU-side visibility simulation.
 
 ## Draw contract
 
-- The source tree is a triangle mesh of `TreeVertex` records (position and
-  RGBA color). Positions are normalized to the unit sphere around the object
-  center. A distinct renderer/compactor is used for incompatible source
-  materials or index buffers.
+- Source geometry consists of `TreeVertex` records (position, linear RGBA
+  tint and source UV). Positions are normalized to a unit sphere around the
+  object center. Textures are `SourceImage` records containing row-major
+  sRGB RGBA8 bytes decoded by the host from its own PNG/DDS pipeline.
+  A distinct renderer/compactor is used per source material/index buffer.
 - `PackedInstance::position_radius.xyz` is the **camera-relative sphere
   center**. The fourth component is the physical radius, already inclusive of
   object scale. `attributes.x` gives stable yaw turns.
 - Construct `TreeMesh`, `GpuCompactor::new(device, capacity,
-  mesh.index_count(), 6)`, `AtlasImage::upload`, then `TreeRenderer::new`.
+  mesh.index_count(), 6)`, `AtlasImage::upload`, `SourceImage::upload`, then
+  `TreeRenderer::new(device, compactor, mesh, atlas, source,
+  TreeRenderConfig { color_format, depth_format, sample_count, alpha_cutoff })`.
 - Before each render pass, encode `compactor.encode()` into the **same
   command encoder**, and call `renderer.set_camera()` before submitting the
   command buffer. In a render pass using the configured color/depth formats,
@@ -23,11 +26,20 @@ a CPU-side visibility simulation.
 - The host owns its color/depth render attachments, pass load operations and
   source material grouping.
 
-A static source tree with transparent leaf cards needs texture-aware source
-shading. The current `TreeVertex` path intentionally supports arbitrary
-**colored/alpha-cutout triangles** and the baker below. An importer for KSP's
-original texture/UV/leaf-card meshes is a further integration task. No
-original KSP/Parallax or Proland assets are shipped with this crate.
+The near-mesh fragment shader samples the original sRGB source albedo using
+bilinear **repeat-wrapped UVs**, combines it with the per-vertex tint, and
+rejects fragments below the configured alpha cutoff. This preserves the
+transparent holes within leaf cards. The source image and CPU reference
+baker use the same UV origin (first RGBA row) and cutoff semantics.
+
+The impostor shader interpolates neighboring views and preserves fractional
+alpha coverage. For a single-sample target it uses stable 4×4 ordered
+coverage dithering with ordinary hardware depth writes, avoiding unsorted
+alpha blending. On a multisample render target, `sample_count > 1` enables
+**alpha-to-coverage** in the impostor pipeline and uses fragment alpha as
+hardware sample coverage. The host owns a matching sample-count color/depth
+pass and resolve attachments. No original KSP/Parallax or Proland assets are
+shipped with this crate.
 
 ## Impostor atlas layout
 
@@ -46,12 +58,13 @@ The quad faces the camera but remains dimensioned to the source bounding
 sphere. Right/up axes are constructed from the view direction and world-up,
 including a stable vertical fallback.
 
-`atlas_bake::bake_colored_mesh()` is a deterministic, pure Rust reference
-baker for arbitrary color-bearing triangulated meshes. It performs
-orthographic rendering for 32 view directions, per-view depth testing,
-alpha-cutout, 2× raster supersampling and alpha-weighted downsampling. The
-host can supply any custom `AtlasImage`, including a texture-correct atlas
-baked using the source engine's own material shader.
+`atlas_bake::bake_mesh()` is a deterministic Rust reference baker for
+**UV-textured triangles and per-vertex tints**, with 32 orthographic view
+cameras, bilinear source sampling and sRGB-to-linear decoding. It performs
+per-supersample alpha cutout, per-view depth testing, 2× raster
+supersampling, premultiplied linear-light resolve, alpha coverage preservation
+and sRGB encoding. The host may supply its own `AtlasImage` for materials
+requiring special GPU shaders (wind animation, normal maps, etc.).
 
 The 32-view atlas is an **appearance/LOD cache**, not persisted simulation
 data. Atlas views can be recreated or replaced without changing canonical
@@ -76,17 +89,38 @@ reference includes a separate sky/ground pass to make silhouettes legible.
 Inspect alpha boundaries, dark edge fringes, view changes and top-down tree
 crowns before selecting optimal per-LOD limits.
 
+## Real source texture validation
+
+The example accepts an optional host-decoded raw RGBA8 texture, without
+adding DDS or PNG dependencies to the engine-independent crate:
+
+```bash
+magick /path/to/oakLeaves.dds -depth 8 \
+  RGBA:/home/jan/builds/i-love-proland/textured-vegetation/oak-leaves.rgba
+cargo +stable run --release --locked --features gpu --example forest_render -- \
+  /home/jan/builds/i-love-proland/textured-vegetation/oak-source \
+  /home/jan/builds/i-love-proland/textured-vegetation/oak-leaves.rgba 1024 1024
+```
+
+This exercises **the actual source texture**, including its DXT5-derived
+transparent leaf cutouts, over the sample's synthetic asymmetric tree geometry.
+The example remains independent of KSP `.mu` scene-node decoding; an engine
+adapter should pass original transformed source positions, mesh UVs and
+separate trunk/leaf material groups. Never treat the synthetic tree image as
+a screenshot of the original `.mu` asset.
+
 ## Constraints and follow-up
 
-- Nearest image is one mip level; a production atlas needs alpha-coverage-
-  preserving mipmap generation, guard borders at each mip and likely
-  alpha-to-coverage or temporally stable foliage coverage.
-- A multi-material source mesh should use appropriate material batches and
-  preserve its exact UV/alpha masks. The current sample tree is solid colored
-  geometry, not actual KSP foliage.
-- The quad geometry is camera-facing; a dense forest needs proper
-  transparency/occlusion, preferably MSAA alpha-to-coverage and vegetation-
-  specific horizon blending before switching to the terrain canopy BRDF.
+- Each uploaded source and angular atlas texture currently has one mip level.
+  Production needs per-level alpha-coverage preservation and isolated atlas
+  tile borders at every mip; the distant terrain canopy shader is separate.
+- Multi-material source geometry must be grouped by source texture and alpha
+  cutoff. The sample test tree is synthetic geometry, even when its texture
+  data is supplied from the user's actual Parallax assets.
+- The quad geometry is camera-facing with either stable screen-space coverage
+  dithering (1 sample) or MSAA alpha-to-coverage. Evaluate temporal stability,
+  vegetation occlusion and horizon blending before transitioning to the
+  terrain canopy BRDF.
 - Below the GPU impostor pixel threshold, objects remain canonical but are
   represented by a **future terrain-attached density/canopy shader**. No
   large-range individual-tree enumeration is intended.
