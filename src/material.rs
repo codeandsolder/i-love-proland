@@ -176,7 +176,16 @@ pub(crate) fn linear_to_srgb(value: f32) -> f32 {
 /// GPU source material storage; kept alive through the host renderer.
 pub struct SourceTexture {
     _texture: wgpu::Texture,
-    pub(crate) view: wgpu::TextureView,
+    view: wgpu::TextureView,
+}
+
+impl SourceTexture {
+    /// Reusable texture view for the renderer. Hosts can instead supply an
+    /// existing BC1/BC3/BC7 source view without an RGBA GPU re-upload.
+    #[must_use]
+    pub const fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
 }
 
 #[cfg(test)]

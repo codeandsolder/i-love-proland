@@ -16,8 +16,11 @@ a CPU-side visibility simulation.
   object scale. `attributes.x` gives stable yaw turns.
 - Construct `TreeMesh`, `GpuCompactor::new(device, capacity,
   mesh.index_count(), 6)`, `AtlasImage::upload`, `SourceImage::upload`, then
-  `TreeRenderer::new(device, compactor, mesh, atlas, source,
+  `TreeRenderer::new(device, compactor, mesh, atlas, source_view,
   TreeRenderConfig { color_format, depth_format, sample_count, alpha_cutoff })`.
+  The `source_view` can be `SourceImage::upload(...).view()` **or an existing
+  filterable GPU BC1/BC3/BC7 DDS texture view**. No uncompressed GPU copy is
+  required when the host already has a compressed, mipmapped source albedo.
 - Before each render pass, encode `compactor.encode()` into the **same
   command encoder**, and call `renderer.set_camera()` before submitting the
   command buffer. In a render pass using the configured color/depth formats,
@@ -111,9 +114,11 @@ a screenshot of the original `.mu` asset.
 
 ## Constraints and follow-up
 
-- Each uploaded source and angular atlas texture currently has one mip level.
-  Production needs per-level alpha-coverage preservation and isolated atlas
-  tile borders at every mip; the distant terrain canopy shader is separate.
+- `SourceImage::upload` creates one uncompressed RGBA8 mip level for the
+  reference/example; a host-provided compressed GPU texture view retains its
+  original compressed mip chain. The generated angular atlas currently has
+  only one mip level; production needs per-level coverage preservation and
+  isolated atlas tile borders at every mip. The far canopy shader is separate.
 - Multi-material source geometry must be grouped by source texture and alpha
   cutoff. The sample test tree is synthetic geometry, even when its texture
   data is supplied from the user's actual Parallax assets.

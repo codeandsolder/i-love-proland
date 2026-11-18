@@ -2,7 +2,6 @@
 //! Consumes compacted GPU buffers without reading back their contents.
 
 use crate::gpu::GpuCompactor;
-use crate::material::SourceTexture;
 use crate::{Error, Result};
 use wgpu::util::DeviceExt;
 
@@ -394,7 +393,7 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 struct MaterialBindings<'a> {
     atlas: &'a AtlasTexture,
     atlas_sampler: &'a wgpu::Sampler,
-    source: &'a SourceTexture,
+    source_view: &'a wgpu::TextureView,
     source_sampler: &'a wgpu::Sampler,
 }
 
@@ -427,7 +426,7 @@ fn make_draw_bind(
             },
             wgpu::BindGroupEntry {
                 binding: 4,
-                resource: wgpu::BindingResource::TextureView(&materials.source.view),
+                resource: wgpu::BindingResource::TextureView(materials.source_view),
             },
             wgpu::BindGroupEntry {
                 binding: 5,
@@ -459,7 +458,7 @@ impl TreeRenderer {
         compactor: &GpuCompactor,
         mesh: &TreeMesh,
         atlas: &AtlasTexture,
-        source: &SourceTexture,
+        source_view: &wgpu::TextureView,
         config: TreeRenderConfig,
     ) -> Result<Self> {
         if !config.alpha_cutoff.is_finite()
@@ -503,7 +502,7 @@ impl TreeRenderer {
         let materials = MaterialBindings {
             atlas,
             atlas_sampler: &sampler,
-            source,
+            source_view,
             source_sampler: &source_sampler,
         };
         let mesh_bind = make_draw_bind(

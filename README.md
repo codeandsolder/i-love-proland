@@ -183,7 +183,9 @@ cargo +stable run --release --locked --features gpu --example forest_render -- /
 ```
 
 The example also accepts host-decoded raw RGBA8 texture data, including
-textures decoded from the original Parallax DDS assets. Source polygons are
+textures decoded from the original Parallax DDS assets. Production hosts
+can bind existing compressed BC3/BC7 source texture views directly,
+without duplicating the source image into an RGBA GPU allocation. Source polygons are
 still synthetic; integration of transformed KSP `.mu` meshes and their
 separate materials, production coverage-preserving mip chains and the distant
 terrain canopy are follow-up tasks. Single-sample rendering uses stable ordered

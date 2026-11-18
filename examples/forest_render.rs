@@ -594,7 +594,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &compactor,
         &gpu_mesh,
         &atlas_texture,
-        &source_texture,
+        source_texture.view(),
         TreeRenderConfig {
             color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
             depth_format: wgpu::TextureFormat::Depth24Plus,
