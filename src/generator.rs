@@ -193,19 +193,66 @@ impl Generator {
     where
         F: Fn(&Candidate) -> f64,
     {
+        self.tile_in_region(tile, None, layer, &habitat)
+    }
+
+    /// Generate only cells belonging to the requested half-open canonical
+    /// rectangle. Objects outside the rectangle are never instantiated or
+    /// passed to the habitat callback, even on partially overlapping tiles.
+    ///
+    /// This is equivalent to generating the entire tile and filtering by
+    /// canonical cell address; it does not change random streams or IDs.
+    ///
+    /// # Errors
+    /// Returns an error for invalid tiles, habitat values, density or
+    /// resource budgets, just like the full tile generation method.
+    pub fn tile_with_habitat_in_cells<F>(
+        self,
+        tile: TileKey,
+        rect: crate::stream::CellRect,
+        layer: &Layer,
+        habitat: F,
+    ) -> Result<Vec<Instance>>
+    where
+        F: Fn(&Candidate) -> f64,
+    {
+        self.tile_in_region(tile, Some(rect), layer, &habitat)
+    }
+
+    fn tile_in_region<F>(
+        self,
+        tile: TileKey,
+        region: Option<crate::stream::CellRect>,
+        layer: &Layer,
+        habitat: &F,
+    ) -> Result<Vec<Instance>>
+    where
+        F: Fn(&Candidate) -> f64,
+    {
         self.domain
             .validate_tile(tile, self.config.cells_per_tile)?;
         let edge = i64::from(self.config.cells_per_tile);
         let origin_x = tile.x().checked_mul(edge).ok_or(Error::IndexOverflow)?;
         let origin_y = tile.y().checked_mul(edge).ok_or(Error::IndexOverflow)?;
+        let end_x = origin_x.checked_add(edge).ok_or(Error::IndexOverflow)?;
+        let end_y = origin_y.checked_add(edge).ok_or(Error::IndexOverflow)?;
+        let (start_x, stop_x, start_y, stop_y) =
+            region.map_or((origin_x, end_x, origin_y, end_y), |rect| {
+                let min = rect.min();
+                let end = rect.end_exclusive();
+                (
+                    origin_x.max(min[0]),
+                    end_x.min(end[0]),
+                    origin_y.max(min[1]),
+                    end_y.min(end[1]),
+                )
+            });
         let mut out = Vec::new();
         let mut proposals = 0_usize;
-        for offset_y in 0..edge {
-            for offset_x in 0..edge {
-                let cell_x = origin_x.checked_add(offset_x).ok_or(Error::IndexOverflow)?;
-                let cell_y = origin_y.checked_add(offset_y).ok_or(Error::IndexOverflow)?;
+        for cell_y in start_y..stop_y {
+            for cell_x in start_x..stop_x {
                 let cell = SurfaceCell::new(self.domain, tile.face(), cell_x, cell_y);
-                self.collect_cell(cell, layer, &habitat, &mut out, &mut proposals)?;
+                self.collect_cell(cell, layer, habitat, &mut out, &mut proposals)?;
             }
         }
         Ok(out)

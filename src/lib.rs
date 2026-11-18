@@ -22,6 +22,7 @@ mod error;
 mod generator;
 mod random;
 mod selection;
+mod stream;
 
 pub use domain::{Anchor, CubeFace, Domain, SurfaceCell, TileKey};
 pub use error::{Error, Result};
@@ -29,3 +30,4 @@ pub use generator::{
     Candidate, Distribution, Generator, GeneratorConfig, Instance, LAYOUT_VERSION, Layer,
 };
 pub use selection::{Variant, choose_variant};
+pub use stream::{CellRect, TileWindow};

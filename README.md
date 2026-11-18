@@ -79,6 +79,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### View-dependent streaming without changing world placement
+
+The renderer can request only the canonical cells covered by a camera/terrain
+patch. Queries are bounded and lazy, support negative coordinates and work
+independently of render-tile size. For example:
+
+```rust
+let rect = generator.planar_cell_rect([-150.0, -100.0], [150.0, 100.0])?;
+for tile in generator.tiles_covering_cells(None, rect, 256)? {
+    let visible = generator.tile_with_habitat_in_cells(
+        tile, rect, &oaks, |_| 1.0,
+    )?;
+    // Supply visible anchors to your renderer or streaming cache.
+}
+```
+
+The explicit tile limit prevents accidentally enumerating an entire planet.
+For spherical worlds, build a canonical CellRect on each intersected cube face
+and call tiles_covering_cells(Some(face), rect, limit). The same cell seeds
+are used regardless of which view or render tile requested them.
+
+```bash
+cargo +stable run --locked --example streaming
+```
+
 ### Planetary surfaces
 
 ```rust
