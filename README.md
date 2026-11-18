@@ -172,8 +172,11 @@ and upright camera-facing impostors at middle distance. The fixed
 **8 azimuth × 4 elevation** atlas supports overhead aircraft views and blends
 adjacent view angles without changing canonical object identities.
 
-A generic Rust reference baker (`atlas_bake::bake_mesh`) generates the 32-view
-atlas from **original UV-textured, alpha-masked triangles** with bilinear sRGB
+A generic Rust reference baker (`atlas_bake::bake_scene`) generates one 32-view
+atlas from **multiple original UV-textured, alpha-masked source materials**
+(e.g., separately textured trunk and leaves with shared depth). The
+single-material `bake_mesh` convenience function uses the same pipeline.
+Both operate on source triangles with bilinear sRGB
 source sampling, per-supersample alpha cutout, depth testing, 2× supersampling,
 linear-light resolve and independently padded tiles. A headless Vulkan example creates a deterministic
 forest and actually renders both stages at **1280×720, 90° FOV**:
