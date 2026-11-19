@@ -167,8 +167,11 @@ resource limits.
 
 The GPU feature also provides `impostor::TreeMesh` and `TreeRenderer`, which
 consume the two compacted instance buffers and **indexed-indirect draw counts**
-inside an existing wgpu render pass. It draws source triangle geometry nearby
-and upright camera-facing impostors at middle distance. The fixed
+inside an existing wgpu render pass. It draws multiple independently textured original source-material meshes nearby
+with **one GPU visibility-compaction pass** and **one** middle-distance
+camera-facing impostor draw. Each near-field material retains its own
+alpha-cutoff/UVs and indexed mesh; shared near instance counts are copied
+GPU-to-GPU into material-specific indirect arguments. The fixed
 **8 azimuth × 4 elevation** atlas supports overhead aircraft views and blends
 adjacent view angles without changing canonical object identities.
 

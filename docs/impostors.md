@@ -14,18 +14,23 @@ a CPU-side visibility simulation.
 - `PackedInstance::position_radius.xyz` is the **camera-relative sphere
   center**. The fourth component is the physical radius, already inclusive of
   object scale. `attributes.x` gives stable yaw turns.
-- Construct `TreeMesh`, `GpuCompactor::new(device, capacity,
-  mesh.index_count(), 6)`, `AtlasImage::upload`, `SourceImage::upload`, then
-  `TreeRenderer::new(device, compactor, mesh, atlas, source_view,
-  TreeRenderConfig { color_format, depth_format, sample_count, alpha_cutoff })`.
-  The `source_view` can be `SourceImage::upload(...).view()` **or an existing
-  filterable GPU BC1/BC3/BC7 DDS texture view**. No uncompressed GPU copy is
-  required when the host already has a compressed, mipmapped source albedo.
-- Before each render pass, encode `compactor.encode()` into the **same
-  command encoder**, and call `renderer.set_camera()` before submitting the
-  command buffer. In a render pass using the configured color/depth formats,
-  `renderer.draw()` issues two actual indexed-indirect draws. No instance
-  readback, CPU draw count, or CPU render-visibility list is needed.
+- Construct one `TreeMesh` for each source material, a single
+  `GpuCompactor::new(device, capacity, first_mesh.index_count(), 6)`, the
+  combined `AtlasImage::upload`, and source albedo views (either
+  `SourceImage::upload` or original GPU-compressed DDS views). Create a
+  `TreeRenderer::new(device, &compactor, vec![TreeMaterial {
+  mesh, source_view, alpha_cutoff }, ...], &atlas,
+  TreeRenderConfig { color_format, depth_format, sample_count })`.
+  The renderer takes ownership of the individual GPU meshes.
+- Before each render pass, call `compactor.encode(queue, encoder, ...)`,
+  then `renderer.encode_mesh_draws(encoder, &compactor)` in the **same
+  encoder**. The latter copies the computed mesh instance count into every
+  material's own indexed-indirect command, preserving its source index count.
+  Call `renderer.set_camera(queue, camera)` before submission. Inside a
+  matching render pass, `renderer.draw(pass, &compactor)` draws all original
+  near-field materials and exactly **one** combined 32-view impostor.
+  Neither mesh material count nor candidate density multiplies visibility
+  classification; no CPU instance-count readback is required.
 - The host owns its color/depth render attachments, pass load operations and
   source material grouping.
 
