@@ -45,11 +45,16 @@ pub struct RenderPose {
 impl RenderPose {
     /// Upright source pose, with one physical radius and yaw in full turns.
     #[must_use]
-    pub fn upright(position: [f32; 3], radius: f32, yaw_turns: f32) -> Self {
-        let half = yaw_turns * core::f32::consts::PI;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a canonical f64 yaw is projected to f32 only for GPU visual orientation"
+    )]
+    pub fn upright(position: [f32; 3], radius: f32, yaw_turns: f64) -> Self {
+        let half = yaw_turns * core::f64::consts::PI;
+        let (sin, cos) = half.sin_cos();
         Self {
             camera_relative_position: position,
-            rotation_xyzw: [0.0, half.sin(), 0.0, half.cos()],
+            rotation_xyzw: [0.0, sin as f32, 0.0, cos as f32],
             axis_radii_m: [radius; 3],
         }
     }
