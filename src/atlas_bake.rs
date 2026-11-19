@@ -310,10 +310,7 @@ pub fn bake_scene(surfaces: &[BakeSurface<'_>], tile_size: u32, gutter: u32) -> 
         if vertices.iter().any(|v| {
             !v.position.iter().all(|x| x.is_finite())
                 || !v.uv.iter().all(|x| x.is_finite())
-                || !v
-                    .color
-                    .iter()
-                    .all(|x| x.is_finite() && (0.0..=1.0).contains(x))
+                || !TreeVertex::valid_color(v.color)
                 || dot(
                     [v.position[0], v.position[1], v.position[2]],
                     [v.position[0], v.position[1], v.position[2]],
@@ -564,6 +561,21 @@ mod textured_tests {
         let tinted = bake_mesh(&vertices, &indices, &gray, 0.5, 32, 2).unwrap();
         assert!(tinted.rgba()[center] < 128);
         assert!(tinted.rgba()[center] > 75);
+
+        // Original KSP grass uses material RGB like (1.3, 1.4, 1.0).
+        // Multiplication must happen in linear space *before* final
+        // sRGB quantization, not by clamping the vertex tint to 1.
+        for vertex in &mut vertices {
+            vertex.color = [1.5, 1.4, 1.2, 1.0];
+        }
+        let boosted = bake_mesh(&vertices, &indices, &gray, 0.5, 32, 2).unwrap();
+        assert!(boosted.rgba()[center] > atlas.rgba()[center]);
+        assert!(boosted.rgba()[center + 1] > atlas.rgba()[center + 1]);
+        assert!(boosted.rgba()[center + 2] > atlas.rgba()[center + 2]);
+        assert!(TreeVertex::valid_color([1.5, 1.4, 1.2, 1.0]));
+        assert!(!TreeVertex::valid_color([f32::NAN, 1.0, 1.0, 1.0]));
+        assert!(!TreeVertex::valid_color([-0.1, 1.0, 1.0, 1.0]));
+        assert!(!TreeVertex::valid_color([1.0, 1.0, 1.0, 1.1]));
     }
 
     #[test]
