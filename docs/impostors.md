@@ -12,8 +12,13 @@ a CPU-side visibility simulation.
   sRGB RGBA8 bytes decoded by the host from its own PNG/DDS pipeline.
   A distinct renderer/compactor is used per source material/index buffer.
 - `PackedInstance::position_radius.xyz` is the **camera-relative sphere
-  center**. The fourth component is the physical radius, already inclusive of
-  object scale. `attributes.x` gives stable yaw turns.
+  center**, with a conservative maximum-axis radius in the fourth component.
+  `rotation` carries the full normalized source quaternion in XYZW order;
+  `axis_radii.xyz` holds the physical scaled source half-axes. The near-mesh
+  vertex shader applies per-axis scale **before** source rotation, matching
+  general KSP/Parallax affine placements including nonuniform scale and tilt.
+  The impostor shader evaluates source-local azimuth/elevation through the
+  inverse quaternion and projects conservative view-dependent half-extents.
 - Construct one `TreeMesh` for each source material, a single
   `GpuCompactor::new(device, capacity, first_mesh.index_count(), 6)`, the
   combined `AtlasImage::upload`, and source albedo views (either
@@ -62,9 +67,9 @@ Every atlas image cell is `tile_size × tile_size`; `gutter` pixels on
 each side are filled from *the same tile's* content. The texture sampler
 is bilinear with no mipmaps. Fragment shading blends the two neighbouring
 azimuths and two neighbouring elevations for smooth camera movement.
-The quad faces the camera but remains dimensioned to the source bounding
-sphere. Right/up axes are constructed from the view direction and world-up,
-including a stable vertical fallback.
+The quad faces the camera; its dimensions are derived from the projected
+source ellipsoid, conservatively covering nonuniform XYZ scale. Its right/up
+axes follow the source orientation, including a stable overhead fallback.
 
 `atlas_bake::bake_scene()` accepts a slice of `BakeSurface` records containing
 original UV-textured triangles, source texture, and material-specific alpha

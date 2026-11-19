@@ -161,11 +161,7 @@ fn generate_forest() -> Result<(Vec<PackedInstance>, f64), Box<dyn Error>> {
                 ];
                 packed.push(PackedInstance::from_instance(
                     &instance,
-                    RenderPose {
-                        camera_relative_position: position,
-                        crown_radius_m: radius,
-                        scale: 1.0,
-                    },
+                    RenderPose::upright(position, radius, instance.candidate.yaw_turns as f32),
                 )?);
             }
         }

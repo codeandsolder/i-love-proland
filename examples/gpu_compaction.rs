@@ -80,11 +80,7 @@ fn generate_sample() -> Result<(Vec<PackedInstance>, f64), Box<dyn Error>> {
                     ];
                     result.push(PackedInstance::from_instance(
                         &original,
-                        RenderPose {
-                            camera_relative_position: position,
-                            crown_radius_m: radius,
-                            scale: 1.0,
-                        },
+                        RenderPose::upright(position, radius, original.candidate.yaw_turns as f32),
                     )?);
                 }
             }

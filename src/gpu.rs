@@ -10,10 +10,10 @@ use wgpu::util::DeviceExt;
 
 pub const WGSL_COMPACTION: &str = include_str!("compact.wgsl");
 
-const INSTANCE_BYTES: u64 = 64;
+const INSTANCE_BYTES: u64 = 80;
 const WORKGROUP_SIZE: u32 = 64;
 
-/// An explicit, stable, shader-compatible 64-byte instance layout. All
+/// An explicit, stable, shader-compatible 80-byte instance layout. All
 /// positions are camera-relative; large planetary coordinates remain in the
 /// caller's precise domain until the final render projection.
 ///
@@ -22,18 +22,37 @@ const WORKGROUP_SIZE: u32 = 64;
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PackedInstance {
     pub position_radius: [f32; 4],
-    pub attributes: [f32; 4],
+    /// Unit quaternion in XYZW order, supporting terrain alignment/tilt.
+    pub rotation: [f32; 4],
+    /// Per-axis physical radii for a source normalized within a unit sphere;
+    /// fourth component is deterministic appearance variation.
+    pub axis_radii: [f32; 4],
     pub object_id: [u32; 4],
     pub metadata: [u32; 4],
 }
 
 /// A visual pose computed from whichever terrain LOD is being displayed.
-/// This never changes the existence or ID of the source object.
+///
+/// Source positions must already be normalized about their source sphere;
+/// axis radii are the corresponding physical XYZ scale factors in metres.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderPose {
     pub camera_relative_position: [f32; 3],
-    pub crown_radius_m: f32,
-    pub scale: f32,
+    pub rotation_xyzw: [f32; 4],
+    pub axis_radii_m: [f32; 3],
+}
+
+impl RenderPose {
+    /// Upright source pose, with one physical radius and yaw in full turns.
+    #[must_use]
+    pub fn upright(position: [f32; 3], radius: f32, yaw_turns: f32) -> Self {
+        let half = yaw_turns * core::f32::consts::PI;
+        Self {
+            camera_relative_position: position,
+            rotation_xyzw: [0.0, half.sin(), 0.0, half.cos()],
+            axis_radii_m: [radius; 3],
+        }
+    }
 }
 
 impl PackedInstance {
@@ -42,17 +61,29 @@ impl PackedInstance {
     /// # Errors
     /// Returns an error on non-finite projection or invalid radius/scale.
     pub fn from_instance(instance: &Instance, pose: RenderPose) -> Result<Self> {
-        if !pose
-            .camera_relative_position
-            .iter()
-            .all(|value| value.is_finite())
-            || !pose.crown_radius_m.is_finite()
-            || pose.crown_radius_m <= 0.0
-            || !pose.scale.is_finite()
-            || pose.scale <= 0.0
+        if !pose.camera_relative_position.iter().all(|v| v.is_finite())
+            || !pose.axis_radii_m.iter().all(|v| v.is_finite() && *v > 0.0)
+            || !pose.rotation_xyzw.iter().all(|v| v.is_finite())
         {
             return Err(Error::InvalidConfiguration(
-                "GPU render pose must have finite position and positive radius/scale",
+                "GPU render pose needs finite position, positive axis radii and unit quaternion",
+            ));
+        }
+        let norm_sq = pose.rotation_xyzw.iter().map(|x| x * x).sum::<f32>();
+        if (norm_sq - 1.0).abs() > 1.0e-3 {
+            return Err(Error::InvalidConfiguration(
+                "GPU source quaternion must be normalized",
+            ));
+        }
+        let radius = pose
+            .axis_radii_m
+            .iter()
+            .copied()
+            .reduce(f32::max)
+            .unwrap_or(0.0);
+        if !radius.is_finite() {
+            return Err(Error::InvalidConfiguration(
+                "invalid GPU bounding sphere radius",
             ));
         }
 
@@ -68,13 +99,14 @@ impl PackedInstance {
                 pose.camera_relative_position[0],
                 pose.camera_relative_position[1],
                 pose.camera_relative_position[2],
-                pose.crown_radius_m,
+                radius,
             ],
-            attributes: [
-                instance.candidate.yaw_turns as f32,
-                pose.scale,
+            rotation: pose.rotation_xyzw,
+            axis_radii: [
+                pose.axis_radii_m[0],
+                pose.axis_radii_m[1],
+                pose.axis_radii_m[2],
                 instance.candidate.appearance_unit as f32,
-                0.0,
             ],
             object_id: [
                 id as u32,
@@ -503,7 +535,7 @@ mod tests {
 
     #[test]
     fn gpu_layout_and_identity_roundtrip() {
-        assert_eq!(core::mem::size_of::<PackedInstance>(), 64);
+        assert_eq!(core::mem::size_of::<PackedInstance>(), 80);
         assert_eq!(core::mem::size_of::<GpuUniform>(), 144);
         assert_eq!(core::mem::size_of::<IndexedDraw>(), 20);
         let g = Generator::new(
@@ -524,11 +556,7 @@ mod tests {
         let original = g.tile(TileKey::planar(1, 2), &layer).unwrap()[0];
         let packed = PackedInstance::from_instance(
             &original,
-            RenderPose {
-                camera_relative_position: [4.0, -6.0, 50.0],
-                crown_radius_m: 5.0,
-                scale: 1.5,
-            },
+            RenderPose::upright([4.0, -6.0, 50.0], 5.0, 0.3),
         )
         .unwrap();
         assert_eq!(packed.stable_id(), original.candidate.id);
@@ -537,14 +565,54 @@ mod tests {
         assert!(
             PackedInstance::from_instance(
                 &original,
-                RenderPose {
-                    camera_relative_position: [f32::INFINITY, 0.0, 0.0],
-                    crown_radius_m: 1.0,
-                    scale: 1.0,
-                }
+                RenderPose::upright([f32::INFINITY, 0.0, 0.0], 1.0, 0.0)
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn arbitrary_orientation_and_anisotropic_source_radii_are_preserved() {
+        let world = Generator::new(
+            Domain::Planar { cell_size_m: 10.0 },
+            GeneratorConfig::default(),
+        )
+        .unwrap();
+        let layer = Layer::new(
+            77,
+            0.2,
+            Distribution::Poisson,
+            vec![Variant {
+                id: 314,
+                weight: 1.0,
+            }],
+        )
+        .unwrap();
+        let original = world.tile(TileKey::planar(0, 0), &layer).unwrap()[0];
+        let xyz = [0.18_f32, -0.34, 0.25];
+        let w = (1.0 - xyz.iter().map(|v| v * v).sum::<f32>()).sqrt();
+        let q = [xyz[0], xyz[1], xyz[2], w];
+        let pose = RenderPose {
+            camera_relative_position: [-14.0, 20.0, 88.0],
+            rotation_xyzw: q,
+            axis_radii_m: [3.0, 7.0, 2.0],
+        };
+        let packed = PackedInstance::from_instance(&original, pose).unwrap();
+        assert_eq!(packed.rotation, q);
+        assert_eq!(packed.axis_radii[..3], [3.0, 7.0, 2.0]);
+        assert_eq!(packed.position_radius, [-14.0, 20.0, 88.0, 7.0]);
+        assert_eq!(packed.stable_id(), original.candidate.id);
+        assert_eq!(packed.variant_id(), original.variant_id);
+        assert_eq!(core::mem::size_of::<PackedInstance>(), 80);
+        let mut invalid = pose;
+        invalid.rotation_xyzw[3] = 2.0;
+        assert!(PackedInstance::from_instance(&original, invalid).is_err());
+        invalid = pose;
+        invalid.axis_radii_m[1] = 0.0;
+        assert!(PackedInstance::from_instance(&original, invalid).is_err());
+        invalid = pose;
+        invalid.axis_radii_m[2] = f32::INFINITY;
+        assert!(PackedInstance::from_instance(&original, invalid).is_err());
     }
 
     #[test]
@@ -552,7 +620,8 @@ mod tests {
         let view = GpuView::unculled(540.0, 32.0, 1.0).unwrap();
         let object = |z, radius| PackedInstance {
             position_radius: [0.0, 0.0, z, radius],
-            attributes: [0.0; 4],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            axis_radii: [radius, radius, radius, 0.0],
             object_id: [0; 4],
             metadata: [0; 4],
         };

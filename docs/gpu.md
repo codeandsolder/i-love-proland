@@ -13,9 +13,10 @@ default crate has **zero runtime dependencies**.
 3. Project these exact objects onto the currently visible terrain LOD.
    Accurate physics height can use a different terrain source; neither
    influences canonical object ID, variant, or saved changes.
-4. Rebase positions to the active camera and build 64-byte
-   `gpu::PackedInstance` records. The crown radius must already include the
-   visual scale and variation of the object.
+4. Rebase positions to the active camera and build 80-byte
+   `gpu::PackedInstance` records. The record stores the full source orientation quaternion and
+   physical per-axis XYZ radii. A conservative sphere radius (the
+   maximum axis radius) is derived for GPU visibility and LOD.
 5. Encode `GpuCompactor` to cull spheres, classify near meshes vs middle
    impostors by pixel footprint, and compact instances into storage buffers.
 6. Bind the appropriate storage buffer to a host render vertex shader, use
@@ -35,9 +36,10 @@ with `#[repr(C)]` + bytemuck POD in Rust.
 | Offset | WGSL field | Meaning |
 | ---: | --- | --- |
 | 0 | `position_radius: vec4<f32>` | Camera-relative XYZ, scaled physical crown radius |
-| 16 | `attributes: vec4<f32>` | Yaw in turns; render scale; appearance mark; reserved |
-| 32 | `object_id: vec4<u32>` | Low-to-high limbs of the **entire** 128-bit stable ID |
-| 48 | `metadata: vec4<u32>` | Low/high limbs of 64-bit variant and layer IDs |
+| 16 | `rotation: vec4<f32>` | Normalized XYZW quaternion; arbitrary orientation and terrain alignment |
+| 32 | `axis_radii: vec4<f32>` | Physical XYZ half-axes in metres and appearance variation |
+| 48 | `object_id: vec4<u32>` | Low-to-high limbs of the **entire** 128-bit stable ID |
+| 64 | `metadata: vec4<u32>` | Low/high limbs of 64-bit variant and layer IDs |
 
 Runtime uniforms: 16-byte count header, 16-byte projection thresholds,
 16-byte normalized forward, and six 16-byte inward-facing frustum planes =
@@ -88,7 +90,7 @@ Allocation checks device storage-buffer and dispatch workgroup limits.
 The instance capacity is fixed at construction. The pass has no per-object
 GPU→CPU synchronization and resets both indirect counts through queue writes
 before dispatch. Buffer memory is approximately
-`3 * 64 * candidate_capacity + 2 * 20 + 144` bytes, excluding driver
+`3 * 80 * candidate_capacity + 2 * 20 + 144` bytes, excluding driver
 allocation granularity and render-side geometry.
 
 Use distinct compactors or a higher-level pool for different material
