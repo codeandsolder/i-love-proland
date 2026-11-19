@@ -20,6 +20,18 @@ pub struct TreeVertex {
     pub uv: [f32; 2],
 }
 
+impl TreeVertex {
+    /// Validate floating-point source-material color, not a normalized
+    /// vertex attribute: linear RGB multipliers may legitimately exceed 1.
+    /// The alpha channel remains ordinary fractional coverage.
+    #[must_use]
+    pub fn valid_color(color: [f32; 4]) -> bool {
+        color[..3].iter().all(|c| c.is_finite() && *c >= 0.0)
+            && color[3].is_finite()
+            && (0.0..=1.0).contains(&color[3])
+    }
+}
+
 pub struct TreeMesh {
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
@@ -38,10 +50,7 @@ impl TreeMesh {
         if vertices.iter().any(|v| {
             !v.position.iter().all(|p| p.is_finite())
                 || !v.uv.iter().all(|p| p.is_finite())
-                || !v
-                    .color
-                    .iter()
-                    .all(|c| c.is_finite() && (0.0..=1.0).contains(c))
+                || !TreeVertex::valid_color(v.color)
         }) || indices
             .iter()
             .any(|i| usize::try_from(*i).map_or(true, |i| i >= vertices.len()))

@@ -147,3 +147,15 @@ a screenshot of the original `.mu` asset.
 
 Further GPU compaction ABI and buffer details:
 [docs/gpu.md](gpu.md).
+
+## HDR material vertex tint
+
+Source mesh `TreeVertex.color` carries floating linear RGB multipliers,
+not normalized RGBA8 vertex colors. RGB above 1.0 is legitimate in
+original asset materials (e.g., Kerbin grass `_Color` 1.3/1.4/1.0).
+Alpha remains fractional coverage in [0,1]. The near-field shader
+multiplies this source material tint before per-instance terrain tint.
+The CPU atlas baker also multiplies in linear space before final
+sRGB RGBA8 quantization. Do not pre-clamp source material RGB, which
+changes muted texture colors even when the eventual framebuffer is
+limited to [0,1].
