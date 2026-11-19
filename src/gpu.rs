@@ -10,10 +10,10 @@ use wgpu::util::DeviceExt;
 
 pub const WGSL_COMPACTION: &str = include_str!("compact.wgsl");
 
-const INSTANCE_BYTES: u64 = 80;
+const INSTANCE_BYTES: u64 = 96;
 const WORKGROUP_SIZE: u32 = 64;
 
-/// An explicit, stable, shader-compatible 80-byte instance layout. All
+/// An explicit, stable, shader-compatible 96-byte instance layout. All
 /// positions are camera-relative; large planetary coordinates remain in the
 /// caller's precise domain until the final render projection.
 ///
@@ -29,6 +29,9 @@ pub struct PackedInstance {
     pub axis_radii: [f32; 4],
     pub object_id: [u32; 4],
     pub metadata: [u32; 4],
+    /// Independent per-object RGBA tint in linear source color space.
+    /// The material's vertex tint is baked into its source mesh/atlas.
+    pub tint: [f32; 4],
 }
 
 /// A visual pose computed from whichever terrain LOD is being displayed.
@@ -125,8 +128,30 @@ impl PackedInstance {
                 layer as u32,
                 (layer >> 32) as u32,
             ],
+            tint: [1.0; 4],
         };
         Ok(words)
+    }
+
+    /// Return a copy with validated per-object tint, without touching
+    /// canonical IDs, variant metadata, world pose or visual LOD.
+    ///
+    /// RGB may exceed 1 for physically meaningful bright tints.
+    /// Alpha is a conventional [0, 1] transparency multiplier.
+    ///
+    /// # Errors
+    /// Rejects NaN, infinity, negative RGB or out-of-range alpha.
+    pub fn with_tint(mut self, tint: [f32; 4]) -> Result<Self> {
+        if !tint.iter().all(|x| x.is_finite())
+            || tint[..3].iter().any(|x| *x < 0.0)
+            || !(0.0..=1.0).contains(&tint[3])
+        {
+            return Err(Error::InvalidConfiguration(
+                "GPU per-instance tint requires finite nonnegative RGB and alpha in 0..1",
+            ));
+        }
+        self.tint = tint;
+        Ok(self)
     }
 
     #[must_use]
@@ -540,7 +565,7 @@ mod tests {
 
     #[test]
     fn gpu_layout_and_identity_roundtrip() {
-        assert_eq!(core::mem::size_of::<PackedInstance>(), 80);
+        assert_eq!(core::mem::size_of::<PackedInstance>(), 96);
         assert_eq!(core::mem::size_of::<GpuUniform>(), 144);
         assert_eq!(core::mem::size_of::<IndexedDraw>(), 20);
         let g = Generator::new(
@@ -567,6 +592,15 @@ mod tests {
         assert_eq!(packed.stable_id(), original.candidate.id);
         assert_eq!(packed.variant_id(), original.variant_id);
         assert_eq!(packed.metadata[2], 111);
+        assert_eq!(packed.tint, [1.0; 4]);
+        let colored = packed.with_tint([0.4, 0.7, 1.5, 0.75]).unwrap();
+        assert_eq!(colored.tint, [0.4, 0.7, 1.5, 0.75]);
+        assert_eq!(colored.stable_id(), packed.stable_id());
+        assert_eq!(colored.metadata, packed.metadata);
+        assert_eq!(colored.position_radius, packed.position_radius);
+        assert!(packed.with_tint([f32::NAN, 1.0, 1.0, 1.0]).is_err());
+        assert!(packed.with_tint([-0.1, 1.0, 1.0, 1.0]).is_err());
+        assert!(packed.with_tint([1.0, 1.0, 1.0, 1.1]).is_err());
         assert!(
             PackedInstance::from_instance(
                 &original,
@@ -608,7 +642,7 @@ mod tests {
         assert_eq!(packed.position_radius, [-14.0, 20.0, 88.0, 7.0]);
         assert_eq!(packed.stable_id(), original.candidate.id);
         assert_eq!(packed.variant_id(), original.variant_id);
-        assert_eq!(core::mem::size_of::<PackedInstance>(), 80);
+        assert_eq!(core::mem::size_of::<PackedInstance>(), 96);
         let mut invalid = pose;
         invalid.rotation_xyzw[3] = 2.0;
         assert!(PackedInstance::from_instance(&original, invalid).is_err());
@@ -629,6 +663,7 @@ mod tests {
             axis_radii: [radius, radius, radius, 0.0],
             object_id: [0; 4],
             metadata: [0; 4],
+            tint: [1.0; 4],
         };
         assert_eq!(classify_cpu(&object(100.0, 10.0), view), VisualLod::Mesh);
         assert_eq!(

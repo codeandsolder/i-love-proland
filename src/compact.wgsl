@@ -8,6 +8,7 @@ struct PackedInstance {
     axis_radii: vec4<f32>,         // physical XYZ scale, appearance variation
     object_id: vec4<u32>,          // full stable u128, low word first
     metadata: vec4<u32>,           // variant u64 + layer u64
+    tint: vec4<f32>,               // per-instance linear RGB, alpha multiplier
 }
 
 struct IndexedDraw {
