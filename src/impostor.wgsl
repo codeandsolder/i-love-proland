@@ -13,6 +13,7 @@ struct Instance {
     axis_radii: vec4<f32>,
     object_id: vec4<u32>,
     metadata: vec4<u32>,
+    tint: vec4<f32>,
 }
 
 struct RenderUniform {
@@ -57,7 +58,7 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
         + rotate(object.rotation, input.position.xyz * object.axis_radii.xyz);
     var out: MeshOutput;
     out.clip = camera.projection * vec4<f32>(world, 1.0);
-    out.color = input.color;
+    out.color = input.color * object.tint;
     out.uv = input.uv;
     return out;
 }
@@ -76,7 +77,7 @@ struct ImpostorOutput {
     @location(0) uv: vec2<f32>,
     @location(1) view_indices: vec4<f32>, // azimuth0, azimuth1, elevation0, elevation1
     @location(2) blend: vec2<f32>,
-    @location(3) tint: vec3<f32>,
+    @location(3) tint: vec4<f32>,
 }
 
 @vertex
@@ -127,7 +128,7 @@ fn impostor_vs(
     out.blend = vec2<f32>(fract(azimuth), fract(elevation));
     // Tiny deterministic visual variation without redefining the world ID.
     let variation = 0.90 + object.axis_radii.w * 0.10;
-    out.tint = vec3<f32>(variation);
+    out.tint = vec4<f32>(object.tint.rgb * variation, object.tint.a);
     return out;
 }
 
@@ -158,7 +159,8 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
         input.blend.x
     );
     let color = mix(lower, upper, input.blend.y);
-    if (color.a <= 0.0) {
+    let alpha = color.a * input.tint.a;
+    if (alpha <= 0.0) {
         discard;
     }
     if (camera.material.y < 0.5) {
@@ -171,10 +173,10 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
             3u, 11u, 1u, 9u, 15u, 7u, 13u, 5u
         );
         let threshold = (f32(bayer[y * 4u + x]) + 0.5) / 16.0;
-        if (color.a < threshold) {
+        if (alpha < threshold) {
             discard;
         }
     }
     // With multisample targets, hardware alpha-to-coverage uses this alpha.
-    return vec4<f32>(color.rgb * input.tint, color.a);
+    return vec4<f32>(color.rgb * input.tint.rgb, alpha);
 }
