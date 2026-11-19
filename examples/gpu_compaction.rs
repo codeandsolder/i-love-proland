@@ -80,11 +80,7 @@ fn generate_sample() -> Result<(Vec<PackedInstance>, f64), Box<dyn Error>> {
                     ];
                     result.push(PackedInstance::from_instance(
                         &original,
-                        RenderPose {
-                            camera_relative_position: position,
-                            crown_radius_m: radius,
-                            scale: 1.0,
-                        },
+                        RenderPose::upright(position, radius, original.candidate.yaw_turns),
                     )?);
                 }
             }
@@ -163,7 +159,8 @@ fn gpu_parity(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let output_bytes = u64::try_from(candidates.len())? * 64;
+    let output_bytes =
+        u64::try_from(candidates.len())? * u64::try_from(core::mem::size_of::<PackedInstance>())?;
     let make_readback = |label| {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -217,7 +214,10 @@ fn gpu_parity(
         let bytes = readback(device, buffer)?;
         let visible_bytes = usize::try_from(count)? * core::mem::size_of::<PackedInstance>();
         let mut gpu = BTreeMap::new();
-        for record in bytes[..visible_bytes].as_chunks::<64>().0 {
+        for record in bytes[..visible_bytes]
+            .as_chunks::<{ core::mem::size_of::<PackedInstance>() }>()
+            .0
+        {
             let object = bytemuck::pod_read_unaligned::<PackedInstance>(record);
             assert!(gpu.insert(object.stable_id(), object).is_none());
             assert!(unique.insert(object.stable_id()));

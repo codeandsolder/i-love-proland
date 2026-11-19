@@ -4,7 +4,8 @@
 
 struct PackedInstance {
     position_radius: vec4<f32>,    // camera-relative xyz, physical crown radius
-    attributes: vec4<f32>,         // yaw in turns, scale, appearance, reserved
+    rotation: vec4<f32>,           // normalized source quaternion XYZW
+    axis_radii: vec4<f32>,         // physical XYZ scale, appearance variation
     object_id: vec4<u32>,          // full stable u128, low word first
     metadata: vec4<u32>,           // variant u64 + layer u64
 }
