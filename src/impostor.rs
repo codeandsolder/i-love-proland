@@ -710,7 +710,7 @@ impl TreeRenderer {
     }
 
     #[must_use]
-    pub fn material_count(&self) -> usize {
+    pub const fn material_count(&self) -> usize {
         self.mesh_draws.len()
     }
 }
