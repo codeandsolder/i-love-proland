@@ -25,6 +25,8 @@ struct RenderUniform {
     field_axes: array<vec4<f32>, 3>,
     field_origin: vec4<f32>,
     field_phase: vec4<f32>, // camera origin modulo texture repetition, time scroll
+    camera_forward: vec4<f32>,
+    billboard_source: vec4<f32>, // normalized source center, original radius (zero = static)
 }
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
@@ -95,10 +97,27 @@ fn wind_offset(world: vec3<f32>, source_y: f32, rotation: vec4<f32>) -> vec3<f32
 @vertex
 fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> MeshOutput {
     let object = objects[instance_id];
+    var vertex = input.position.xyz;
+    let source = camera.billboard_source;
+    if source.w > 0.0 {
+        // Unity's inverse-transpose view row points back toward the camera.
+        // Original forward is multiplied by the complete scaled instance
+        // basis; normalize only the horizontal right, not forward.
+        let back = inverse_rotate(object.rotation, -camera.camera_forward.xyz)
+            * (object.axis_radii.xyz / source.w);
+        let horizontal = length(back.xz);
+        var right = vec3<f32>(1.0, 0.0, 0.0);
+        if horizontal > 0.000001 {
+            right = vec3<f32>(-back.z, 0.0, back.x) / horizontal;
+        }
+        let local = vertex + source.xyz;
+        vertex = local.x * right + vec3<f32>(0.0, local.y, 0.0)
+            + local.z * back - source.xyz;
+    }
     let world = object.position_radius.xyz
-        + rotate(object.rotation, input.position.xyz * object.axis_radii.xyz);
+        + rotate(object.rotation, vertex * object.axis_radii.xyz);
     var out: MeshOutput;
-    let source_y = input.position.y * camera.wind_source.y + camera.wind_source.x;
+    let source_y = vertex.y * camera.wind_source.y + camera.wind_source.x;
     let displaced = world + wind_offset(world, source_y, object.rotation);
     out.clip = camera.projection * vec4<f32>(displaced, 1.0);
     out.color = input.color * object.tint;

@@ -4,6 +4,7 @@
 use crate::gpu::{CompactedBin, GpuCompactor, IndexedDraw};
 use crate::{
     Error, Result,
+    billboard::Billboard,
     wind::{WindFrame, WindParameters},
 };
 use wgpu::util::DeviceExt;
@@ -202,18 +203,24 @@ pub struct AtlasTexture {
 #[derive(Clone, Copy, Debug)]
 pub struct TreeCamera {
     projection: [[f32; 4]; 4],
+    forward: [f32; 3],
     wind: Option<WindFrame>,
 }
 
 impl TreeCamera {
     /// # Errors
-    /// Rejects non-finite camera matrices.
-    pub fn new(projection: [[f32; 4]; 4]) -> Result<Self> {
+    /// Rejects non-finite camera matrices or a non-unit forward vector.
+    pub fn new(projection: [[f32; 4]; 4], forward: [f32; 3]) -> Result<Self> {
         if projection.iter().flatten().any(|x| !x.is_finite()) {
             return Err(Error::InvalidConfiguration("non-finite tree projection"));
         }
+        let length_squared: f32 = forward.iter().map(|v| v * v).sum();
+        if !length_squared.is_finite() || (length_squared - 1.0).abs() > 1e-4 {
+            return Err(Error::InvalidConfiguration("invalid tree camera forward"));
+        }
         Ok(Self {
             projection,
+            forward,
             wind: None,
         })
     }
@@ -246,12 +253,15 @@ impl TreeCamera {
         }
         let focal = 1.0 / (fov_y * 0.5).tan();
         let depth = far / (far - near);
-        Self::new([
-            [focal / aspect, 0.0, 0.0, 0.0],
-            [0.0, focal, 0.0, 0.0],
-            [0.0, 0.0, depth, 1.0],
-            [0.0, 0.0, -near * depth, 0.0],
-        ])
+        Self::new(
+            [
+                [focal / aspect, 0.0, 0.0, 0.0],
+                [0.0, focal, 0.0, 0.0],
+                [0.0, 0.0, depth, 1.0],
+                [0.0, 0.0, -near * depth, 0.0],
+            ],
+            [0.0, 0.0, 1.0],
+        )
     }
 }
 
@@ -266,6 +276,8 @@ struct DrawUniform {
     field_axes: [[f32; 4]; 3],
     field_origin: [f32; 4],
     field_phase: [f32; 4],
+    camera_forward: [f32; 4],
+    billboard_source: [f32; 4],
 }
 
 /// Render targets and material alpha-cutoff semantics.
@@ -319,6 +331,7 @@ pub struct TreeMaterial<'a> {
     pub source_view: &'a wgpu::TextureView,
     pub alpha_cutoff: f32,
     pub wind: Option<MeshWind<'a>>,
+    pub billboard: Option<Billboard>,
 }
 
 struct MeshDraw {
@@ -329,6 +342,7 @@ struct MeshDraw {
     source_indirect_offset: u64,
     cutoff: f32,
     wind: Option<MaterialWind>,
+    billboard: Option<Billboard>,
 }
 
 /// Every authored mesh tier shares one GPU-visible instance list across its
@@ -596,6 +610,7 @@ fn build_mesh_draw(
         indirect,
         source_indirect_offset: bin.indirect_offset,
         cutoff: source.alpha_cutoff,
+        billboard: source.billboard,
         wind: source.wind.map(|wind| MaterialWind {
             parameters: wind.parameters,
             source_center_y: wind.source_center_y,
@@ -805,9 +820,15 @@ impl TreeRenderer {
             field_axes: [[0.0; 4]; 3],
             field_origin: [0.0; 4],
             field_phase: [0.0; 4],
+            camera_forward: [camera.forward[0], camera.forward[1], camera.forward[2], 0.0],
+            billboard_source: [0.0; 4],
         };
         for material in &self.mesh_draws {
             uniform.material[0] = material.cutoff;
+            uniform.billboard_source = material.billboard.map_or([0.0; 4], |b| {
+                let [x, y, z] = b.center();
+                [x, y, z, b.radius()]
+            });
             uniform.wind_parameters = [0.0; 4];
             if let (Some(wind), Some(frame)) = (material.wind, camera.wind) {
                 let p = wind.parameters;
@@ -891,6 +912,6 @@ mod tests {
         );
         assert!(TreeCamera::perspective(0.0, 1.0, 0.1, 100.0).is_err());
         assert!(TreeCamera::perspective(core::f32::consts::FRAC_PI_2, 1.0, 0.1, 0.1,).is_err());
-        assert!(TreeCamera::new([[f32::NAN; 4]; 4]).is_err());
+        assert!(TreeCamera::new([[f32::NAN; 4]; 4], [0., 0., 1.]).is_err());
     }
 }

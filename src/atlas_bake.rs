@@ -7,7 +7,7 @@
 
 use crate::impostor::{AZIMUTH_VIEWS, AtlasImage, ELEVATION_VIEWS, TreeVertex};
 use crate::material::{SourceImage, linear_to_srgb};
-use crate::{Error, Result};
+use crate::{Error, Result, billboard::Billboard};
 use core::f32::consts::{FRAC_PI_2, TAU};
 
 #[derive(Clone, Copy)]
@@ -36,6 +36,7 @@ pub struct BakeSurface<'a> {
     pub indices: &'a [u32],
     pub source: &'a SourceImage,
     pub alpha_cutoff: f32,
+    pub billboard: Option<Billboard>,
 }
 
 struct PreparedSurface<'a> {
@@ -44,6 +45,7 @@ struct PreparedSurface<'a> {
     source: &'a SourceImage,
     texels: Vec<[f32; 4]>,
     alpha_cutoff: f32,
+    billboard: Option<Billboard>,
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -183,7 +185,18 @@ fn render_view(surfaces: &[PreparedSurface<'_>], side: u16, azi: u16, elev: u16)
         let projected: Vec<_> = surface
             .vertices
             .iter()
-            .map(|vertex| project(vertex, eye, right, up, f32::from(side)))
+            .map(|vertex| {
+                let mut vertex = *vertex;
+                if let Some(billboard) = surface.billboard {
+                    let point = billboard.atlas_point(
+                        [vertex.position[0], vertex.position[1], vertex.position[2]],
+                        eye,
+                        right,
+                    );
+                    vertex.position[..3].copy_from_slice(&point);
+                }
+                project(&vertex, eye, right, up, f32::from(side))
+            })
             .collect();
         let material = RasterMaterial {
             source: surface.source,
@@ -323,6 +336,26 @@ pub fn bake_scene(surfaces: &[BakeSurface<'_>], tile_size: u32, gutter: u32) -> 
                 "invalid atlas source vertex/index",
             ));
         }
+        if let Some(billboard) = surface.billboard {
+            for elevation in 0..4 {
+                for azimuth in 0..8 {
+                    let (eye, right, _) = basis(azimuth, elevation);
+                    if vertices.iter().any(|v| {
+                        let p = billboard.atlas_point(
+                            [v.position[0], v.position[1], v.position[2]],
+                            eye,
+                            right,
+                        );
+                        let radius_squared = dot(p, p);
+                        !radius_squared.is_finite() || radius_squared > 1.000_01
+                    }) {
+                        return Err(Error::InvalidConfiguration(
+                            "billboard atlas exceeds source sphere",
+                        ));
+                    }
+                }
+            }
+        }
         if !surface.alpha_cutoff.is_finite() || !(0.0..=1.0).contains(&surface.alpha_cutoff) {
             return Err(Error::InvalidConfiguration(
                 "invalid source material alpha cutoff",
@@ -351,6 +384,7 @@ pub fn bake_scene(surfaces: &[BakeSurface<'_>], tile_size: u32, gutter: u32) -> 
                 source: surface.source,
                 texels: surface.source.linear_texels(),
                 alpha_cutoff: surface.alpha_cutoff,
+                billboard: surface.billboard,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -392,6 +426,7 @@ pub fn bake_mesh(
             indices,
             source,
             alpha_cutoff,
+            billboard: None,
         }],
         tile_size,
         gutter,
@@ -625,12 +660,14 @@ mod multi_material_tests {
                 indices: &indices,
                 source: &red,
                 alpha_cutoff: 0.0,
+                billboard: None,
             },
             BakeSurface {
                 vertices: &leaves,
                 indices: &leaf_indices,
                 source: &green,
                 alpha_cutoff: 0.5,
+                billboard: None,
             },
         ];
         let a = bake_scene(&materials, 32, 2).unwrap();
@@ -666,12 +703,14 @@ mod multi_material_tests {
             indices: &indices,
             source: &white,
             alpha_cutoff: 0.1,
+            billboard: None,
         };
         let invalid = BakeSurface {
             vertices: &vertices,
             indices: &[4, 1, 2],
             source: &white,
             alpha_cutoff: 0.1,
+            billboard: None,
         };
         assert!(bake_scene(&[], 32, 2).is_err());
         assert!(bake_scene(&[valid, invalid], 32, 2).is_err());
@@ -680,7 +719,62 @@ mod multi_material_tests {
             indices: &indices,
             source: &white,
             alpha_cutoff: f32::NAN,
+            billboard: None,
         };
         assert!(bake_scene(&[invalid_cutoff], 32, 2).is_err());
+    }
+    #[test]
+    fn billboard_atlas_rotates_source_card_for_every_azimuth() {
+        let vertices = [
+            TreeVertex {
+                position: [-0.5, -0.5, 0.0, 1.0],
+                color: [1.0; 4],
+                uv: [0.0, 0.0],
+            },
+            TreeVertex {
+                position: [0.5, -0.5, 0.0, 1.0],
+                color: [1.0; 4],
+                uv: [1.0, 0.0],
+            },
+            TreeVertex {
+                position: [-0.5, 0.5, 0.0, 1.0],
+                color: [1.0; 4],
+                uv: [0.0, 1.0],
+            },
+            TreeVertex {
+                position: [0.5, 0.5, 0.0, 1.0],
+                color: [1.0; 4],
+                uv: [1.0, 1.0],
+            },
+        ];
+        let image = SourceImage::white();
+        let surface = BakeSurface {
+            vertices: &vertices,
+            indices: &[0, 1, 2, 2, 1, 3],
+            source: &image,
+            alpha_cutoff: 0.0,
+            billboard: Some(Billboard::new([0.0; 3], 1.0).unwrap()),
+        };
+        let atlas = bake_scene(&[surface], 32, 2).unwrap();
+        let sums = (0..8)
+            .map(|tile| {
+                (2..30)
+                    .flat_map(|y| (2..30).map(move |x| (y * 256 + tile * 32 + x) * 4 + 3))
+                    .map(|i| u32::from(atlas.rgba()[i]))
+                    .sum::<u32>()
+            })
+            .collect::<Vec<_>>();
+        assert!(sums[0] > 0);
+        assert!(sums.iter().all(|&alpha| alpha == sums[0]));
+        let static_atlas = bake_scene(
+            &[BakeSurface {
+                billboard: None,
+                ..surface
+            }],
+            32,
+            2,
+        )
+        .unwrap();
+        assert_ne!(atlas.rgba(), static_atlas.rgba());
     }
 }
