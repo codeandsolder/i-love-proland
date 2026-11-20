@@ -188,3 +188,31 @@ not an identity or terrain edit.
 Real Vulkan regression: set PROLAND_TEST_WIND=1 for the forest render
 example. It renders a deterministic varying RGB fixture at two animation
 times and repeats the first time; motion must exceed repeated-frame noise.
+
+## Authored source billboards
+
+A source mesh (often an original far LOD) can supply a Billboard descriptor
+to TreeMaterial and BakeSurface, separately from the composite impostor.
+The descriptor contains the original bounding-sphere center divided by
+the radius, and the original radius in source units. TreeCamera::new now
+requires an explicit unit camera-forward vector in the render frame.
+The source vertex is restored relative to its placement anchor, then
+transformed using the original cylindrical rule: local up remains Y,
+local back is the camera-back direction inverse-rotated and multiplied
+componentwise by the original instance XYZ scales, and local right is
+the normalized cross product of back and Y. Back is intentionally not
+normalized. Apply the original instance scale and rotation after this
+vertex transform. At the vertical singularity the real-time shader uses
+a deterministic local X fallback; the atlas uses analytic azimuth.
+The wind height uses the transformed source Y, as in the source shader.
+The caller must include the source billboard's motion in its visibility
+padding; this is not another placement or a duplicate canonical ID.
+
+The CPU baker also transforms authored billboard surfaces for each atlas
+view at unit source scale, resolving inter-material occlusion in the same
+depth buffer. It validates that all the transformed vertices fit the
+normalized sphere, rather than clipping an offset card. The actual
+nonuniform instance geometry remains more accurate than the static atlas.
+The albedo-only Proland renderer does not distinguish lighting normal
+variants of a billboard. Set PROLAND_TEST_BILLBOARD=1 for the Vulkan
+forest example's rotated, nonuniformly scaled source-card regression.

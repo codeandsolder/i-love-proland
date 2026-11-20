@@ -196,12 +196,15 @@ fn pitched_view(pitch: f32) -> Result<(TreeCamera, GpuView), Box<dyn Error>> {
     let near = 0.5;
     let far = 50_000.0;
     let depth = far / (far - near);
-    let camera = TreeCamera::new([
-        [1.0 / aspect, 0.0, 0.0, 0.0],
-        [0.0, cos_pitch, -depth * sin_pitch, -sin_pitch],
-        [0.0, sin_pitch, depth * cos_pitch, cos_pitch],
-        [0.0, 0.0, -near * depth, 0.0],
-    ])?;
+    let camera = TreeCamera::new(
+        [
+            [1.0 / aspect, 0.0, 0.0, 0.0],
+            [0.0, cos_pitch, -depth * sin_pitch, -sin_pitch],
+            [0.0, sin_pitch, depth * cos_pitch, cos_pitch],
+            [0.0, 0.0, -near * depth, 0.0],
+        ],
+        [0.0, -sin_pitch, cos_pitch],
+    )?;
     let nx = aspect.mul_add(aspect, 1.0).sqrt();
     let ny = 2.0_f32.sqrt();
     let view = GpuView::new(
@@ -584,6 +587,102 @@ fn validate_wind_animation(
     Ok(())
 }
 
+// Real GPU regression: a nonuniformly scaled card is edge-on when
+// static, but its original-source billboard must face the camera. A
+// second view-facing card with the same canonical pose is not generated.
+fn validate_source_billboards(
+    device: &wgpu::Device,
+    scene: &ForestPass<'_>,
+    targets: &FrameTargets,
+    atlas: &AtlasTexture,
+    white: &wgpu::TextureView,
+) -> Result<(), Box<dyn Error>> {
+    use i_love_proland::billboard::Billboard;
+    if std::env::var_os("PROLAND_TEST_BILLBOARD").is_none() {
+        return Ok(());
+    }
+    let vertices = [[0.0_f32, 0.0_f32], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]].map(|uv| TreeVertex {
+        position: [uv[0] - 0.5, uv[1] - 0.5, 0.0, 1.0],
+        color: [1.0, 0.0, 0.0, 1.0],
+        uv,
+    });
+    let card = TreeMesh::new(device, &vertices, &[0, 1, 2, 2, 1, 3])?;
+    let compactor = GpuCompactor::new(
+        device,
+        1,
+        MeshLods::new(vec![MeshLod {
+            start_m: 0.0,
+            index_count: card.index_count(),
+        }])?,
+        6,
+    )?;
+    let candidates = [PackedInstance {
+        position_radius: [0.0, 0.4, 8.0, 1.7],
+        rotation: [
+            0.0,
+            core::f32::consts::FRAC_1_SQRT_2,
+            0.0,
+            core::f32::consts::FRAC_1_SQRT_2,
+        ],
+        axis_radii: [1.4, 0.8, 1.7, 1.0],
+        object_id: [1; 4],
+        metadata: [2; 4],
+        tint: [1.0; 4],
+    }];
+    let (camera, view) = pitched_view(0.0)?;
+    let render = |billboard| -> Result<usize, Box<dyn Error>> {
+        let renderer = TreeRenderer::new(
+            device,
+            &compactor,
+            vec![vec![TreeMaterial {
+                mesh: card.clone(),
+                source_view: white,
+                alpha_cutoff: 0.0,
+                wind: None,
+                billboard,
+            }]],
+            atlas,
+            TreeRenderConfig {
+                color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                depth_format: wgpu::TextureFormat::Depth24Plus,
+                sample_count: 1,
+            },
+        )?;
+        renderer.set_camera(scene.queue, camera);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("authored source card regression"),
+        });
+        render_frame(
+            &mut encoder,
+            &ForestPass {
+                candidates: &candidates,
+                compactor: &compactor,
+                renderer: &renderer,
+                view,
+                ..*scene
+            },
+        )?;
+        let pixels = capture(device, scene.queue, encoder, &targets.color)?;
+        Ok(pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[0] > 245 && p[1] < 10 && p[2] < 10)
+            .count())
+    };
+    let static_pixels = render(None)?;
+    let billboard = Some(Billboard::new([0.0, 0.5, 0.0], 1.0)?);
+    let animated_pixels = render(billboard)?;
+    let repeated_pixels = render(billboard)?;
+    assert_eq!(static_pixels, 0);
+    assert!(animated_pixels > 1000);
+    assert_eq!(animated_pixels, repeated_pixels);
+    println!(
+        "FOREST_BILLBOARD_PASS static_pixels={static_pixels} facing_pixels={animated_pixels} repeat_pixels={repeated_pixels}"
+    );
+    Ok(())
+}
+
 fn benchmark_forest(device: &wgpu::Device, scene: &ForestPass<'_>) -> Result<f64, Box<dyn Error>> {
     const FRAMES: u32 = 20;
     let start = Instant::now();
@@ -650,12 +749,14 @@ fn make_source_renderer(
                         mesh: trunk_mesh.clone(),
                         source_view: views.bark,
                         alpha_cutoff: 0.0,
+                        billboard: None,
                         wind: None,
                     },
                     TreeMaterial {
                         mesh: leaf_mesh.clone(),
                         source_view: views.foliage,
                         alpha_cutoff: 0.45,
+                        billboard: None,
                         wind: Some(i_love_proland::impostor::MeshWind {
                             parameters: i_love_proland::wind::WindParameters {
                                 spatial_scale: 0.08,
@@ -721,6 +822,35 @@ fn example_compactor(
     Ok(GpuCompactor::new(device, u32::try_from(count)?, lods, 6)?)
 }
 
+fn validate_and_benchmark(
+    device: &wgpu::Device,
+    scene: &ForestPass<'_>,
+    camera: TreeCamera,
+    targets: &FrameTargets,
+    atlas: &AtlasTexture,
+    white: &wgpu::TextureView,
+) -> Result<f64, Box<dyn Error>> {
+    validate_wind_animation(device, scene, camera, &targets.color)?;
+    validate_source_billboards(device, scene, targets, atlas, white)?;
+    benchmark_forest(device, scene)
+}
+
+fn capture_initial_forest(
+    device: &wgpu::Device,
+    scene: &ForestPass<'_>,
+    color: &wgpu::Texture,
+    prefix: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("low-altitude forest test scene"),
+    });
+    render_frame(&mut encoder, scene)?;
+    let image = capture(device, scene.queue, encoder, color)?;
+    let greens = validate_green_forest(&image)?;
+    write_ppm(&format!("{prefix}-scene.ppm"), WIDTH, HEIGHT, &image)?;
+    Ok(greens)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let prefix = args.next().ok_or(
@@ -747,12 +877,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 indices: trunk_indices,
                 source: &bark,
                 alpha_cutoff: 0.0,
+                billboard: None,
             },
             BakeSurface {
                 vertices: leaf_vertices,
                 indices: &leaf_indices,
                 source: &source,
                 alpha_cutoff: 0.45,
+                billboard: None,
             },
         ],
         64,
@@ -786,27 +918,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     renderer.set_camera(&queue, low_camera);
     let targets = make_frame_targets(&device);
     let color = &targets.color;
-    let color_view = &targets.color_view;
-    let depth_view = &targets.depth_view;
     let background = background_pipeline(&device, "fs_main");
     let overhead_background = background_pipeline(&device, "fs_overhead");
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("low-altitude forest test scene"),
-    });
     let scene = ForestPass {
         queue: &queue,
         compactor: &compactor,
         renderer: &renderer,
         candidates: &candidates,
         view,
-        color: color_view,
-        depth: depth_view,
+        color: &targets.color_view,
+        depth: &targets.depth_view,
         background: &background,
     };
-    render_frame(&mut encoder, &scene)?;
-    let image = capture(&device, &queue, encoder, color)?;
-    let greens = validate_green_forest(&image)?;
-    write_ppm(&format!("{prefix}-scene.ppm"), WIDTH, HEIGHT, &image)?;
+    let greens = capture_initial_forest(&device, &scene, color, &prefix)?;
 
     render_overhead(
         &device,
@@ -817,8 +941,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         &prefix,
     )?;
 
-    validate_wind_animation(&device, &scene, low_camera, color)?;
-    let frame_ms = benchmark_forest(&device, &scene)?;
+    let frame_ms = validate_and_benchmark(
+        &device,
+        &scene,
+        low_camera,
+        &targets,
+        &atlas_texture,
+        bark_texture.view(),
+    )?;
     println!(
         "FOREST_RENDER_PASS candidates={} mesh_indices={} atlas_ms={atlas_ms:.2} canonical_ms={generation_ms:.2} capture_green_pixels={greens} gpu_compact_and_indirect_render_ms={frame_ms:.3} images={prefix}-scene.ppm,{prefix}-atlas.ppm",
         candidates.len(),
