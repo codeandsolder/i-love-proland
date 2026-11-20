@@ -22,7 +22,7 @@ default = []
 gpu = ["dep:wgpu", "dep:bytemuck"]
 
 [dev-dependencies]
-pollster = "0.4"
+pollster = "1.0"
 
 [[example]]
 name = "gpu_compaction"
