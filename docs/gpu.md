@@ -17,8 +17,9 @@ default crate has **zero runtime dependencies**.
    `gpu::PackedInstance` records. The record stores the full source orientation quaternion and
    physical per-axis XYZ radii. A conservative sphere radius (the
    maximum axis radius) is derived for GPU visibility and LOD.
-5. Encode `GpuCompactor` to cull spheres, classify near meshes vs middle
-   impostors by pixel footprint, and compact instances into storage buffers.
+5. Encode `GpuCompactor` to cull spheres, choose mesh vs impostor by
+   pixel footprint, and select the mesh tier using authored physical-anchor
+   distances. Compact each retained object exactly once.
 6. Bind the appropriate storage buffer to a host render vertex shader, use
    `@builtin(instance_index)` to fetch its record, then call
    `draw_indexed_indirect` with the matching GPU indirect argument buffer.
@@ -42,9 +43,9 @@ with `#[repr(C)]` + bytemuck POD in Rust.
 | 64 | `metadata: vec4<u32>` | Low/high limbs of 64-bit variant and layer IDs |
 | 80 | `tint: vec4<f32>` | Independent source-space per-object linear RGB and alpha multiplier, separate from material tint and identity |
 
-Runtime uniforms: 16-byte count header, 16-byte projection thresholds,
-16-byte normalized forward, and six 16-byte inward-facing frustum planes =
-144 bytes. The frustum plane equation is
+Runtime uniforms: 16-byte input count/bin stride/mesh tier count,
+16-byte projection thresholds, 16-byte normalized forward, 16-byte
+normalized source bounds center, and six 16-byte frustum planes = 160 bytes. The frustum plane equation is
 `dot(plane.xyz, camera_relative_position) + plane.w >= -radius`.
 Zero planes are accepted as explicitly disabled planes for broad visibility
 and reproducibility tests.
@@ -63,10 +64,26 @@ Cross-multiplication avoids rounding an exact 1-pixel diameter across the
 boundary on some GPU drivers. This was discovered on a real AMD/RADV Vulkan
 run and fixed before the GPU implementation was committed.
 
-Each object is emitted to **at most one** of two outputs:
+A validated `MeshLods` owns strictly increasing finite mesh range starts
+(in metres) beginning at zero, with the first material's nonzero index
+count per tier. Mesh selection uses the final start distance at or below
+the squared physical-anchor distance; the compute shader performs a binary
+search over those squared boundaries. `GpuView::with_source_center`
+accepts the original source bounds center in normalized mesh coordinates.
+It is multiplied by the packed physical axis radii and rotated by the
+instance quaternion, then subtracted from the camera-relative sphere
+center to recover the exact placement anchor. Off-axis objects therefore
+use true Euclidean distance, not forward depth or source crown distance.
 
-- mesh instances with the first indexed-indirect draw record;
-- octahedral/crossed-billboard impostor instances with the second.
+Each object is emitted to **at most one** of N+1 bins: one of the N
+authored source mesh tiers or the single composite impostor. Indirect
+draws and storage are shared contiguous buffers, with each bin's storage
+offset aligned both to the record size and device storage-binding offset.
+`compactor.bin(index)` exposes its `wgpu::BufferBinding`, indirect buffer
+and byte offset. All indirect `first_instance` values are zero relative
+to the independently bound slice. Only the instance count is atomically
+updated; no object is copied to multiple bins. Choose mesh ranges
+independently of the final projected-size impostor threshold.
 
 Below the impostor threshold, the intended output is the terrain canopy
 appearance field, not a microscopic mesh. The compactor does not bake
@@ -78,21 +95,27 @@ storage order is irrelevant to game state and saved worlds. The instance
 buffer is not a stable indexable database. Sort by IDs outside the GPU draw
 phase if a particular external workflow requires a canonical order.
 
-The compactor processes one compatible geometry/material batch, with its
-own index count for the near mesh and the impostor. Do not blend unrelated
-mesh geometries into the same indirect draw unless the host vertex renderer
-knows how to decode them. Call `encode` once per compactor per submission
-and consume the resulting buffers in a subsequent render pass in that
-submission.
+The compactor processes one compatible physical source family. A tier can
+have multiple material draws; copy its GPU-computed count to each material
+draw while keeping the material-specific index count. Separate source
+families should use their own compactors. Call `encode` once per compactor
+per submission and consume those bins in later passes in that submission.
 
 ### Resource bounds
 
-Allocation checks device storage-buffer and dispatch workgroup limits.
-The instance capacity is fixed at construction. The pass has no per-object
-GPU→CPU synchronization and resets both indirect counts through queue writes
-before dispatch. Buffer memory is approximately
-`3 * 96 * candidate_capacity + 2 * 20 + 144` bytes, excluding driver
-allocation granularity and render-side geometry.
+Let B be the number of mesh tiers plus one impostor bin, C the candidate
+capacity, A the device storage buffer offset alignment and
+S = align_up(C, A/gcd(A,96)) * 96 the byte stride across output bins.
+The allocation is bounded by the actual GPU storage buffer and dispatch
+limits: one C*96-byte input, one B*S-byte output buffer, B*20-byte
+indirect records, N*4-byte immutable squared mesh boundaries and a
+160-byte camera uniform. The shader uses four storage bindings
+(input, output, indirect, thresholds) and one uniform. Slots inside a
+bin never overlap another bin, even when all candidates select one tier.
+The fixed worst-case per-bin allocation trades memory for a single
+pass without per-bin prefix scans, extra dispatches or per-object CPU
+work. Padding is never drawn. Empty frames reset all indirect counts
+before returning.
 
 Use distinct compactors or a higher-level pool for different material
 batches. For moving aircraft, prefetch canonical cells ahead of the craft
@@ -107,9 +130,11 @@ cargo +stable run --locked --features gpu --example gpu_compaction
 ```
 
 The Vulkan example constructs more than sixty thousand deterministic tree
-and rock instances, reads back the **whole** mesh/impostor buffers and both
-indexed indirect commands, then compares every packed record against the
-Rust reference in ID-keyed maps. This is stronger than count parity. It also
+and rock instances, reads back four mesh tiers plus the impostor bin, every
+indexed indirect command, and every visible packed record against the
+Rust reference in ID-keyed maps. The probe exercises full anisotropy,
+rotation, non-neutral tint, nonzero source-center offset, frustum
+rejection, and empty-dispatch resetting. This is stronger than count parity. It also
 reports per-frame elapsed time including CPU uploads and GPU queue drain.
 The example is intentionally independent of KSP source art.
 

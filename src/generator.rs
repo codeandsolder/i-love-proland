@@ -549,7 +549,9 @@ mod tests {
                         let Anchor::Spherical { direction } = item.candidate.anchor else {
                             panic!("not spherical");
                         };
-                        let latitude_bin = ((direction[1] + 1.0) * 2.5).floor() as usize;
+                        let scaled_latitude = (direction[1] + 1.0) * 2.5;
+                        let latitude_bin = [1.0, 2.0, 3.0, 4.0, 5.0]
+                            .partition_point(|&edge| edge <= scaled_latitude);
                         bins[latitude_bin.min(4)] += 1;
                     }
                 }
@@ -558,7 +560,7 @@ mod tests {
         let expected = std::f64::consts::PI * 4.0 * 100.0_f64.powi(2) * 0.3 / 5.0;
         for (i, actual) in bins.into_iter().enumerate() {
             assert!(
-                (actual as f64 - expected).abs() < expected * 0.07,
+                (f64::from(u32::try_from(actual).unwrap()) - expected).abs() < expected * 0.07,
                 "bin {i}: {actual} vs {expected}"
             );
         }
@@ -586,8 +588,10 @@ mod tests {
                     let Anchor::Planar { x_m, y_m } = item.candidate.anchor else {
                         panic!("not planar");
                     };
-                    let local_x = x_m / 10.0 - item.candidate.cell.x as f64;
-                    let local_y = y_m / 10.0 - item.candidate.cell.y as f64;
+                    let local_x =
+                        x_m / 10.0 - f64::from(i32::try_from(item.candidate.cell.x).unwrap());
+                    let local_y =
+                        y_m / 10.0 - f64::from(i32::try_from(item.candidate.cell.y).unwrap());
                     assert!((0.25..0.75).contains(&local_x));
                     assert!((0.25..0.75).contains(&local_y));
                 }
@@ -638,16 +642,16 @@ mod tests {
         let first = instances.first().unwrap();
         assert_eq!(
             first.candidate.id,
-            154533613205574063414866829586011445627_u128
+            154_533_613_205_574_063_414_866_829_586_011_445_627_u128
         );
         assert_eq!(first.variant_id, 1002);
         assert_eq!(
             first.candidate.anchor,
             Anchor::Spherical {
                 direction: [
-                    -0.4115419164003406,
-                    -0.40527162064537636,
-                    0.8163260160897758
+                    -0.411_541_916_400_340_6,
+                    -0.405_271_620_645_376_36,
+                    0.816_326_016_089_775_8
                 ],
             }
         );

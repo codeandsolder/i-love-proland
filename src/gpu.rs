@@ -6,6 +6,7 @@
 //! impostor selection. GPU atomic append order has no persistence semantics.
 
 use crate::{Error, Instance, Result};
+use std::num::NonZeroU64;
 use wgpu::util::DeviceExt;
 
 pub const WGSL_COMPACTION: &str = include_str!("compact.wgsl");
@@ -180,6 +181,7 @@ pub struct GpuView {
     impostor_threshold_px: f32,
     forward: [f32; 3],
     planes: [[f32; 4]; 6],
+    source_center: [f32; 3],
 }
 
 impl GpuView {
@@ -231,7 +233,23 @@ impl GpuView {
             impostor_threshold_px,
             forward,
             planes,
+            source_center: [0.0; 3],
         })
+    }
+
+    /// Supply the original mesh bounds centre relative to its placement anchor,
+    /// in unit-sphere mesh coordinates. Distance LOD selection then uses
+    /// the reconstructed physical anchor even when the source is offset,
+    /// rotated, or nonuniformly scaled.
+    ///
+    /// # Errors
+    /// Rejects non-finite source coordinates.
+    pub fn with_source_center(mut self, source_center: [f32; 3]) -> Result<Self> {
+        if source_center.iter().any(|x| !x.is_finite()) {
+            return Err(Error::InvalidConfiguration("nonfinite source center"));
+        }
+        self.source_center = source_center;
+        Ok(self)
     }
 
     /// Disable frustum plane rejection while keeping correct size-based LOD.
@@ -260,6 +278,7 @@ struct GpuUniform {
     counts: [u32; 4],
     lod: [f32; 4],
     forward: [f32; 4],
+    source_center: [f32; 4],
     planes: [[f32; 4]; 6],
 }
 
@@ -275,14 +294,88 @@ pub struct IndexedDraw {
     pub first_instance: u32,
 }
 
+/// An authored mesh tier begins at a distance in metres from the physical
+/// object's placement anchor. The first tier always starts at zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshLod {
+    pub start_m: f32,
+    pub index_count: u32,
+}
+
+/// Validated, strictly ordered authored mesh tiers. The final mesh tier
+/// extends until the screen-size-based impostor crossover.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshLods {
+    tiers: Vec<MeshLod>,
+}
+
+impl MeshLods {
+    /// # Errors
+    /// Rejects an empty set, nonzero first boundary, duplicate/nonfinite
+    /// distances, overflowing squared boundaries, or empty geometry.
+    pub fn new(tiers: Vec<MeshLod>) -> Result<Self> {
+        if tiers.first().is_none_or(|t| t.start_m != 0.0)
+            || tiers.iter().any(|t| {
+                !t.start_m.is_finite()
+                    || t.start_m < 0.0
+                    || !(t.start_m * t.start_m).is_finite()
+                    || t.index_count == 0
+            })
+            || tiers
+                .windows(2)
+                .any(|w| w[0].start_m * w[0].start_m >= w[1].start_m * w[1].start_m)
+        {
+            return Err(Error::InvalidConfiguration(
+                "invalid ordered mesh LOD ranges",
+            ));
+        }
+        Ok(Self { tiers })
+    }
+
+    #[must_use]
+    pub fn tiers(&self) -> &[MeshLod] {
+        &self.tiers
+    }
+
+    #[must_use]
+    pub const fn impostor_bin(&self) -> usize {
+        self.tiers.len()
+    }
+
+    /// The last start boundary at or below the squared anchor distance.
+    fn tier_for_distance_squared(&self, distance_squared: f32) -> usize {
+        self.tiers
+            .partition_point(|t| t.start_m * t.start_m <= distance_squared)
+            .saturating_sub(1)
+    }
+}
+
 /// Stable reference classification for unit tests and GPU parity checks.
 /// Placement identity is independent of this visual classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VisualLod {
-    Mesh,
+    Mesh(usize),
     Impostor,
     TerrainCanopy,
     OutsideFrustum,
+}
+
+/// Rotate a scaled source-center offset by the physical world quaternion.
+fn source_anchor(object: &PackedInstance, view: GpuView) -> [f32; 3] {
+    let v = core::array::from_fn(|i| view.source_center[i] * object.axis_radii[i]);
+    let q = [object.rotation[0], object.rotation[1], object.rotation[2]];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[2].mul_add(-b[1], a[1] * b[2]),
+            a[0].mul_add(-b[2], a[2] * b[0]),
+            a[1].mul_add(-b[0], a[0] * b[1]),
+        ]
+    };
+    let t = cross(q, v).map(|x| x * 2.0);
+    let u = cross(q, t);
+    core::array::from_fn(|i| {
+        object.position_radius[i] - (object.rotation[3].mul_add(t[i], v[i]) + u[i])
+    })
 }
 
 /// Reference classifier for parity testing with the WGSL shader.
@@ -291,7 +384,7 @@ pub enum VisualLod {
 /// GPU math can still differ slightly near boundaries, affecting visual
 /// LOD only, never canonical object identity.
 #[must_use]
-pub fn classify_cpu(object: &PackedInstance, view: GpuView) -> VisualLod {
+pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods) -> VisualLod {
     let pos = &object.position_radius[..3];
     let radius = object.position_radius[3];
     if view
@@ -311,7 +404,9 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView) -> VisualLod {
     let projected_crown = (2.0 * radius) * view.focal_length_px;
     let safe_depth = depth.max(0.001);
     if projected_crown >= view.mesh_threshold_px * safe_depth {
-        VisualLod::Mesh
+        let anchor = source_anchor(object, view);
+        let distance_squared = anchor.iter().map(|x| x * x).sum();
+        VisualLod::Mesh(mesh_lods.tier_for_distance_squared(distance_squared))
     } else if projected_crown >= view.impostor_threshold_px * safe_depth {
         VisualLod::Impostor
     } else {
@@ -319,23 +414,50 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView) -> VisualLod {
     }
 }
 
-/// Buffers can be bound directly by the host render pass; use the matching
-/// indirect draw buffer and instance storage buffer for each geometry LOD.
+/// One compacted instance-bin binding and its indexed indirect record.
 ///
-/// Every GPU invocation rewrites the indirect instance counts. Compaction
-/// preserves exact IDs/variants but not output order across workgroups.
+/// Each bin is an aligned, independently bindable slice of one storage
+/// buffer. The same instance record is written at most once per dispatch.
+pub struct CompactedBin<'a> {
+    pub instances: wgpu::BufferBinding<'a>,
+    pub indirect: &'a wgpu::Buffer,
+    pub indirect_offset: u64,
+    pub index_count: u32,
+}
+
+/// GPU classification for ordered mesh tiers and one impostor bin.
+///
+/// Canonical IDs and attributes survive unchanged; output order within each
+/// bin is intentionally unspecified.
 pub struct GpuCompactor {
     capacity: u32,
+    mesh_lods: MeshLods,
     input: wgpu::Buffer,
-    mesh: wgpu::Buffer,
-    impostor: wgpu::Buffer,
-    mesh_indirect: wgpu::Buffer,
-    impostor_indirect: wgpu::Buffer,
+    visible: wgpu::Buffer,
+    indirect: wgpu::Buffer,
+    bin_stride: u64,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::ComputePipeline,
-    mesh_template: IndexedDraw,
-    impostor_template: IndexedDraw,
+    templates: Vec<IndexedDraw>,
+}
+
+const fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// A bin offsets whole instance records, and also meets WGPU storage
+/// binding offset alignment. Padding is private, never counted/drawn.
+fn aligned_bin_stride(capacity: u32, alignment: u64) -> Option<u64> {
+    let alignment = alignment.max(1);
+    let records_alignment = alignment / gcd(INSTANCE_BYTES, alignment);
+    u64::from(capacity)
+        .div_ceil(records_alignment)
+        .checked_mul(records_alignment)?
+        .checked_mul(INSTANCE_BYTES)
 }
 
 fn create_compaction_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
@@ -353,64 +475,99 @@ fn create_compaction_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
     })
 }
 
+fn compaction_sizes(
+    device: &wgpu::Device,
+    capacity: u32,
+    mesh_lods: &MeshLods,
+    impostor_index_count: u32,
+) -> Result<(u64, u64, u64)> {
+    let limits = device.limits();
+    let bytes = u64::from(capacity) * INSTANCE_BYTES;
+    let bins = mesh_lods
+        .tiers
+        .len()
+        .checked_add(1)
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or(Error::InvalidConfiguration("GPU LOD bin count overflow"))?;
+    let bin_stride = aligned_bin_stride(
+        capacity,
+        u64::from(limits.min_storage_buffer_offset_alignment),
+    )
+    .ok_or(Error::InvalidConfiguration("GPU LOD stride overflow"))?;
+    let visible_bytes = bin_stride
+        .checked_mul(bins)
+        .ok_or(Error::InvalidConfiguration("GPU LOD storage overflow"))?;
+    if capacity == 0
+        || impostor_index_count == 0
+        || bytes > limits.max_storage_buffer_binding_size
+        || bytes > limits.max_buffer_size
+        || visible_bytes > limits.max_storage_buffer_binding_size
+        || visible_bytes > limits.max_buffer_size
+        || visible_bytes / INSTANCE_BYTES > u64::from(u32::MAX)
+        || capacity.div_ceil(WORKGROUP_SIZE) > limits.max_compute_workgroups_per_dimension
+    {
+        return Err(Error::InvalidConfiguration(
+            "GPU compactor capacity exceeds device limits",
+        ));
+    }
+    Ok((bytes, bin_stride, visible_bytes))
+}
+
 impl GpuCompactor {
     /// # Errors
-    /// Rejects capacity exceeding the GPU's storage/workgroup limits.
+    /// Rejects capacity, tier count, storage or workgroup requirements
+    /// exceeding device limits, and a zero impostor index count.
     pub fn new(
         device: &wgpu::Device,
         capacity: u32,
-        mesh_index_count: u32,
+        mesh_lods: MeshLods,
         impostor_index_count: u32,
     ) -> Result<Self> {
-        let limits = device.limits();
-        let bytes = u64::from(capacity) * INSTANCE_BYTES;
-        if capacity == 0
-            || bytes > limits.max_storage_buffer_binding_size
-            || bytes > limits.max_buffer_size
-            || capacity.div_ceil(WORKGROUP_SIZE) > limits.max_compute_workgroups_per_dimension
-        {
-            return Err(Error::InvalidConfiguration(
-                "GPU compactor capacity exceeds device limits",
-            ));
-        }
-
-        let create_instance_buffer = |name| {
+        let (bytes, bin_stride, visible_bytes) =
+            compaction_sizes(device, capacity, &mesh_lods, impostor_index_count)?;
+        let create_instance_buffer = |name, size| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(name),
-                size: bytes,
+                size,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             })
         };
-        let input = create_instance_buffer("i-love-proland candidate input");
-        let mesh = create_instance_buffer("i-love-proland compacted meshes");
-        let impostor = create_instance_buffer("i-love-proland compacted impostors");
-        let mesh_template = IndexedDraw {
-            index_count: mesh_index_count,
-            instance_count: 0,
-            first_index: 0,
-            base_vertex: 0,
-            first_instance: 0,
-        };
-        let impostor_template = IndexedDraw {
-            index_count: impostor_index_count,
-            ..mesh_template
-        };
-        let create_indirect = |name, record: &IndexedDraw| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(name),
-                contents: bytemuck::bytes_of(record),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::INDIRECT
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
+        let input = create_instance_buffer("i-love-proland candidate input", bytes);
+        let visible = create_instance_buffer("i-love-proland compacted LOD bins", visible_bytes);
+        let templates = mesh_lods
+            .tiers
+            .iter()
+            .map(|tier| tier.index_count)
+            .chain(core::iter::once(impostor_index_count))
+            .map(|index_count| IndexedDraw {
+                index_count,
+                instance_count: 0,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
             })
-        };
-        let mesh_indirect = create_indirect("i-love-proland mesh indirect", &mesh_template);
-        let impostor_indirect =
-            create_indirect("i-love-proland impostor indirect", &impostor_template);
+            .collect::<Vec<_>>();
+        let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("i-love-proland LOD indirect arguments"),
+            contents: bytemuck::cast_slice(&templates),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+        let distance_squared = mesh_lods
+            .tiers
+            .iter()
+            .map(|tier| tier.start_m * tier.start_m)
+            .collect::<Vec<_>>();
+        let thresholds = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("i-love-proland authored squared mesh LOD boundaries"),
+            contents: bytemuck::cast_slice(&distance_squared),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("i-love-proland GPU view parameters"),
             size: core::mem::size_of::<GpuUniform>() as u64,
@@ -429,38 +586,33 @@ impl GpuCompactor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: mesh.as_entire_binding(),
+                    resource: visible.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: impostor.as_entire_binding(),
+                    resource: indirect.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: mesh_indirect.as_entire_binding(),
+                    resource: thresholds.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: impostor_indirect.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
                     resource: uniforms.as_entire_binding(),
                 },
             ],
         });
         Ok(Self {
             capacity,
+            mesh_lods,
             input,
-            mesh,
-            impostor,
-            mesh_indirect,
-            impostor_indirect,
+            visible,
+            indirect,
+            bin_stride,
             uniforms,
             bind_group,
             pipeline,
-            mesh_template,
-            impostor_template,
+            templates,
         })
     }
 
@@ -470,43 +622,38 @@ impl GpuCompactor {
     }
 
     #[must_use]
-    pub const fn mesh_index_count(&self) -> u32 {
-        self.mesh_template.index_count
+    pub const fn mesh_lods(&self) -> &MeshLods {
+        &self.mesh_lods
     }
 
     #[must_use]
-    pub const fn impostor_index_count(&self) -> u32 {
-        self.impostor_template.index_count
+    pub const fn bin_count(&self) -> usize {
+        self.templates.len()
     }
 
+    /// Bind or copy the exact capacity-sized instance slice and the
+    /// corresponding indirect record. Mesh bins precede the impostor bin.
     #[must_use]
-    pub const fn mesh_instances(&self) -> &wgpu::Buffer {
-        &self.mesh
+    pub fn bin(&self, index: usize) -> Option<CompactedBin<'_>> {
+        let template = self.templates.get(index)?;
+        let index = u64::try_from(index).ok()?;
+        Some(CompactedBin {
+            instances: wgpu::BufferBinding {
+                buffer: &self.visible,
+                offset: index * self.bin_stride,
+                size: NonZeroU64::new(u64::from(self.capacity) * INSTANCE_BYTES),
+            },
+            indirect: &self.indirect,
+            indirect_offset: index * core::mem::size_of::<IndexedDraw>() as u64,
+            index_count: template.index_count,
+        })
     }
 
-    #[must_use]
-    pub const fn impostor_instances(&self) -> &wgpu::Buffer {
-        &self.impostor
-    }
-
-    #[must_use]
-    pub const fn mesh_indirect(&self) -> &wgpu::Buffer {
-        &self.mesh_indirect
-    }
-
-    #[must_use]
-    pub const fn impostor_indirect(&self) -> &wgpu::Buffer {
-        &self.impostor_indirect
-    }
-
-    /// Write candidate data and reset both indexed indirect draws, then
-    /// record a single GPU classification/compaction compute pass.
-    ///
-    /// Call before a render pass that consumes the returned storage buffers
-    /// via `@builtin(instance_index)` and the indirect draw parameters.
+    /// Write candidates and reset every indexed indirect record, then
+    /// record one classification/compaction compute pass.
     ///
     /// # Errors
-    /// Rejects candidate batches larger than the fixed instance capacity.
+    /// Rejects candidate batches exceeding the fixed instance capacity.
     pub fn encode(
         &self,
         queue: &wgpu::Queue,
@@ -522,7 +669,14 @@ impl GpuCompactor {
             ));
         }
         let uniform = GpuUniform {
-            counts: [count, 0, 0, 0],
+            counts: [
+                count,
+                u32::try_from(self.bin_stride / INSTANCE_BYTES)
+                    .map_err(|_| Error::InvalidConfiguration("GPU LOD bin stride overflow"))?,
+                u32::try_from(self.mesh_lods.tiers.len())
+                    .map_err(|_| Error::InvalidConfiguration("GPU mesh LOD count overflow"))?,
+                0,
+            ],
             lod: [
                 view.focal_length_px,
                 view.mesh_threshold_px,
@@ -530,19 +684,16 @@ impl GpuCompactor {
                 0.0,
             ],
             forward: [view.forward[0], view.forward[1], view.forward[2], 0.0],
+            source_center: [
+                view.source_center[0],
+                view.source_center[1],
+                view.source_center[2],
+                0.0,
+            ],
             planes: view.planes,
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniform));
-        queue.write_buffer(
-            &self.mesh_indirect,
-            0,
-            bytemuck::bytes_of(&self.mesh_template),
-        );
-        queue.write_buffer(
-            &self.impostor_indirect,
-            0,
-            bytemuck::bytes_of(&self.impostor_template),
-        );
+        queue.write_buffer(&self.indirect, 0, bytemuck::cast_slice(&self.templates));
         if count == 0 {
             return Ok(());
         }
@@ -566,7 +717,7 @@ mod tests {
     #[test]
     fn gpu_layout_and_identity_roundtrip() {
         assert_eq!(core::mem::size_of::<PackedInstance>(), 96);
-        assert_eq!(core::mem::size_of::<GpuUniform>(), 144);
+        assert_eq!(core::mem::size_of::<GpuUniform>(), 160);
         assert_eq!(core::mem::size_of::<IndexedDraw>(), 20);
         let g = Generator::new(
             Domain::Planar { cell_size_m: 10.0 },
@@ -657,6 +808,11 @@ mod tests {
     #[test]
     fn reference_classification_respects_crown_pixels_and_frustum() {
         let view = GpuView::unculled(540.0, 32.0, 1.0).unwrap();
+        let lods = MeshLods::new(vec![MeshLod {
+            start_m: 0.0,
+            index_count: 3,
+        }])
+        .unwrap();
         let object = |z, radius| PackedInstance {
             position_radius: [0.0, 0.0, z, radius],
             rotation: [0.0, 0.0, 0.0, 1.0],
@@ -665,23 +821,106 @@ mod tests {
             metadata: [0; 4],
             tint: [1.0; 4],
         };
-        assert_eq!(classify_cpu(&object(100.0, 10.0), view), VisualLod::Mesh);
         assert_eq!(
-            classify_cpu(&object(500.0, 10.0), view),
+            classify_cpu(&object(100.0, 10.0), view, &lods),
+            VisualLod::Mesh(0)
+        );
+        assert_eq!(
+            classify_cpu(&object(500.0, 10.0), view, &lods),
             VisualLod::Impostor
         );
         assert_eq!(
-            classify_cpu(&object(25_000.0, 10.0), view),
+            classify_cpu(&object(25_000.0, 10.0), view, &lods),
             VisualLod::TerrainCanopy
         );
         assert_eq!(
-            classify_cpu(&object(-100.0, 10.0), view),
+            classify_cpu(&object(-100.0, 10.0), view, &lods),
             VisualLod::OutsideFrustum
         );
         let plane = [1.0, 0.0, 0.0, 0.0];
         let clipped = GpuView::new(540.0, 32.0, 1.0, [0.0, 0.0, 1.0], [plane; 6]).unwrap();
         let mut behind = object(100.0, 1.0);
         behind.position_radius[0] = -20.0;
-        assert_eq!(classify_cpu(&behind, clipped), VisualLod::OutsideFrustum);
+        assert_eq!(
+            classify_cpu(&behind, clipped, &lods),
+            VisualLod::OutsideFrustum
+        );
+    }
+    #[test]
+    fn arbitrary_lod_ranges_and_alignment() {
+        let tier = |start_m| MeshLod {
+            start_m,
+            index_count: 3,
+        };
+        assert!(MeshLods::new(vec![]).is_err());
+        assert!(MeshLods::new(vec![tier(1.0)]).is_err());
+        assert!(MeshLods::new(vec![tier(0.0), tier(0.0)]).is_err());
+        assert!(MeshLods::new(vec![tier(0.0), tier(f32::INFINITY)]).is_err());
+        assert!(MeshLods::new(vec![tier(0.0), tier(f32::MAX)]).is_err());
+        assert!(
+            MeshLods::new(vec![MeshLod {
+                start_m: 0.0,
+                index_count: 0
+            }])
+            .is_err()
+        );
+        let lods = MeshLods::new(vec![tier(0.0), tier(10.0), tier(20.0), tier(90.0)]).unwrap();
+        assert_eq!(lods.impostor_bin(), 4);
+        for (d, expected) in [
+            (0.0, 0),
+            (9.0, 0),
+            (10.0, 1),
+            (20.0, 2),
+            (90.0, 3),
+            (190.0, 3),
+        ] {
+            assert_eq!(lods.tier_for_distance_squared(d * d), expected);
+        }
+        for capacity in [1, 3, 8, 9, 91, 20_013] {
+            for alignment in [1, 16, 32, 64, 256, 4096] {
+                let stride = aligned_bin_stride(capacity, alignment).unwrap();
+                assert_eq!(stride % alignment, 0);
+                assert_eq!(stride % INSTANCE_BYTES, 0);
+                assert!(stride >= u64::from(capacity) * INSTANCE_BYTES);
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_tier_distance_uses_physical_anchor_not_crown_or_depth() {
+        let lods = MeshLods::new(vec![
+            MeshLod {
+                start_m: 0.0,
+                index_count: 9,
+            },
+            MeshLod {
+                start_m: 10.0,
+                index_count: 3,
+            },
+            MeshLod {
+                start_m: 20.0,
+                index_count: 6,
+            },
+        ])
+        .unwrap();
+        let view = GpuView::unculled(540.0, 16.0, 0.15)
+            .unwrap()
+            .with_source_center([0.0, 0.0, 1.0])
+            .unwrap();
+        // Sphere center is 21m away but the physical anchor is only 8m.
+        let mut object = PackedInstance {
+            position_radius: [0.0, 0.0, 21.0, 13.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            axis_radii: [3.0, 5.0, 13.0, 0.0],
+            object_id: [1; 4],
+            metadata: [2; 4],
+            tint: [1.0; 4],
+        };
+        assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Mesh(0));
+        // Off-axis distance, not view-forward depth, chooses the next tiers.
+        object.position_radius[0] = 14.0;
+        assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Mesh(1));
+        object.position_radius[0] = 22.0;
+        assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Mesh(2));
     }
 }

@@ -19,23 +19,26 @@ a CPU-side visibility simulation.
   general KSP/Parallax affine placements including nonuniform scale and tilt.
   The impostor shader evaluates source-local azimuth/elevation through the
   inverse quaternion and projects conservative view-dependent half-extents.
-- Construct one `TreeMesh` for each source material, a single
-  `GpuCompactor::new(device, capacity, first_mesh.index_count(), 6)`, the
-  combined `AtlasImage::upload`, and source albedo views (either
-  `SourceImage::upload` or original GPU-compressed DDS views). Create a
-  `TreeRenderer::new(device, &compactor, vec![TreeMaterial {
-  mesh, source_view, alpha_cutoff }, ...], &atlas,
-  TreeRenderConfig { color_format, depth_format, sample_count })`.
-  The renderer takes ownership of the individual GPU meshes.
+- Construct each unique immutable `TreeMesh` once (cloning shares its
+  underlying GPU buffers), and construct a single `GpuCompactor` with an
+  ordered `MeshLods` (first material index count per tier), plus a final
+  impostor index count of 6. Upload the combined `AtlasImage` and source
+  albedo views (compressed or uncompressed). Create
+  `TreeRenderer::new(device, &compactor, sources, &atlas, config)` with
+  `sources: Vec<Vec<TreeMaterial>>`, one material vector per mesh tier.
+  All tiers must have nonempty source materials and their first index
+  count must match the corresponding compactor metadata.
 - Before each render pass, call `compactor.encode(queue, encoder, ...)`,
-  then `renderer.encode_mesh_draws(encoder, &compactor)` in the **same
-  encoder**. The latter copies the computed mesh instance count into every
-  material's own indexed-indirect command, preserving its source index count.
-  Call `renderer.set_camera(queue, camera)` before submission. Inside a
-  matching render pass, `renderer.draw(pass, &compactor)` draws all original
-  near-field materials and exactly **one** combined 32-view impostor.
-  Neither mesh material count nor candidate density multiplies visibility
-  classification; no CPU instance-count readback is required.
+  then `renderer.encode_mesh_draws(encoder)` in the **same encoder**.
+  Each material receives the count from its own compacted tier, keeping
+  its source index count. The renderer owns shared handles to its input
+  bin buffers, avoiding accidentally drawing against a different
+  compactor's storage. Call `renderer.set_camera(queue, camera)` before
+  submission; inside the pass `renderer.draw(pass)` emits every tier's
+  source materials and **one** composite 32-view impostor. One compute
+  dispatch classifies all candidate objects regardless of mesh-tier or
+  material counts; no CPU count readback is necessary.
+
 - The host owns its color/depth render attachments, pass load operations and
   source material grouping.
 

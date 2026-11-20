@@ -322,13 +322,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(matching, clipped);
-        assert!(
+        assert_eq!(
             generator
                 .tile_with_habitat_in_cells(TileKey::planar(3, 3), rect, &trees, |_| panic!(
                     "outside tile"
                 ))
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            []
         );
     }
 

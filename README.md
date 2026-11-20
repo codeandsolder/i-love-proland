@@ -136,11 +136,14 @@ and two layer-ID words through GPU filtering.
 
 `gpu::GpuCompactor` accepts an arbitrary candidate batch and a camera
 frustum, then dispatches a WGSL compute pass that culls bounding spheres,
-chooses detailed mesh vs impostor by **projected canopy diameter in pixels**,
-and atomically compacts survivors into two separate storage buffers. Each has
-its own GPU-written indexed-indirect draw arguments; the host can bind
-`mesh_instances()/mesh_indirect()` or
-`impostor_instances()/impostor_indirect()` directly in its render passes.
+chooses mesh vs impostor by **projected canopy diameter in pixels**, and
+selects the authored distance tier within the mesh class. The ordered
+`MeshLods` table accepts any number of mesh ranges, followed by exactly
+one impostor bin. Every candidate is atomically appended at most once.
+Each bin has its own indexed-indirect record and device-aligned storage
+slice, both exposed through `compactor.bin(index)`. Draw materials
+within a tier share its instance list and immutable uploaded source
+mesh buffers; no per-material compaction or CPU readback is needed.
 
 Very small trees are handled by the future aggregate canopy shading path;
 they are excluded from mesh/impostor lists without deleting canonical world
