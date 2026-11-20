@@ -182,6 +182,7 @@ pub struct GpuView {
     forward: [f32; 3],
     planes: [[f32; 4]; 6],
     source_center: [f32; 3],
+    displacement_bound: f32,
 }
 
 impl GpuView {
@@ -234,6 +235,7 @@ impl GpuView {
             forward,
             planes,
             source_center: [0.0; 3],
+            displacement_bound: 0.0,
         })
     }
 
@@ -249,6 +251,21 @@ impl GpuView {
             return Err(Error::InvalidConfiguration("nonfinite source center"));
         }
         self.source_center = source_center;
+        Ok(self)
+    }
+
+    /// Conservatively extend the sphere used for visibility by the maximum
+    /// animation displacement (metres), without changing visual LOD size.
+    ///
+    /// # Errors
+    /// Rejects negative or nonfinite bounds.
+    pub fn with_displacement_bound(mut self, metres: f32) -> Result<Self> {
+        if !metres.is_finite() || metres < 0.0 {
+            return Err(Error::InvalidConfiguration(
+                "invalid animated displacement bound",
+            ));
+        }
+        self.displacement_bound = metres;
         Ok(self)
     }
 
@@ -387,18 +404,17 @@ fn source_anchor(object: &PackedInstance, view: GpuView) -> [f32; 3] {
 pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods) -> VisualLod {
     let pos = &object.position_radius[..3];
     let radius = object.position_radius[3];
-    if view
-        .planes
-        .iter()
-        .any(|p| p[0].mul_add(pos[0], p[1].mul_add(pos[1], p[2] * pos[2])) + p[3] < -radius)
-    {
+    let visibility_radius = radius + view.displacement_bound;
+    if view.planes.iter().any(|p| {
+        p[0].mul_add(pos[0], p[1].mul_add(pos[1], p[2] * pos[2])) + p[3] < -visibility_radius
+    }) {
         return VisualLod::OutsideFrustum;
     }
     let depth = view.forward[0].mul_add(
         pos[0],
         view.forward[1].mul_add(pos[1], view.forward[2] * pos[2]),
     );
-    if depth + radius <= 0.0 {
+    if depth + visibility_radius <= 0.0 {
         return VisualLod::OutsideFrustum;
     }
     let projected_crown = (2.0 * radius) * view.focal_length_px;
@@ -681,7 +697,7 @@ impl GpuCompactor {
                 view.focal_length_px,
                 view.mesh_threshold_px,
                 view.impostor_threshold_px,
-                0.0,
+                view.displacement_bound,
             ],
             forward: [view.forward[0], view.forward[1], view.forward[2], 0.0],
             source_center: [
@@ -922,5 +938,44 @@ mod tests {
         assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Mesh(1));
         object.position_radius[0] = 22.0;
         assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Mesh(2));
+    }
+    #[test]
+    fn wind_visibility_padding_does_not_change_projected_lod() {
+        let tiers = MeshLods::new(vec![MeshLod {
+            start_m: 0.0,
+            index_count: 3,
+        }])
+        .unwrap();
+        let view = GpuView::new(
+            540.0,
+            32.0,
+            0.15,
+            [0.0, 0.0, 1.0],
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0; 4],
+                [0.0; 4],
+                [0.0; 4],
+                [0.0; 4],
+                [0.0; 4],
+            ],
+        )
+        .unwrap();
+        let packed = PackedInstance {
+            position_radius: [-3.0, 0.0, 1000.0, 1.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            axis_radii: [1.0, 1.0, 1.0, 0.0],
+            object_id: [1; 4],
+            metadata: [2; 4],
+            tint: [1.0; 4],
+        };
+        assert_eq!(
+            classify_cpu(&packed, view, &tiers),
+            VisualLod::OutsideFrustum
+        );
+        let padded = view.with_displacement_bound(3.0).unwrap();
+        assert_eq!(classify_cpu(&packed, padded, &tiers), VisualLod::Impostor);
+        assert!(view.with_displacement_bound(-1.0).is_err());
+        assert!(view.with_displacement_bound(f32::NAN).is_err());
     }
 }

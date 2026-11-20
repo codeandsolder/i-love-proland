@@ -21,7 +21,7 @@ struct IndexedDraw {
 
 struct View {
     counts: vec4<u32>,             // input count, aligned bin stride (records), mesh bin count
-    lod: vec4<f32>,                // focal pixels, mesh threshold, impostor threshold, unused
+    lod: vec4<f32>,                // focal pixels, mesh threshold, impostor threshold, animation displacement bound
     forward: vec4<f32>,            // normalized camera forward
     source_center: vec4<f32>,      // normalized original mesh bounds centre
     planes: array<vec4<f32>, 6>,   // xyz normal, w offset; camera-relative
@@ -48,17 +48,18 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let instance = input[input_id];
     let position = instance.position_radius.xyz;
     let radius = instance.position_radius.w;
+    let visibility_radius = radius + camera.lod.w;
 
     // Conservatively keep every sphere intersecting the camera frustum.
     for (var p: u32 = 0u; p < 6u; p += 1u) {
         let plane = camera.planes[p];
-        if dot(plane.xyz, position) + plane.w < -radius {
+        if dot(plane.xyz, position) + plane.w < -visibility_radius {
             return;
         }
     }
 
     let depth = dot(position, camera.forward.xyz);
-    if depth + radius <= 0.0 {
+    if depth + visibility_radius <= 0.0 {
         return;
     }
     // Cross-multiply the projected diameter test. This avoids a costly

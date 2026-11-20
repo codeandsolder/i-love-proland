@@ -537,6 +537,53 @@ fn render_overhead(
     Ok(())
 }
 
+// Render the same canonical objects twice at a fixed camera, changing only
+// the wind time. Then restore the exact original unanimated camera.
+fn validate_wind_animation(
+    device: &wgpu::Device,
+    scene: &ForestPass<'_>,
+    camera: TreeCamera,
+    color: &wgpu::Texture,
+) -> Result<(), Box<dyn Error>> {
+    use i_love_proland::wind::WindFrame;
+    if std::env::var_os("PROLAND_TEST_WIND").is_none() {
+        return Ok(());
+    }
+    let render = |camera, label| -> Result<Vec<u8>, Box<dyn Error>> {
+        scene.renderer.set_camera(scene.queue, camera);
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        render_frame(&mut encoder, scene)?;
+        capture(device, scene.queue, encoder, color)
+    };
+    let axes = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
+    let start = camera.with_wind(WindFrame::new([0., 600_000., 0.], axes, 0.0)?);
+    let end = camera.with_wind(WindFrame::new([0., 600_000., 0.], axes, 3.0)?);
+    let first = render(start, "wind t=0")?;
+    let second = render(end, "wind t=3")?;
+    let repeat = render(start, "wind t=0 repeat")?;
+    let count_changed = |left: &[u8], right: &[u8]| {
+        left.as_chunks::<4>()
+            .0
+            .iter()
+            .zip(right.as_chunks::<4>().0)
+            .filter(|(a, b)| a != b)
+            .count()
+    };
+    let moved = count_changed(&first, &second);
+    let repeat_changed = count_changed(&first, &repeat);
+    assert!(moved > 0, "wind animation must change pixels");
+    // GPU atomic output order can resolve depth-tied edges differently.
+    // Compare repeated-time noise against the actual animation signal.
+    assert!(
+        moved > repeat_changed * 10,
+        "wind signal must exceed repeat rendering noise"
+    );
+    println!("FOREST_WIND_PASS changed_pixels={moved} repeated_time_changed={repeat_changed}");
+    scene.renderer.set_camera(scene.queue, camera);
+    Ok(())
+}
+
 fn benchmark_forest(device: &wgpu::Device, scene: &ForestPass<'_>) -> Result<f64, Box<dyn Error>> {
     const FRAMES: u32 = 20;
     let start = Instant::now();
@@ -563,6 +610,24 @@ fn load_source_image(args: &[String]) -> Result<SourceImage, Box<dyn Error>> {
     }
 }
 
+/// Independent nonuniform RGB wind fixture; never reuse the white default
+/// albedo or depend on external asset files for the animation regression.
+fn wind_fixture() -> Result<SourceImage, Box<dyn Error>> {
+    let mut rgba = Vec::new();
+    for y in 0_u8..8 {
+        for x in 0_u8..8 {
+            rgba.extend_from_slice(&[x * 32, y * 32, (x ^ y) * 32, 255]);
+        }
+    }
+    Ok(SourceImage::new(8, 8, rgba)?)
+}
+
+struct SourceViews<'a> {
+    bark: &'a wgpu::TextureView,
+    foliage: &'a wgpu::TextureView,
+    wind: &'a wgpu::TextureView,
+}
+
 /// Share two immutable source meshes across every tier; keep their cutoffs.
 fn make_source_renderer(
     device: &wgpu::Device,
@@ -570,8 +635,7 @@ fn make_source_renderer(
     trunk_mesh: &TreeMesh,
     leaf_mesh: &TreeMesh,
     atlas_texture: &AtlasTexture,
-    bark_view: &wgpu::TextureView,
-    foliage_view: &wgpu::TextureView,
+    views: &SourceViews<'_>,
 ) -> Result<TreeRenderer, Box<dyn Error>> {
     let renderer = TreeRenderer::new(
         device,
@@ -584,13 +648,26 @@ fn make_source_renderer(
                 vec![
                     TreeMaterial {
                         mesh: trunk_mesh.clone(),
-                        source_view: bark_view,
+                        source_view: views.bark,
                         alpha_cutoff: 0.0,
+                        wind: None,
                     },
                     TreeMaterial {
                         mesh: leaf_mesh.clone(),
-                        source_view: foliage_view,
+                        source_view: views.foliage,
                         alpha_cutoff: 0.45,
+                        wind: Some(i_love_proland::impostor::MeshWind {
+                            parameters: i_love_proland::wind::WindParameters {
+                                spatial_scale: 0.08,
+                                height_start: 0.0,
+                                height_exponent: 1.62,
+                                speed: 2.1,
+                                intensity: 0.7,
+                            },
+                            map: views.wind,
+                            source_center_y: 1.0,
+                            source_radius: 1.0,
+                        }),
                     },
                 ]
             })
@@ -692,14 +769,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let atlas_texture = atlas.upload(&device, &queue)?;
     let bark_texture = bark.upload(&device, &queue)?;
     let source_texture = source.upload(&device, &queue)?;
+    let wind_texture = wind_fixture()?.upload(&device, &queue)?;
     let renderer = make_source_renderer(
         &device,
         &compactor,
         &trunk_mesh,
         &leaf_mesh,
         &atlas_texture,
-        bark_texture.view(),
-        source_texture.view(),
+        &SourceViews {
+            bark: bark_texture.view(),
+            foliage: source_texture.view(),
+            wind: wind_texture.view(),
+        },
     )?;
     let (low_camera, view) = pitched_view(0.0)?;
     renderer.set_camera(&queue, low_camera);
@@ -736,6 +817,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &prefix,
     )?;
 
+    validate_wind_animation(&device, &scene, low_camera, color)?;
     let frame_ms = benchmark_forest(&device, &scene)?;
     println!(
         "FOREST_RENDER_PASS candidates={} mesh_indices={} atlas_ms={atlas_ms:.2} canonical_ms={generation_ms:.2} capture_green_pixels={greens} gpu_compact_and_indirect_render_ms={frame_ms:.3} images={prefix}-scene.ppm,{prefix}-atlas.ppm",

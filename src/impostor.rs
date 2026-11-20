@@ -2,7 +2,10 @@
 //! Consumes compacted GPU buffers without reading back their contents.
 
 use crate::gpu::{CompactedBin, GpuCompactor, IndexedDraw};
-use crate::{Error, Result};
+use crate::{
+    Error, Result,
+    wind::{WindFrame, WindParameters},
+};
 use wgpu::util::DeviceExt;
 
 pub const AZIMUTH_VIEWS: u32 = 8;
@@ -199,6 +202,7 @@ pub struct AtlasTexture {
 #[derive(Clone, Copy, Debug)]
 pub struct TreeCamera {
     projection: [[f32; 4]; 4],
+    wind: Option<WindFrame>,
 }
 
 impl TreeCamera {
@@ -208,7 +212,17 @@ impl TreeCamera {
         if projection.iter().flatten().any(|x| !x.is_finite()) {
             return Err(Error::InvalidConfiguration("non-finite tree projection"));
         }
-        Ok(Self { projection })
+        Ok(Self {
+            projection,
+            wind: None,
+        })
+    }
+
+    /// Attach stable wind coordinates and elapsed animation time.
+    #[must_use]
+    pub const fn with_wind(mut self, frame: WindFrame) -> Self {
+        self.wind = Some(frame);
+        self
     }
 
     /// Left-handed forward-positive-Z perspective with depth in [0, 1].
@@ -247,6 +261,11 @@ struct DrawUniform {
     projection: [[f32; 4]; 4],
     atlas: [f32; 4],
     material: [f32; 4],
+    wind_parameters: [f32; 4],
+    wind_source: [f32; 4],
+    field_axes: [[f32; 4]; 3],
+    field_origin: [f32; 4],
+    field_phase: [f32; 4],
 }
 
 /// Render targets and material alpha-cutoff semantics.
@@ -263,11 +282,43 @@ enum PassKind {
     Impostor,
 }
 
+/// Optional texture-driven wind on a single authored material.
+pub struct MeshWind<'a> {
+    pub parameters: WindParameters,
+    pub map: &'a wgpu::TextureView,
+    /// Unnormalized source-space bounds centre Y and radius.
+    pub source_center_y: f32,
+    pub source_radius: f32,
+}
+
+#[derive(Clone, Copy)]
+struct MaterialWind {
+    parameters: WindParameters,
+    source_center_y: f32,
+    source_radius: f32,
+}
+
+impl MeshWind<'_> {
+    fn validate(&self) -> Result<()> {
+        self.parameters.validate()?;
+        if !self.source_center_y.is_finite()
+            || !self.source_radius.is_finite()
+            || self.source_radius <= 0.0
+        {
+            return Err(Error::InvalidConfiguration("invalid wind source bounds"));
+        }
+        self.parameters
+            .max_displacement(self.source_center_y + self.source_radius)?;
+        Ok(())
+    }
+}
+
 /// One textured source mesh. The renderer takes ownership of its GPU mesh.
 pub struct TreeMaterial<'a> {
     pub mesh: TreeMesh,
     pub source_view: &'a wgpu::TextureView,
     pub alpha_cutoff: f32,
+    pub wind: Option<MeshWind<'a>>,
 }
 
 struct MeshDraw {
@@ -277,6 +328,7 @@ struct MeshDraw {
     indirect: wgpu::Buffer,
     source_indirect_offset: u64,
     cutoff: f32,
+    wind: Option<MaterialWind>,
 }
 
 /// Every authored mesh tier shares one GPU-visible instance list across its
@@ -410,8 +462,18 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             },
             BindGroupLayoutEntry {
                 binding: 5,
-                visibility: ShaderStages::FRAGMENT,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
                 ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
                 count: None,
             },
         ],
@@ -423,6 +485,7 @@ struct MaterialBindings<'a> {
     atlas_sampler: &'a wgpu::Sampler,
     source_view: &'a wgpu::TextureView,
     source_sampler: &'a wgpu::Sampler,
+    wind_view: &'a wgpu::TextureView,
 }
 
 fn make_draw_bind(
@@ -459,6 +522,10 @@ fn make_draw_bind(
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: wgpu::BindingResource::Sampler(materials.source_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(materials.wind_view),
             },
         ],
     })
@@ -505,6 +572,10 @@ fn build_mesh_draw(
             atlas_sampler,
             source_view: source.source_view,
             source_sampler,
+            wind_view: source
+                .wind
+                .as_ref()
+                .map_or(source.source_view, |wind| wind.map),
         },
     );
     let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -525,6 +596,11 @@ fn build_mesh_draw(
         indirect,
         source_indirect_offset: bin.indirect_offset,
         cutoff: source.alpha_cutoff,
+        wind: source.wind.map(|wind| MaterialWind {
+            parameters: wind.parameters,
+            source_center_y: wind.source_center_y,
+            source_radius: wind.source_radius,
+        }),
     }
 }
 
@@ -564,6 +640,7 @@ fn make_impostor_bind(
             atlas_sampler,
             source_view: &source_view,
             source_sampler,
+            wind_view: &source_view,
         },
     )
 }
@@ -586,6 +663,11 @@ fn validate_material_tiers(
         return Err(Error::InvalidConfiguration(
             "invalid forest material tiers or sample count",
         ));
+    }
+    for source in sources.iter().flatten() {
+        if let Some(wind) = &source.wind {
+            wind.validate()?;
+        }
     }
     for (tier, source) in sources.iter().enumerate() {
         if compactor
@@ -718,12 +800,34 @@ impl TreeRenderer {
             projection: camera.projection,
             atlas: [8.0, 4.0, self.gutter_fraction, 0.0],
             material: [0.0, f32::from(u8::from(self.alpha_to_coverage)), 0.0, 0.0],
+            wind_parameters: [0.0; 4],
+            wind_source: [0.0; 4],
+            field_axes: [[0.0; 4]; 3],
+            field_origin: [0.0; 4],
+            field_phase: [0.0; 4],
         };
         for material in &self.mesh_draws {
             uniform.material[0] = material.cutoff;
+            uniform.wind_parameters = [0.0; 4];
+            if let (Some(wind), Some(frame)) = (material.wind, camera.wind) {
+                let p = wind.parameters;
+                uniform.wind_parameters = [
+                    p.spatial_scale,
+                    p.height_start,
+                    p.height_exponent,
+                    p.intensity,
+                ];
+                uniform.wind_source = [wind.source_center_y, wind.source_radius, 0.0, 0.0];
+                (
+                    uniform.field_axes,
+                    uniform.field_origin,
+                    uniform.field_phase,
+                ) = frame.uniforms(p);
+            }
             queue.write_buffer(&material.uniforms, 0, bytemuck::bytes_of(&uniform));
         }
         uniform.material[0] = 0.0;
+        uniform.wind_parameters = [0.0; 4];
         queue.write_buffer(&self.impostor_uniforms, 0, bytemuck::bytes_of(&uniform));
     }
 
