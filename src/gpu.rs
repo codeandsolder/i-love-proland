@@ -338,7 +338,7 @@ impl MeshLods {
     }
 
     #[must_use]
-    pub fn impostor_bin(&self) -> usize {
+    pub const fn impostor_bin(&self) -> usize {
         self.tiers.len()
     }
 
@@ -366,14 +366,16 @@ fn source_anchor(object: &PackedInstance, view: GpuView) -> [f32; 3] {
     let q = [object.rotation[0], object.rotation[1], object.rotation[2]];
     let cross = |a: [f32; 3], b: [f32; 3]| {
         [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
+            a[2].mul_add(-b[1], a[1] * b[2]),
+            a[0].mul_add(-b[2], a[2] * b[0]),
+            a[1].mul_add(-b[0], a[0] * b[1]),
         ]
     };
     let t = cross(q, v).map(|x| x * 2.0);
     let u = cross(q, t);
-    core::array::from_fn(|i| object.position_radius[i] - (v[i] + object.rotation[3] * t[i] + u[i]))
+    core::array::from_fn(|i| {
+        object.position_radius[i] - (object.rotation[3].mul_add(t[i], v[i]) + u[i])
+    })
 }
 
 /// Reference classifier for parity testing with the WGSL shader.
@@ -413,6 +415,7 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods
 }
 
 /// One compacted instance-bin binding and its indexed indirect record.
+///
 /// Each bin is an aligned, independently bindable slice of one storage
 /// buffer. The same instance record is written at most once per dispatch.
 pub struct CompactedBin<'a> {
@@ -422,9 +425,10 @@ pub struct CompactedBin<'a> {
     pub index_count: u32,
 }
 
-/// One GPU classification pass for an arbitrary ordered mesh LOD set
-/// followed by a single impostor bin. Canonical IDs and attributes survive
-/// unchanged; output order within each bin is intentionally unspecified.
+/// GPU classification for ordered mesh tiers and one impostor bin.
+///
+/// Canonical IDs and attributes survive unchanged; output order within each
+/// bin is intentionally unspecified.
 pub struct GpuCompactor {
     capacity: u32,
     mesh_lods: MeshLods,
@@ -438,7 +442,7 @@ pub struct GpuCompactor {
     templates: Vec<IndexedDraw>,
 }
 
-fn gcd(mut a: u64, mut b: u64) -> u64 {
+const fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         (a, b) = (b, a % b);
     }
@@ -623,7 +627,7 @@ impl GpuCompactor {
     }
 
     #[must_use]
-    pub fn bin_count(&self) -> usize {
+    pub const fn bin_count(&self) -> usize {
         self.templates.len()
     }
 
