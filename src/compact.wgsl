@@ -20,18 +20,23 @@ struct IndexedDraw {
 }
 
 struct View {
-    counts: vec4<u32>,             // x = input candidate count
+    counts: vec4<u32>,             // input count, aligned bin stride (records), mesh bin count
     lod: vec4<f32>,                // focal pixels, mesh threshold, impostor threshold, unused
     forward: vec4<f32>,            // normalized camera forward
+    source_center: vec4<f32>,      // normalized original mesh bounds centre
     planes: array<vec4<f32>, 6>,   // xyz normal, w offset; camera-relative
 }
 
 @group(0) @binding(0) var<storage, read> input: array<PackedInstance>;
-@group(0) @binding(1) var<storage, read_write> mesh_instances: array<PackedInstance>;
-@group(0) @binding(2) var<storage, read_write> impostor_instances: array<PackedInstance>;
-@group(0) @binding(3) var<storage, read_write> mesh_draw: IndexedDraw;
-@group(0) @binding(4) var<storage, read_write> impostor_draw: IndexedDraw;
-@group(0) @binding(5) var<uniform> camera: View;
+@group(0) @binding(1) var<storage, read_write> visible: array<PackedInstance>;
+@group(0) @binding(2) var<storage, read_write> draws: array<IndexedDraw>;
+@group(0) @binding(3) var<storage, read> mesh_starts_squared: array<f32>;
+@group(0) @binding(4) var<uniform> camera: View;
+
+fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
 
 @compute @workgroup_size(64)
 fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -68,11 +73,23 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // The source ID, variant, and appearance parameters are passed unchanged.
     // Append order across GPU workgroups is intentionally unspecified.
+    var bin = camera.counts.z; // final bin is the composite impostor
     if projected_crown >= camera.lod.y * safe_depth {
-        let slot = atomicAdd(&mesh_draw.instance_count, 1u);
-        mesh_instances[slot] = instance;
-    } else {
-        let slot = atomicAdd(&impostor_draw.instance_count, 1u);
-        impostor_instances[slot] = instance;
+        let anchor = position - rotate(instance.rotation, camera.source_center.xyz * instance.axis_radii.xyz);
+        let distance_squared = dot(anchor, anchor);
+        // Upper bound search for the final inclusive authored start range.
+        var low = 0u;
+        var high = camera.counts.z;
+        while low + 1u < high {
+            let middle = low + (high - low) / 2u;
+            if mesh_starts_squared[middle] <= distance_squared {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        bin = low;
     }
+    let slot = atomicAdd(&draws[bin].instance_count, 1u);
+    visible[bin * camera.counts.y + slot] = instance;
 }

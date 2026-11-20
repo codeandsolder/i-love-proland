@@ -408,7 +408,7 @@ mod tests {
                     assert_eq!(modification.layer_id, original.candidate.layer_id);
                     assert_eq!(modification.payload, "moved oak");
                 }
-                _ => panic!("expected relocated"),
+                VisibleExtra::Added(_) => panic!("expected relocated"),
             }
             assert!(moved.next().is_none());
         }
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(extras.len(), 1);
         match &extras[0] {
             VisibleExtra::Added(addition) => assert_eq!(addition.payload, 2),
-            _ => panic!("expected added"),
+            VisibleExtra::Relocated { .. } => panic!("expected added"),
         }
         assert_eq!(edits.generated_changes().count(), 1);
         edits.remove_added(id);

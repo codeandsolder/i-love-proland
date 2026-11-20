@@ -3,7 +3,7 @@
 //! external conversion tools without adding runtime dependencies to the library.
 
 use i_love_proland::atlas_bake::{BakeSurface, bake_scene};
-use i_love_proland::gpu::{GpuCompactor, GpuView, PackedInstance, RenderPose};
+use i_love_proland::gpu::{GpuCompactor, GpuView, MeshLod, MeshLods, PackedInstance, RenderPose};
 use i_love_proland::impostor::{
     AtlasImage, AtlasTexture, TreeCamera, TreeMaterial, TreeMesh, TreeRenderConfig, TreeRenderer,
     TreeVertex,
@@ -341,7 +341,7 @@ fn render_frame(
     scene
         .compactor
         .encode(scene.queue, encoder, scene.candidates, scene.view)?;
-    scene.renderer.encode_mesh_draws(encoder, scene.compactor);
+    scene.renderer.encode_mesh_draws(encoder);
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("i-love-proland real forest GPU draw"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -367,7 +367,7 @@ fn render_frame(
     });
     pass.set_pipeline(scene.background);
     pass.draw(0..3, 0..1);
-    scene.renderer.draw(&mut pass, scene.compactor);
+    scene.renderer.draw(&mut pass);
     Ok(())
 }
 
@@ -563,12 +563,12 @@ fn load_source_image(args: &[String]) -> Result<SourceImage, Box<dyn Error>> {
     }
 }
 
-/// Own the two source meshes; retain each material's original alpha cutoff.
+/// Share two immutable source meshes across every tier; keep their cutoffs.
 fn make_source_renderer(
     device: &wgpu::Device,
     compactor: &GpuCompactor,
-    trunk_mesh: TreeMesh,
-    leaf_mesh: TreeMesh,
+    trunk_mesh: &TreeMesh,
+    leaf_mesh: &TreeMesh,
     atlas_texture: &AtlasTexture,
     bark_view: &wgpu::TextureView,
     foliage_view: &wgpu::TextureView,
@@ -576,18 +576,25 @@ fn make_source_renderer(
     let renderer = TreeRenderer::new(
         device,
         compactor,
-        vec![
-            TreeMaterial {
-                mesh: trunk_mesh,
-                source_view: bark_view,
-                alpha_cutoff: 0.0,
-            },
-            TreeMaterial {
-                mesh: leaf_mesh,
-                source_view: foliage_view,
-                alpha_cutoff: 0.45,
-            },
-        ],
+        compactor
+            .mesh_lods()
+            .tiers()
+            .iter()
+            .map(|_| {
+                vec![
+                    TreeMaterial {
+                        mesh: trunk_mesh.clone(),
+                        source_view: bark_view,
+                        alpha_cutoff: 0.0,
+                    },
+                    TreeMaterial {
+                        mesh: leaf_mesh.clone(),
+                        source_view: foliage_view,
+                        alpha_cutoff: 0.45,
+                    },
+                ]
+            })
+            .collect(),
         atlas_texture,
         TreeRenderConfig {
             color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -595,7 +602,10 @@ fn make_source_renderer(
             sample_count: 1,
         },
     )?;
-    assert_eq!(renderer.material_count(), 2);
+    assert_eq!(
+        renderer.material_count(),
+        2 * compactor.mesh_lods().tiers().len()
+    );
     Ok(renderer)
 }
 
@@ -610,6 +620,28 @@ fn validate_green_forest(image: &[u8]) -> Result<usize, Box<dyn Error>> {
         return Err(format!("GPU forest capture appears empty: only {greens} green pixels").into());
     }
     Ok(greens)
+}
+
+fn example_compactor(
+    device: &wgpu::Device,
+    count: usize,
+    index_count: u32,
+) -> Result<GpuCompactor, Box<dyn Error>> {
+    let starts = if std::env::var_os("PROLAND_SINGLE_MESH_TIER").is_some() {
+        vec![0.0]
+    } else {
+        vec![0.0, 45.0, 110.0]
+    };
+    let lods = MeshLods::new(
+        starts
+            .into_iter()
+            .map(|start_m| MeshLod {
+                start_m,
+                index_count,
+            })
+            .collect(),
+    )?;
+    Ok(GpuCompactor::new(device, u32::try_from(count)?, lods, 6)?)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -656,20 +688,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (device, queue) = create_device()?;
     let trunk_mesh = TreeMesh::new(&device, trunk_vertices, trunk_indices)?;
     let leaf_mesh = TreeMesh::new(&device, leaf_vertices, &leaf_indices)?;
-    let compactor = GpuCompactor::new(
-        &device,
-        u32::try_from(candidates.len())?,
-        trunk_mesh.index_count(),
-        6,
-    )?;
+    let compactor = example_compactor(&device, candidates.len(), trunk_mesh.index_count())?;
     let atlas_texture = atlas.upload(&device, &queue)?;
     let bark_texture = bark.upload(&device, &queue)?;
     let source_texture = source.upload(&device, &queue)?;
     let renderer = make_source_renderer(
         &device,
         &compactor,
-        trunk_mesh,
-        leaf_mesh,
+        &trunk_mesh,
+        &leaf_mesh,
         &atlas_texture,
         bark_texture.view(),
         source_texture.view(),

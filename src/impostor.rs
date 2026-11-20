@@ -1,7 +1,7 @@
 //! Actual instanced source-mesh and multi-angle impostor rendering.
 //! Consumes compacted GPU buffers without reading back their contents.
 
-use crate::gpu::{GpuCompactor, IndexedDraw};
+use crate::gpu::{CompactedBin, GpuCompactor, IndexedDraw};
 use crate::{Error, Result};
 use wgpu::util::DeviceExt;
 
@@ -32,6 +32,8 @@ impl TreeVertex {
     }
 }
 
+/// Cloning shares the immutable GPU vertex and index buffers.
+#[derive(Clone)]
 pub struct TreeMesh {
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
@@ -273,17 +275,20 @@ struct MeshDraw {
     bind: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     indirect: wgpu::Buffer,
+    source_indirect_offset: u64,
     cutoff: f32,
 }
 
-/// Original near-material draws share one GPU-visible instance list and one
-/// distant impostor draw, without reclassifying the same tree per material.
+/// Every authored mesh tier shares one GPU-visible instance list across its
+/// material draws, and the family emits one composite impostor draw.
 pub struct TreeRenderer {
     mesh_pipeline: wgpu::RenderPipeline,
     impostor_pipeline: wgpu::RenderPipeline,
     mesh_draws: Vec<MeshDraw>,
     impostor_bind: wgpu::BindGroup,
     impostor_uniforms: wgpu::Buffer,
+    source_indirect: wgpu::Buffer,
+    impostor_indirect_offset: u64,
     quad_indices: wgpu::Buffer,
     gutter_fraction: f32,
     alpha_to_coverage: bool,
@@ -423,7 +428,7 @@ struct MaterialBindings<'a> {
 fn make_draw_bind(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    instances: &wgpu::Buffer,
+    instances: wgpu::BufferBinding<'_>,
     uniforms: &wgpu::Buffer,
     materials: &MaterialBindings<'_>,
 ) -> wgpu::BindGroup {
@@ -437,7 +442,7 @@ fn make_draw_bind(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: instances.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(instances),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -482,7 +487,7 @@ fn new_uniform(device: &wgpu::Device) -> wgpu::Buffer {
 
 fn build_mesh_draw(
     device: &wgpu::Device,
-    compactor: &GpuCompactor,
+    bin: &CompactedBin<'_>,
     source: TreeMaterial<'_>,
     layout: &wgpu::BindGroupLayout,
     atlas: &AtlasTexture,
@@ -493,7 +498,7 @@ fn build_mesh_draw(
     let bind = make_draw_bind(
         device,
         layout,
-        compactor.mesh_instances(),
+        bin.instances.clone(),
         &uniforms,
         &MaterialBindings {
             atlas,
@@ -518,13 +523,14 @@ fn build_mesh_draw(
         bind,
         uniforms,
         indirect,
+        source_indirect_offset: bin.indirect_offset,
         cutoff: source.alpha_cutoff,
     }
 }
 
 fn make_impostor_bind(
     device: &wgpu::Device,
-    compactor: &GpuCompactor,
+    bin: &CompactedBin<'_>,
     layout: &wgpu::BindGroupLayout,
     uniforms: &wgpu::Buffer,
     atlas: &AtlasTexture,
@@ -551,7 +557,7 @@ fn make_impostor_bind(
     make_draw_bind(
         device,
         layout,
-        compactor.impostor_instances(),
+        bin.instances.clone(),
         uniforms,
         &MaterialBindings {
             atlas,
@@ -562,9 +568,50 @@ fn make_impostor_bind(
     )
 }
 
+fn validate_material_tiers(
+    compactor: &GpuCompactor,
+    sources: &[Vec<TreeMaterial<'_>>],
+    config: TreeRenderConfig,
+) -> Result<()> {
+    if sources.len() != compactor.mesh_lods().tiers().len()
+        || config.sample_count == 0
+        || !config.sample_count.is_power_of_two()
+        || sources.iter().any(|tier| {
+            tier.is_empty()
+                || tier
+                    .iter()
+                    .any(|s| !s.alpha_cutoff.is_finite() || !(0.0..=1.0).contains(&s.alpha_cutoff))
+        })
+    {
+        return Err(Error::InvalidConfiguration(
+            "invalid forest material tiers or sample count",
+        ));
+    }
+    for (tier, source) in sources.iter().enumerate() {
+        if compactor
+            .bin(tier)
+            .is_none_or(|bin| bin.index_count != source[0].mesh.index_count())
+        {
+            return Err(Error::InvalidConfiguration(
+                "incompatible mesh LOD draw indexes",
+            ));
+        }
+    }
+    if compactor
+        .bin(compactor.mesh_lods().impostor_bin())
+        .is_none_or(|bin| bin.index_count != 6)
+    {
+        return Err(Error::InvalidConfiguration(
+            "incompatible impostor draw indexes",
+        ));
+    }
+    Ok(())
+}
+
 impl TreeRenderer {
-    /// Compile the near mesh materials and one shared middle impostor pass.
-    /// The first mesh provides the compactor's base indirect index count.
+    /// Compile ordered authored mesh tiers and one shared middle impostor pass.
+    /// Each tier's first mesh provides its base indirect index count. All
+    /// material draws within a tier share that tier's compacted instances.
     ///
     /// # Errors
     /// Rejects empty/invalid materials, invalid sample count and incompatible
@@ -572,28 +619,14 @@ impl TreeRenderer {
     pub fn new(
         device: &wgpu::Device,
         compactor: &GpuCompactor,
-        sources: Vec<TreeMaterial<'_>>,
+        sources: Vec<Vec<TreeMaterial<'_>>>,
         atlas: &AtlasTexture,
         config: TreeRenderConfig,
     ) -> Result<Self> {
-        if sources.is_empty()
-            || config.sample_count == 0
-            || !config.sample_count.is_power_of_two()
-            || sources
-                .iter()
-                .any(|s| !s.alpha_cutoff.is_finite() || !(0.0..=1.0).contains(&s.alpha_cutoff))
-        {
-            return Err(Error::InvalidConfiguration(
-                "invalid forest materials or sample count",
-            ));
-        }
-        if compactor.mesh_index_count() != sources[0].mesh.index_count()
-            || compactor.impostor_index_count() != 6
-        {
-            return Err(Error::InvalidConfiguration(
-                "incompatible compactor draw indexes",
-            ));
-        }
+        validate_material_tiers(compactor, &sources, config)?;
+        let impostor_bin = compactor
+            .bin(compactor.mesh_lods().impostor_bin())
+            .ok_or(Error::InvalidConfiguration("missing impostor bin"))?;
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("i-love-proland impostor atlas bilinear sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -612,24 +645,27 @@ impl TreeRenderer {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let mesh_draws = sources
-            .into_iter()
-            .map(|source| {
+        let mut mesh_draws = Vec::new();
+        for (tier, materials) in sources.into_iter().enumerate() {
+            let bin = compactor
+                .bin(tier)
+                .ok_or(Error::InvalidConfiguration("missing mesh LOD bin"))?;
+            mesh_draws.extend(materials.into_iter().map(|source| {
                 build_mesh_draw(
                     device,
-                    compactor,
+                    &bin,
                     source,
                     &layout,
                     atlas,
                     &sampler,
                     &source_sampler,
                 )
-            })
-            .collect();
+            }));
+        }
         let impostor_uniforms = new_uniform(device);
         let impostor_bind = make_impostor_bind(
             device,
-            compactor,
+            &impostor_bin,
             &layout,
             &impostor_uniforms,
             atlas,
@@ -668,6 +704,8 @@ impl TreeRenderer {
             mesh_draws,
             impostor_bind,
             impostor_uniforms,
+            source_indirect: impostor_bin.indirect.clone(),
+            impostor_indirect_offset: impostor_bin.indirect_offset,
             quad_indices,
             gutter_fraction: atlas.gutter_fraction,
             alpha_to_coverage: config.sample_count > 1,
@@ -689,22 +727,24 @@ impl TreeRenderer {
         queue.write_buffer(&self.impostor_uniforms, 0, bytemuck::bytes_of(&uniform));
     }
 
-    /// Copy the GPU-computed near instance count into each material's indirect
+    /// Copy the GPU-computed tier instance count into each material's indirect
     /// draw arguments, preserving its original index count. This must happen
     /// after compaction and before drawing, in the same encoder.
-    pub fn encode_mesh_draws(&self, encoder: &mut wgpu::CommandEncoder, compactor: &GpuCompactor) {
+    pub fn encode_mesh_draws(&self, encoder: &mut wgpu::CommandEncoder) {
         for material in &self.mesh_draws {
-            encoder.copy_buffer_to_buffer(compactor.mesh_indirect(), 4, &material.indirect, 4, 4);
+            encoder.copy_buffer_to_buffer(
+                &self.source_indirect,
+                material.source_indirect_offset + 4,
+                &material.indirect,
+                4,
+                4,
+            );
         }
     }
 
-    /// Draw every near material with the compacted shared instance set,
+    /// Draw every mesh tier's materials with its compacted instance set,
     /// then emit precisely one composite middle-distance impostor draw.
-    pub fn draw<'pass>(
-        &'pass self,
-        pass: &mut wgpu::RenderPass<'pass>,
-        compactor: &'pass GpuCompactor,
-    ) {
+    pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
         pass.set_pipeline(&self.mesh_pipeline);
         for material in &self.mesh_draws {
             pass.set_bind_group(0, &material.bind, &[]);
@@ -715,7 +755,7 @@ impl TreeRenderer {
         pass.set_pipeline(&self.impostor_pipeline);
         pass.set_bind_group(0, &self.impostor_bind, &[]);
         pass.set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed_indirect(compactor.impostor_indirect(), 0);
+        pass.draw_indexed_indirect(&self.source_indirect, self.impostor_indirect_offset);
     }
 
     #[must_use]
