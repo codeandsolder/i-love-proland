@@ -162,3 +162,29 @@ The CPU atlas baker also multiplies in linear space before final
 sRGB RGBA8 quantization. Do not pre-clamp source material RGB, which
 changes muted texture colors even when the eventual framebuffer is
 limited to [0,1].
+
+## Authored texture-driven wind
+
+Mesh materials can supply a MeshWind (original wind image view, validated
+WindParameters, unnormalized source bounds center Y and radius). A
+TreeCamera with a WindFrame activates animation; omitting the frame
+keeps the source geometry unchanged. Each frame contains the camera's f64
+position in a stable Cartesian field, an orthonormal render-to-field basis,
+and elapsed seconds. Periodic texture origins and time are reduced in f64
+before converting to GPU floats. Source height is reconstructed before
+instance scaling from the normalized mesh vertex.
+
+The vertex shader smooths each repeating planar texture sample with four
+half-texel taps, blends the three projections by the absolute radial normal
+components, and applies height-powered RGB displacement along the local
+up and projected field direction. Animation is render-only. GpuView can
+supply the maximum displacement in metres (see WindParameters::max_displacement)
+to pad the visibility sphere without changing distance or projected-size
+LOD thresholds. The caller supplies the original texture's color-space
+interpretation and source-space height bounds. Composite impostors and
+terrain canopy remain static; wind is a source-mesh vertex deformation,
+not an identity or terrain edit.
+
+Real Vulkan regression: set PROLAND_TEST_WIND=1 for the forest render
+example. It renders a deterministic varying RGB fixture at two animation
+times and repeats the first time; motion must exceed repeated-frame noise.

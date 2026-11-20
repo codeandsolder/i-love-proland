@@ -20,6 +20,11 @@ struct RenderUniform {
     projection: mat4x4<f32>,
     atlas: vec4<f32>, // (8,4, gutter fraction, reserved)
     material: vec4<f32>, // source alpha cutoff, 1 for multisample alpha-to-coverage
+    wind_parameters: vec4<f32>, // spatial scale, height start, exponent, intensity
+    wind_source: vec4<f32>, // original source center Y, radius
+    field_axes: array<vec4<f32>, 3>,
+    field_origin: vec4<f32>,
+    field_phase: vec4<f32>, // camera origin modulo texture repetition, time scroll
 }
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
@@ -28,6 +33,7 @@ struct RenderUniform {
 @group(0) @binding(3) var atlas_sampler: sampler;
 @group(0) @binding(4) var source_texture: texture_2d<f32>;
 @group(0) @binding(5) var source_sampler: sampler;
+@group(0) @binding(6) var wind_texture: texture_2d<f32>;
 
 struct MeshVertex {
     @location(0) position: vec4<f32>,
@@ -51,13 +57,50 @@ fn inverse_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     return rotate(vec4<f32>(-q.xyz, q.w), v);
 }
 
+// Four half-texel-offset bilinear taps reproduce the authored smooth wind
+// field; UVs repeat and use explicit LOD zero in the vertex stage.
+fn smooth_wind(uv: vec2<f32>) -> vec3<f32> {
+    let half_texel = 0.5 / vec2<f32>(textureDimensions(wind_texture, 0));
+    let p = fract(uv);
+    return 0.25 * (
+        textureSampleLevel(wind_texture, source_sampler, p - half_texel, 0.0).rgb
+        + textureSampleLevel(wind_texture, source_sampler, p + vec2<f32>(half_texel.x, -half_texel.y), 0.0).rgb
+        + textureSampleLevel(wind_texture, source_sampler, p + vec2<f32>(-half_texel.x, half_texel.y), 0.0).rgb
+        + textureSampleLevel(wind_texture, source_sampler, p + half_texel, 0.0).rgb);
+}
+
+fn wind_offset(world: vec3<f32>, source_y: f32, rotation: vec4<f32>) -> vec3<f32> {
+    let p = camera.wind_parameters;
+    if p.w <= 0.0 || source_y <= p.y || source_y <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let basis = mat3x3<f32>(camera.field_axes[0].xyz, camera.field_axes[1].xyz, camera.field_axes[2].xyz);
+    let relative = basis * world;
+    let field_position = camera.field_origin.xyz + relative;
+    let normal = abs(field_position);
+    let weights = normal / max(normal.x + normal.y + normal.z, 0.000001);
+    let uv = relative * p.x + camera.field_phase.xyz + vec3<f32>(camera.field_phase.w);
+    let wind = smooth_wind(uv.yz) * weights.x
+        + smooth_wind(uv.zx) * weights.y
+        + smooth_wind(uv.xy) * weights.z;
+    let up = basis * rotate(rotation, vec3<f32>(0.0, 1.0, 0.0));
+    let direction = vec3<f32>(1.0) - up * dot(up, vec3<f32>(1.0));
+    // A plane perpendicular to (1,1,1) has no preferred lateral direction.
+    let lateral = -direction * inverseSqrt(max(dot(direction, direction), 0.00000001));
+    let amplitude = pow(source_y, p.z) * p.w;
+    let offset = (lateral + 0.4 * up) * wind * amplitude;
+    return transpose(basis) * offset;
+}
+
 @vertex
 fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> MeshOutput {
     let object = objects[instance_id];
     let world = object.position_radius.xyz
         + rotate(object.rotation, input.position.xyz * object.axis_radii.xyz);
     var out: MeshOutput;
-    out.clip = camera.projection * vec4<f32>(world, 1.0);
+    let source_y = input.position.y * camera.wind_source.y + camera.wind_source.x;
+    let displaced = world + wind_offset(world, source_y, object.rotation);
+    out.clip = camera.projection * vec4<f32>(displaced, 1.0);
     out.color = input.color * object.tint;
     out.uv = input.uv;
     return out;
