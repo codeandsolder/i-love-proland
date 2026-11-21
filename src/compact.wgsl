@@ -20,7 +20,7 @@ struct IndexedDraw {
 }
 
 struct View {
-    counts: vec4<u32>,             // input count, aligned bin stride (records), mesh bin count
+    counts: vec4<u32>,             // input count, aligned bin stride (records), mesh bin count, host-owned population flag
     lod: vec4<f32>,                // focal pixels, mesh threshold, impostor threshold, animation displacement bound
     forward: vec4<f32>,            // normalized camera forward
     source_center: vec4<f32>,      // normalized original mesh bounds centre
@@ -30,7 +30,7 @@ struct View {
 @group(0) @binding(0) var<storage, read> input: array<PackedInstance>;
 @group(0) @binding(1) var<storage, read_write> visible: array<PackedInstance>;
 @group(0) @binding(2) var<storage, read_write> draws: array<IndexedDraw>;
-@group(0) @binding(3) var<storage, read> mesh_starts_squared: array<f32>;
+@group(0) @binding(3) var<storage, read> mesh_lods: array<vec2<f32>>;
 @group(0) @binding(4) var<uniform> camera: View;
 
 fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
@@ -67,28 +67,28 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // implementations otherwise round a quotient across the comparison.
     let projected_crown = (2.0 * radius) * camera.lod.x;
     let safe_depth = max(depth, 0.001);
-    // Smaller foliage is the responsibility of the distant canopy field.
-    if projected_crown < camera.lod.z * safe_depth {
+    // With a host-owned distance handoff, the submitted population
+    // already complements aggregate coverage. Do not drop it twice.
+    if camera.counts.w == 0u && projected_crown < camera.lod.z * safe_depth {
         return;
     }
-
-    // The source ID, variant, and appearance parameters are passed unchanged.
-    // Append order across GPU workgroups is intentionally unspecified.
-    var bin = camera.counts.z; // final bin is the composite impostor
-    if projected_crown >= camera.lod.y * safe_depth {
-        let anchor = position - rotate(instance.rotation, camera.source_center.xyz * instance.axis_radii.xyz);
-        let distance_squared = dot(anchor, anchor);
-        // Upper bound search for the final inclusive authored start range.
-        var low = 0u;
-        var high = camera.counts.z;
-        while low + 1u < high {
-            let middle = low + (high - low) / 2u;
-            if mesh_starts_squared[middle] <= distance_squared {
-                low = middle;
-            } else {
-                high = middle;
-            }
+    let anchor = position - rotate(instance.rotation, camera.source_center.xyz * instance.axis_radii.xyz);
+    let distance_squared = dot(anchor, anchor);
+    // Upper bound search for the final inclusive authored start range.
+    var low = 0u;
+    var high = camera.counts.z;
+    while low + 1u < high {
+        let middle = low + (high - low) / 2u;
+        if mesh_lods[middle].x <= distance_squared {
+            low = middle;
+        } else {
+            high = middle;
         }
+    }
+    // Cheap original cards can be preferable to generated impostors,
+    // independently of the family's projected-size crossover.
+    var bin = camera.counts.z;
+    if mesh_lods[low].y > 0.5 || projected_crown >= camera.lod.y * safe_depth {
         bin = low;
     }
     let slot = atomicAdd(&draws[bin].instance_count, 1u);

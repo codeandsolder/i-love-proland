@@ -183,6 +183,7 @@ pub struct GpuView {
     planes: [[f32; 4]; 6],
     source_center: [f32; 3],
     displacement_bound: f32,
+    explicit_population: bool,
 }
 
 impl GpuView {
@@ -236,6 +237,7 @@ impl GpuView {
             planes,
             source_center: [0.0; 3],
             displacement_bound: 0.0,
+            explicit_population: false,
         })
     }
 
@@ -267,6 +269,16 @@ impl GpuView {
         }
         self.displacement_bound = metres;
         Ok(self)
+    }
+
+    /// The host owns the complementary distance-based aggregate handoff.
+    /// Keep every frustum-visible candidate in a mesh or impostor bin,
+    /// even if its projected diameter is below the usual canopy cutoff.
+    /// This avoids introducing a second, inconsistent visibility threshold.
+    #[must_use]
+    pub const fn with_explicit_population(mut self) -> Self {
+        self.explicit_population = true;
+        self
     }
 
     /// Disable frustum plane rejection while keeping correct size-based LOD.
@@ -317,6 +329,9 @@ pub struct IndexedDraw {
 pub struct MeshLod {
     pub start_m: f32,
     pub index_count: u32,
+    /// A cheap authored representation (e.g. source billboard cards)
+    /// should not be replaced by the more expensive generated impostor.
+    pub prefer_mesh: bool,
 }
 
 /// Validated, strictly ordered authored mesh tiers. The final mesh tier
@@ -419,14 +434,16 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods
     }
     let projected_crown = (2.0 * radius) * view.focal_length_px;
     let safe_depth = depth.max(0.001);
-    if projected_crown >= view.mesh_threshold_px * safe_depth {
-        let anchor = source_anchor(object, view);
-        let distance_squared = anchor.iter().map(|x| x * x).sum();
-        VisualLod::Mesh(mesh_lods.tier_for_distance_squared(distance_squared))
-    } else if projected_crown >= view.impostor_threshold_px * safe_depth {
-        VisualLod::Impostor
+    if !view.explicit_population && projected_crown < view.impostor_threshold_px * safe_depth {
+        return VisualLod::TerrainCanopy;
+    }
+    let anchor = source_anchor(object, view);
+    let distance_squared = anchor.iter().map(|x| x * x).sum();
+    let tier = mesh_lods.tier_for_distance_squared(distance_squared);
+    if mesh_lods.tiers[tier].prefer_mesh || projected_crown >= view.mesh_threshold_px * safe_depth {
+        VisualLod::Mesh(tier)
     } else {
-        VisualLod::TerrainCanopy
+        VisualLod::Impostor
     }
 }
 
@@ -574,14 +591,19 @@ impl GpuCompactor {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         });
-        let distance_squared = mesh_lods
+        let boundaries = mesh_lods
             .tiers
             .iter()
-            .map(|tier| tier.start_m * tier.start_m)
+            .map(|tier| {
+                [
+                    tier.start_m * tier.start_m,
+                    f32::from(u8::from(tier.prefer_mesh)),
+                ]
+            })
             .collect::<Vec<_>>();
         let thresholds = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("i-love-proland authored squared mesh LOD boundaries"),
-            contents: bytemuck::cast_slice(&distance_squared),
+            label: Some("i-love-proland authored squared mesh LOD boundaries and preferences"),
+            contents: bytemuck::cast_slice(&boundaries),
             usage: wgpu::BufferUsages::STORAGE,
         });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -691,7 +713,7 @@ impl GpuCompactor {
                     .map_err(|_| Error::InvalidConfiguration("GPU LOD bin stride overflow"))?,
                 u32::try_from(self.mesh_lods.tiers.len())
                     .map_err(|_| Error::InvalidConfiguration("GPU mesh LOD count overflow"))?,
-                0,
+                u32::from(view.explicit_population),
             ],
             lod: [
                 view.focal_length_px,
@@ -827,6 +849,7 @@ mod tests {
         let lods = MeshLods::new(vec![MeshLod {
             start_m: 0.0,
             index_count: 3,
+            prefer_mesh: false,
         }])
         .unwrap();
         let object = |z, radius| PackedInstance {
@@ -867,6 +890,7 @@ mod tests {
         let tier = |start_m| MeshLod {
             start_m,
             index_count: 3,
+            prefer_mesh: false,
         };
         assert!(MeshLods::new(vec![]).is_err());
         assert!(MeshLods::new(vec![tier(1.0)]).is_err());
@@ -876,7 +900,8 @@ mod tests {
         assert!(
             MeshLods::new(vec![MeshLod {
                 start_m: 0.0,
-                index_count: 0
+                index_count: 0,
+                prefer_mesh: false,
             }])
             .is_err()
         );
@@ -908,14 +933,17 @@ mod tests {
             MeshLod {
                 start_m: 0.0,
                 index_count: 9,
+                prefer_mesh: false,
             },
             MeshLod {
                 start_m: 10.0,
                 index_count: 3,
+                prefer_mesh: false,
             },
             MeshLod {
                 start_m: 20.0,
                 index_count: 6,
+                prefer_mesh: false,
             },
         ])
         .unwrap();
@@ -940,10 +968,62 @@ mod tests {
         assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Mesh(2));
     }
     #[test]
+    fn authored_card_and_host_owned_handoff_are_independent() {
+        let lods = MeshLods::new(vec![
+            MeshLod {
+                start_m: 0.0,
+                index_count: 100,
+                prefer_mesh: false,
+            },
+            MeshLod {
+                start_m: 1000.0,
+                index_count: 6,
+                prefer_mesh: true,
+            },
+        ])
+        .unwrap();
+        let view = GpuView::unculled(540.0, 16.0, 0.15).unwrap();
+        let object = |z, radius| PackedInstance {
+            position_radius: [0.0, 0.0, z, radius],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            axis_radii: [radius, radius, radius, 1.0],
+            object_id: [1; 4],
+            metadata: [0; 4],
+            tint: [1.0; 4],
+        };
+        assert_eq!(
+            classify_cpu(&object(500.0, 1.0), view, &lods),
+            VisualLod::Impostor
+        );
+        assert_eq!(
+            classify_cpu(&object(3000.0, 10.0), view, &lods),
+            VisualLod::Mesh(1)
+        );
+        assert_eq!(
+            classify_cpu(&object(100_000.0, 1.0), view, &lods),
+            VisualLod::TerrainCanopy
+        );
+        let host = view.with_explicit_population();
+        assert_eq!(
+            classify_cpu(&object(100_000.0, 1.0), host, &lods),
+            VisualLod::Mesh(1)
+        );
+        assert_eq!(
+            classify_cpu(&object(900.0, 0.01), host, &lods),
+            VisualLod::Impostor
+        );
+        assert_eq!(
+            classify_cpu(&object(-100.0, 1.0), host, &lods),
+            VisualLod::OutsideFrustum
+        );
+    }
+
+    #[test]
     fn wind_visibility_padding_does_not_change_projected_lod() {
         let tiers = MeshLods::new(vec![MeshLod {
             start_m: 0.0,
             index_count: 3,
+            prefer_mesh: false,
         }])
         .unwrap();
         let view = GpuView::new(
