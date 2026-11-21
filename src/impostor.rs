@@ -1012,7 +1012,7 @@ mod tests {
                 let size = (side >> level).pow(2) as usize;
                 let pixels = &layer[offset..offset + size * 4];
                 let mut mean = 0.0;
-                for pixel in pixels.chunks_exact(4) {
+                for pixel in pixels.as_chunks::<4>().0 {
                     let alpha = f64::from(pixel[3]) / 255.0;
                     mean += alpha;
                     let channel = if view == 0 { pixel[0] } else { pixel[1] };
