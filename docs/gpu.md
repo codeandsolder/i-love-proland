@@ -43,7 +43,7 @@ with `#[repr(C)]` + bytemuck POD in Rust.
 | 64 | `metadata: vec4<u32>` | Low/high limbs of 64-bit variant and layer IDs |
 | 80 | `tint: vec4<f32>` | Independent source-space per-object linear RGB and alpha multiplier, separate from material tint and identity |
 
-Runtime uniforms: 16-byte input count/bin stride/mesh tier count,
+Runtime uniforms: 16-byte input count/bin stride/mesh tier count/host-population flag,
 16-byte projection thresholds, 16-byte normalized forward, 16-byte
 normalized source bounds center, and six 16-byte frustum planes = 160 bytes. The frustum plane equation is
 `dot(plane.xyz, camera_relative_position) + plane.w >= -radius`.
@@ -83,11 +83,20 @@ offset aligned both to the record size and device storage-binding offset.
 and byte offset. All indirect `first_instance` values are zero relative
 to the independently bound slice. Only the instance count is atomically
 updated; no object is copied to multiple bins. Choose mesh ranges
-independently of the final projected-size impostor threshold.
+independently of the final projected-size impostor threshold. Mark a tier
+\`prefer_mesh: true\` if the original mesh is already a cheap authored
+billboard/low-cost representation preferable to a generated impostor.
+The storage table contains a squared start distance and a preference flag
+for each tier; the same classifier runs on CPU and GPU.
 
-Below the impostor threshold, the intended output is the terrain canopy
-appearance field, not a microscopic mesh. The compactor does not bake
-impostors, provide mesh/material shaders, or generate that canopy field.
+Below the impostor threshold, the ordinary intended output is the terrain
+canopy appearance field, not a microscopic mesh. A host using a separately
+defined world-space aggregate handoff may instead opt into
+\`GpuView::with_explicit_population()\`: the supplied candidate population
+already complements its aggregate field, so frustum-visible objects are
+never discarded a second time based only on projected size. Very small
+non-preferred meshes still choose the generated impostor. The compactor
+does not generate the aggregate field or alter canonical existence.
 
 GPU atomics allocate contiguous output slots in **nondeterministic order**.
 All records retain their ID, variant, and attributes bit-for-bit, so render

@@ -139,7 +139,10 @@ frustum, then dispatches a WGSL compute pass that culls bounding spheres,
 chooses mesh vs impostor by **projected canopy diameter in pixels**, and
 selects the authored distance tier within the mesh class. The ordered
 `MeshLods` table accepts any number of mesh ranges, followed by exactly
-one impostor bin. Every candidate is atomically appended at most once.
+one impostor bin. Authored cheap tiers can explicitly prefer their own
+geometry over the generated impostor. A host that selects its explicit
+population with a complementary aggregate handoff can disable the
+independent subpixel cutoff. Every candidate is atomically appended at most once.
 Each bin has its own indexed-indirect record and device-aligned storage
 slice, both exposed through `compactor.bin(index)`. Draw materials
 within a tier share its instance list and immutable uploaded source

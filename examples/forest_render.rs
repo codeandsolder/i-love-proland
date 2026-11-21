@@ -613,6 +613,7 @@ fn validate_source_billboards(
         MeshLods::new(vec![MeshLod {
             start_m: 0.0,
             index_count: card.index_count(),
+            prefer_mesh: false,
         }])?,
         6,
     )?;
@@ -816,6 +817,7 @@ fn example_compactor(
             .map(|start_m| MeshLod {
                 start_m,
                 index_count,
+                prefer_mesh: false,
             })
             .collect(),
     )?;

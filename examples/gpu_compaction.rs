@@ -255,18 +255,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         MeshLod {
             start_m: 0.0,
             index_count: 369,
+            prefer_mesh: false,
         },
         MeshLod {
             start_m: 180.0,
             index_count: 147,
+            prefer_mesh: false,
         },
         MeshLod {
             start_m: 380.0,
             index_count: 27,
+            prefer_mesh: false,
         },
         MeshLod {
             start_m: 600.0,
             index_count: 9,
+            prefer_mesh: false,
         },
     ])?;
     let (expected, canopy) = reference(&candidates, view, &lods);
@@ -302,6 +306,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         frustum,
         &frustum_reference,
     )?;
+    let mut preferred = compactor.mesh_lods().tiers().to_vec();
+    preferred
+        .last_mut()
+        .ok_or("missing authored tier")?
+        .prefer_mesh = true;
+    let preferred = MeshLods::new(preferred)?;
+    let authored_view = view.with_explicit_population();
+    let (authored_reference, _) = reference(&candidates, authored_view, &preferred);
+    let authored = GpuCompactor::new(&device, u32::try_from(candidates.len())?, preferred, 6)?;
+    let (authored_draws, _) = gpu_parity(
+        &device,
+        &queue,
+        &authored,
+        &candidates,
+        authored_view,
+        &authored_reference,
+    )?;
+    assert!(authored_draws[authored.bin_count() - 2].instance_count > 0);
+    println!(
+        "GPU_AUTHORED_HANDOFF_PARITY bins={:?}",
+        authored_draws
+            .iter()
+            .map(|d| d.instance_count)
+            .collect::<Vec<_>>()
+    );
     let frame_ms = benchmark(&device, &queue, &compactor, &candidates, view)?;
     // Empty frames must reset every indirect bin, including late mesh tiers.
     let empty = vec![BTreeMap::new(); compactor.bin_count()];
