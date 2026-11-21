@@ -154,7 +154,7 @@ impl SourceImage {
     }
 }
 
-fn srgb_to_linear(v: u8) -> f32 {
+pub(crate) fn srgb_to_linear(v: u8) -> f32 {
     let c = f32::from(v) / 255.0;
     if c <= 0.040_45 {
         c / 12.92

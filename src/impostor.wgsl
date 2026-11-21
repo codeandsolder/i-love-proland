@@ -18,7 +18,6 @@ struct Instance {
 
 struct RenderUniform {
     projection: mat4x4<f32>,
-    atlas: vec4<f32>, // (8,4, gutter fraction, reserved)
     material: vec4<f32>, // source alpha cutoff, 1 for multisample alpha-to-coverage
     wind_parameters: vec4<f32>, // spatial scale, height start, exponent, intensity
     wind_source: vec4<f32>, // original source center Y, radius
@@ -31,7 +30,7 @@ struct RenderUniform {
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
 @group(0) @binding(1) var<storage, read> objects: array<Instance>;
-@group(0) @binding(2) var atlas_texture: texture_2d<f32>;
+@group(0) @binding(2) var atlas_texture: texture_2d_array<f32>;
 @group(0) @binding(3) var atlas_sampler: sampler;
 @group(0) @binding(4) var source_texture: texture_2d<f32>;
 @group(0) @binding(5) var source_sampler: sampler;
@@ -195,13 +194,8 @@ fn impostor_vs(
 }
 
 fn atlas_sample(tile: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
-    let gutter = camera.atlas.z;
-    let local = gutter + clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (1.0 - 2.0 * gutter);
-    return textureSample(
-        atlas_texture,
-        atlas_sampler,
-        (tile + local) / camera.atlas.xy
-    );
+    let layer = i32(tile.y * AZIMUTH_VIEWS + tile.x);
+    return textureSample(atlas_texture, atlas_sampler, uv, layer);
 }
 
 @fragment
@@ -240,5 +234,6 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
         }
     }
     // With multisample targets, hardware alpha-to-coverage uses this alpha.
-    return vec4<f32>(color.rgb * input.tint.rgb, alpha);
+    // Unpremultiply after both spatial mip filtering and angular blending.
+    return vec4<f32>(color.rgb / color.a * input.tint.rgb, alpha);
 }
