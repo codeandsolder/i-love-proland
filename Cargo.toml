@@ -31,3 +31,7 @@ required-features = ["gpu"]
 [[example]]
 name = "forest_render"
 required-features = ["gpu"]
+
+[[example]]
+name = "gpu_terrain"
+required-features = ["gpu"]

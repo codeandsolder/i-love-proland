@@ -182,6 +182,10 @@ impl ChannelField {
         })
     }
 
+    #[cfg(feature = "gpu")]
+    pub(super) fn gpu_buckets(&self) -> (usize, &[Vec<usize>]) {
+        (self.side, &self.buckets)
+    }
     /// Return the original directed segments, in deterministic graph order.
     #[must_use = "Use the directed channel segments"]
     pub fn reaches(&self) -> &[Reach] {

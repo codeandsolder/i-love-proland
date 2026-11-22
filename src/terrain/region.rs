@@ -381,6 +381,23 @@ impl Region {
         width.is_finite().then_some(width)
     }
 
+    #[cfg(feature = "gpu")]
+    pub(super) fn gpu_controls(&self) -> impl Iterator<Item = [u32; 2]> + '_ {
+        self.cells.iter().map(|cell| {
+            let height = u32::from(u16::from_le_bytes(cell.height.to_le_bytes()));
+            let lake = u32::from(u16::from_le_bytes(cell.lake.to_le_bytes()));
+            [
+                height | (lake << 16),
+                u32::from_le_bytes([cell.rgb[0], cell.rgb[1], cell.rgb[2], 255]),
+            ]
+        })
+    }
+
+    #[cfg(feature = "gpu")]
+    pub(super) fn gpu_channels(&self) -> &ChannelField {
+        &self.channels
+    }
+
     /// Little-endian, versioned format. No machine-dependent struct layout.
     ///
     /// # Errors
