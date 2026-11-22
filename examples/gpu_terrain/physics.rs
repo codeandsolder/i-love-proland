@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn flat() -> io::Result<Region> {
+fn slope_region(slope: f64) -> io::Result<Region> {
     let chart = RegionChart {
         radius_m: 600_000.0,
         latitude_rad: 0.0,
@@ -20,8 +20,18 @@ fn flat() -> io::Result<Region> {
         spacing_m: 16.0,
         cells: 8,
     };
-    let sample = RegionCell::new(100.0, None, [0.3, 0.5, 0.2])?;
-    Region::new(chart, vec![sample; 81], vec![])
+    let cells = (0..=chart.cells)
+        .flat_map(|_| {
+            (0..=chart.cells).map(move |x| {
+                RegionCell::new(
+                    (f64::from(x) * chart.spacing_m).mul_add(slope, 100.0),
+                    None,
+                    [0.3, 0.5, 0.2],
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    Region::new(chart, cells, vec![])
 }
 fn body(position: [f32; 3], velocity: [f32; 3], count: u32) -> RigidBody {
     RigidBody {
@@ -31,9 +41,11 @@ fn body(position: [f32; 3], velocity: [f32; 3], count: u32) -> RigidBody {
         angular: [0.0, 0.0, 0.0, 0.0],
         inverse_inertia: [2.0, 2.0, 2.0, 0.0],
         metadata: [0, count, 0, 0],
+        clock: [0; 4],
     }
 }
 const CONFIG: PhysicsConfig = PhysicsConfig {
+    initial_tick: 0,
     hz: 240,
     gravity_m_s2: 9.81,
     contact_slop_m: 0.001,
@@ -47,8 +59,19 @@ fn simulate(
     spheres: &[Sphere],
     batch_size: u32,
 ) -> Result<(Vec<RigidBody>, f64)> {
-    let mut physics = PhysicsGpu::new(device, terrain, 0, CONFIG, initial, spheres)?;
-    let mut clock = SimulationClock::new(CONFIG.hz)?;
+    let initial_tick = initial[0].completed_tick();
+    let mut physics = PhysicsGpu::new(
+        device,
+        terrain,
+        0,
+        PhysicsConfig {
+            initial_tick,
+            ..CONFIG
+        },
+        initial,
+        spheres,
+    )?;
+    let mut clock = SimulationClock::at_tick(CONFIG.hz, initial_tick)?;
     // 60x warp, 100 ms host interval, 6 seconds of fixed simulation time.
     clock.advance(Duration::from_millis(100), 60_000_000)?;
     let start = Instant::now();
@@ -68,7 +91,7 @@ fn simulate(
     // dispatch fence. A stopped body's tick counter must be considered.
     let actual = output
         .iter()
-        .map(|b| u64::from(b.metadata[2]))
+        .map(RigidBody::completed_tick)
         .min()
         .ok_or_else(|| io::Error::other("no physics state"))?;
     clock.completed(actual)?;
@@ -83,7 +106,7 @@ fn simulate(
     Ok((output, start.elapsed().as_secs_f64()))
 }
 pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
-    let region = flat()?;
+    let region = slope_region(0.0)?;
     let mut terrain = TerrainGpu::new(device, &region, 65, 1, 0, 0.0)?;
     let mut commands = encoder(device);
     terrain.encode(
@@ -107,7 +130,8 @@ pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         bytemuck::cast_slice::<_, u8>(&a),
         bytemuck::cast_slice::<_, u8>(&b)
     );
-    assert_eq!(a[0].metadata, [0, 1, 1440, 0]);
+    assert_eq!(a[0].metadata, [0, 1, 0, 0]);
+    assert_eq!(a[0].completed_tick(), 1440);
     assert!(
         (a[0].position[2] - 100.5).abs() < 0.015,
         "sphere settled at {:?}",
@@ -136,7 +160,8 @@ pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     lander.rotation = [0.09983342, 0.0, 0.0, 0.9950042];
     let (compound, _) = simulate(device, queue, &terrain, &[lander], &feet, 64)?;
     println!("GPU_PHYSICS landed={:?}", compound[0]);
-    assert_eq!(compound[0].metadata, [0, 4, 1440, 0]);
+    assert_eq!(compound[0].metadata, [0, 4, 0, 0]);
+    assert_eq!(compound[0].completed_tick(), 1440);
     assert!((compound[0].position[2] - 100.65).abs() < 0.04);
     assert!(compound[0].rotation[0].abs() < 0.06);
     assert!(compound[0].velocity[..3].iter().all(|v| v.abs() < 0.1));
@@ -147,10 +172,37 @@ pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         body([32.0, 32.0, 105.0], [200.0, 0.0, 0.0], 1),
     ];
     let (stopped, _) = simulate(device, queue, &terrain, &initial, &sphere, 64)?;
-    assert_eq!(stopped[0].metadata[3], 1);
-    assert_eq!(stopped[1].metadata[3], 2);
-    assert_eq!(stopped[1].metadata[2], 0);
+    assert_eq!(stopped[0].metadata[2], 1);
+    assert_eq!(stopped[1].metadata[2], 2);
+    assert_eq!(stopped[1].completed_tick(), 0);
     let many = vec![lander; 128];
     simulate(device, queue, &terrain, &many, &feet, 128)?;
+    let region = slope_region(0.1)?;
+    let mut sloped = TerrainGpu::new(device, &region, 65, 1, 0, 0.0)?;
+    let mut commands = encoder(device);
+    sloped.encode(
+        device,
+        &mut commands,
+        &[TerrainRequest {
+            origin_ticks: [0, 0],
+            spacing_ticks: 16,
+            slot: 0,
+        }],
+    )?;
+    queue.submit([commands.finish()]);
+    let mut rolling = body([32.0, 32.0, 106.0], [0.0; 3], 1);
+    rolling.clock = [u32::MAX - 100, 15, 0, 0];
+    let start = rolling.completed_tick();
+    let (result, _) = simulate(device, queue, &sloped, &[rolling], &sphere, 128)?;
+    let result = result[0];
+    assert_eq!(result.completed_tick(), start + 1440);
+    assert_eq!(result.metadata[2], 0);
+    let distance = (result.position[2] - 100.0 - 0.1 * result.position[0]) / 1.01_f32.sqrt();
+    assert!(
+        (distance - 0.5).abs() < 0.035,
+        "slope contact distance {distance}"
+    );
+    assert!(result.position[0] < 30.0);
+    println!("GPU_PHYSICS slope={result:?} tick_rollover=true");
     Ok(())
 }

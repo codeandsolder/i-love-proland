@@ -1,7 +1,7 @@
 //! Experimental fixed-step GPU rigid-body terrain solver. This is a local
 //! chart-space sandbox, not yet a full planetary multi-body physics engine.
 mod clock;
-use super::{RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage};
+use super::{Kernel, RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage};
 pub use clock::{SimulationClock, StepBatch};
 use std::io;
 use wgpu::util::DeviceExt;
@@ -19,7 +19,7 @@ pub struct Sphere {
 /// A GPU-resident rigid body. Position is tile-relative west/north/up;
 /// rotation is a unit quaternion xyzw. Last components encode properties.
 ///
-/// Metadata is [first sphere, sphere count, completed steps, status]:
+/// Metadata is [first sphere, sphere count, status, reserved]:
 /// status 0 active, 1 terrain coverage exhausted, 2 step too large.
 /// The body is retained at its last successfully integrated state on a stop.
 #[repr(C)]
@@ -31,10 +31,16 @@ pub struct RigidBody {
     pub angular: [f32; 4],
     pub inverse_inertia: [f32; 4],
     pub metadata: [u32; 4],
+    /// Low/high words of the absolute u64 tick, followed by two reserved words.
+    pub clock: [u32; 4],
 }
 
 impl RigidBody {
-    fn valid(&self, shape_count: usize) -> bool {
+    #[must_use = "Timestamp the actual completed physics state"]
+    pub const fn completed_tick(&self) -> u64 {
+        (self.clock[1] as u64) << 32 | self.clock[0] as u64
+    }
+    fn valid(&self, shape_count: usize, initial_tick: u64) -> bool {
         let finite = [
             self.position,
             self.rotation,
@@ -58,12 +64,15 @@ impl RigidBody {
                 .is_some_and(|end| end as usize <= shape_count)
             && self.metadata[2] == 0
             && self.metadata[3] == 0
+            && self.completed_tick() == initial_tick
+            && self.clock[2..] == [0, 0]
     }
 }
 
 /// Bounded integration configuration, independent of render cadence.
 #[derive(Clone, Copy, Debug)]
 pub struct PhysicsConfig {
+    pub initial_tick: u64,
     pub hz: u32,
     pub gravity_m_s2: f32,
     pub contact_slop_m: f32,
@@ -90,7 +99,7 @@ struct StepConfig {
 /// metadata and optional snapshots. Vessel-vessel contacts and joints are
 /// intentionally outside this first terrain-contact solver.
 pub struct PhysicsGpu {
-    pipeline: wgpu::ComputePipeline,
+    pipeline: Kernel,
     bodies: wgpu::Buffer,
     spheres: wgpu::Buffer,
     terrain: wgpu::Buffer,
@@ -120,7 +129,9 @@ impl PhysicsGpu {
             || !(1..=32).contains(&config.solver_iterations)
             || bodies.is_empty()
             || spheres.is_empty()
-            || bodies.iter().any(|body| !body.valid(spheres.len()))
+            || bodies
+                .iter()
+                .any(|body| !body.valid(spheres.len(), config.initial_tick))
             || spheres.iter().any(|sphere| {
                 !sphere.center.iter().all(|v| v.is_finite())
                     || !(0.01..=1000.0).contains(&sphere.radius)
@@ -138,18 +149,7 @@ impl PhysicsGpu {
             .copied()
             .flatten()
             .ok_or_else(|| invalid("physics terrain slot not initialized"))?;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("GPU terrain rigid bodies"),
-            source: wgpu::ShaderSource::Wgsl(STEP_WGSL.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("fixed physics steps"),
-            layout: None,
-            module: &shader,
-            entry_point: Some("advance"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline = Kernel::new(device, "fixed physics steps", STEP_WGSL, "advance");
         let bytes = bytemuck::cast_slice(bodies);
         if u64::try_from(bytes.len()).map_err(io::Error::other)?
             > device
@@ -167,7 +167,6 @@ impl PhysicsGpu {
                 | wgpu::BufferUsages::VERTEX,
         });
         #[expect(
-            clippy::cast_possible_truncation,
             clippy::cast_precision_loss,
             reason = "bounded local lattice spacing and fixed integration frequency"
         )]
@@ -194,7 +193,7 @@ impl PhysicsGpu {
             terrain: terrain.samples().clone(),
             request,
             params,
-            submitted: 0,
+            submitted: config.initial_tick,
             hz: config.hz,
         })
     }
@@ -235,7 +234,6 @@ impl PhysicsGpu {
         let end = batch
             .start_tick
             .checked_add(u64::from(batch.steps))
-            .filter(|&end| end <= u64::from(u32::MAX))
             .ok_or_else(|| invalid("physics tick overflow"))?;
         let params = StepConfig {
             steps: batch.steps,
@@ -247,23 +245,13 @@ impl PhysicsGpu {
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let buffers = [&self.terrain, &self.bodies, &self.spheres, &uniform];
-        let entries = std::array::from_fn::<_, 4, _>(|i| wgpu::BindGroupEntry {
-            binding: u32::try_from(i).unwrap_or_default(),
-            resource: buffers[i].as_entire_binding(),
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("GPU physics batch"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &entries,
-        });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("advance fixed physics ticks"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(self.params.count.div_ceil(64), 1, 1);
-        drop(pass);
+        self.pipeline.encode(
+            device,
+            encoder,
+            "advance fixed physics ticks",
+            &buffers,
+            [self.params.count.div_ceil(64), 1, 1],
+        )?;
         self.submitted = end;
         Ok(())
     }

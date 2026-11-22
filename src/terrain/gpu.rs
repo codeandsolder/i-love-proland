@@ -3,7 +3,9 @@
 //! The chart lattice is integer-addressed (1/16 m), not camera-relative.
 use super::Region;
 use std::io;
+mod kernel;
 mod readback;
+use kernel::Kernel;
 pub use readback::{PendingReadback, RecordedReadback};
 pub mod physics;
 use wgpu::util::DeviceExt;
@@ -152,7 +154,7 @@ impl Source {
 /// without any copy to the CPU. The caller owns slot lifetime and scheduling.
 pub struct TerrainGpu {
     source: Source,
-    pipeline: wgpu::ComputePipeline,
+    pipeline: Kernel,
     samples: wgpu::Buffer,
     config: Config,
     resident: Vec<Option<TerrainRequest>>,
@@ -212,18 +214,7 @@ impl TerrainGpu {
             return Err(invalid("GPU terrain pool exceeds device limits"));
         }
         let source = Source::new(device, region, config)?;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("canonical GPU terrain field"),
-            source: wgpu::ShaderSource::Wgsl(WGSL.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("resident terrain generation"),
-            layout: None,
-            module: &shader,
-            entry_point: Some("generate"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline = Kernel::new(device, "resident terrain generation", WGSL, "generate");
         let samples = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("resident generated terrain"),
             size: bytes,
@@ -290,23 +281,13 @@ impl TerrainGpu {
             &jobs,
             &self.samples,
         ];
-        let entries = std::array::from_fn::<_, 6, _>(|i| wgpu::BindGroupEntry {
-            binding: u32::try_from(i).unwrap_or_default(),
-            resource: buffers[i].as_entire_binding(),
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terrain generation bindings"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &entries,
-        });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("generate terrain slots"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(self.samples_per_slot().div_ceil(64), count, 1);
-        drop(pass);
+        self.pipeline.encode(
+            device,
+            encoder,
+            "generate terrain slots",
+            &buffers,
+            [self.samples_per_slot().div_ceil(64), count, 1],
+        )?;
         for request in requests {
             self.resident[request.slot as usize] = Some(*request);
         }

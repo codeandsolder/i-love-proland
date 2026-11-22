@@ -19,7 +19,7 @@ pub struct StepBatch {
 #[derive(Debug)]
 pub struct SimulationClock {
     hz: u32,
-    target_units: u128,
+    target_credit: u128,
     target_tick: u64,
     submitted: u64,
     complete: u64,
@@ -31,15 +31,24 @@ impl SimulationClock {
     /// # Errors
     /// Rejects a zero integration frequency.
     pub fn new(hz: u32) -> io::Result<Self> {
+        Self::at_tick(hz, 0)
+    }
+
+    /// Start an independent contact timeline at an absolute tick, for
+    /// example when a vessel leaves analytic orbit propagation.
+    ///
+    /// # Errors
+    /// Rejects a zero integration frequency.
+    pub fn at_tick(hz: u32, tick: u64) -> io::Result<Self> {
         if hz == 0 {
             return Err(io::Error::other("zero physics frequency"));
         }
         Ok(Self {
             hz,
-            target_units: 0,
-            target_tick: 0,
-            submitted: 0,
-            complete: 0,
+            target_credit: u128::from(tick) * SECOND,
+            target_tick: tick,
+            submitted: tick,
+            complete: tick,
         })
     }
 
@@ -52,17 +61,15 @@ impl SimulationClock {
         let increment = elapsed
             .as_nanos()
             .checked_mul(u128::from(warp_millionths))
+            .and_then(|v| v.checked_mul(u128::from(self.hz)))
             .ok_or_else(|| io::Error::other("warp overflow"))?;
         let next = self
-            .target_units
+            .target_credit
             .checked_add(increment)
             .ok_or_else(|| io::Error::other("simulation time overflow"))?;
-        let whole = next
-            .checked_mul(u128::from(self.hz))
-            .ok_or_else(|| io::Error::other("tick conversion overflow"))?
-            / SECOND;
+        let whole = next / SECOND;
         self.target_tick = u64::try_from(whole).map_err(io::Error::other)?;
-        self.target_units = next;
+        self.target_credit = next;
         Ok(())
     }
 
@@ -76,7 +83,7 @@ impl SimulationClock {
     /// nanosecond warp credit remains internal and survives rate changes.
     #[must_use = "Use independent target time for scheduling and display"]
     pub const fn target_nanoseconds(&self) -> u128 {
-        self.target_units / RATE_SCALE
+        self.target_credit / (self.hz as u128 * RATE_SCALE)
     }
 
     /// Exact tick-to-timestamp conversion, rounded down once, not an
@@ -183,6 +190,22 @@ mod tests {
             clock.completed(clock.submitted_tick())?;
         }
         assert_eq!(clock.completed_tick(), clock.target_tick());
+        Ok(())
+    }
+
+    #[test]
+    fn high_epoch_retains_exact_tick_and_time_credit() -> io::Result<()> {
+        let epoch = u64::from(u32::MAX) - 100;
+        let mut clock = SimulationClock::at_tick(240, epoch)?;
+        assert_eq!(clock.target_nanoseconds(), clock.tick_nanoseconds(epoch));
+        clock.advance(Duration::from_secs(1), 1_000_000)?;
+        assert_eq!(clock.target_tick(), epoch + 240);
+        let batch = clock
+            .plan(300, 300)
+            .ok_or_else(|| io::Error::other("missing epoch batch"))?;
+        clock.submitted(batch)?;
+        clock.completed(epoch + 240)?;
+        assert_eq!(clock.completed_tick(), epoch + 240);
         Ok(())
     }
 
