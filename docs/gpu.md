@@ -183,3 +183,26 @@ probe, not an isolated compute shader GPU timestamp benchmark.
 - Render motion tests at 50–150m AGL and aerial scale references from
   1–100km around KSC, verifying actual pixel/silhouette coverage and temporal
   stability.
+
+## Resident moving camera and distance handoff
+
+The input pose is now in the caller's stable local frame rather than rewritten
+relative to every eye. Set the camera-relative projection and eye on both the
+classification view and draw camera. Each shader subtracts the eye before
+frustum, distance and vertex transforms. Large absolute planetary coordinates
+still require caller-side high-precision local projection.
+
+For complementary source-range canopy, call
+`GpuView::with_distance_handoff(begin, end)` and supply the physical placement
+anchor and an identity-stable independent rank in [0,1) for each candidate
+(`PackedInstance::with_handoff_anchor`). Classification rejects candidates
+at or beyond end and uses the original smoothstep fraction in the final band.
+Retained objects are not also culled by the projected canopy cutoff. The
+anchor is independent of source-mesh sphere center or visual slot.
+
+Actual AMD Renoir Vulkan: 63,333 input records; all candidate bytes and
+compacted IDs/bins matched the CPU reference on three translated eyes with
+distance handoff, without reuploading the population. The forest example's
+480m overhead eye uses the same resident input; wind, billboard and
+capacity-growth checks pass. Measured full upload+classify/sync 3.016ms,
+resident classify/sync 0.844ms.
