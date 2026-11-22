@@ -31,8 +31,10 @@ a CPU-side visibility simulation.
   count must match the corresponding compactor metadata. The family owns an independent
   compactor, material uniforms, source texture bindings and indirect counts;
   immutable resource sharing never merges family populations.
-- Before each render pass, call `renderer.reserve(candidate_count)`
-  if needed, then `renderer.encode(queue, encoder, candidates, view)`.
+- Replace candidate storage only when input poses change using
+  `renderer.set_candidates(queue, candidates)`; capacity growth is automatic.
+  Before each render pass, call `renderer.encode(queue, encoder, view)` to
+  classify the resident input using the current camera.
   The renderer owns its compactor and resizes just candidate/visible buffers
   and per-tier dynamic bind groups; all immutable mesh/material and pipeline
   resources survive capacity changes.

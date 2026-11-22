@@ -951,14 +951,17 @@ impl TreeRenderer {
         &self.compactor
     }
 
-    /// Grow instance storage while preserving all source geometry, textures,
-    /// pipelines, camera uniforms and indirect records. Call before encoding
-    /// the next frame; that frame uploads fresh candidates.
+    /// Replace the resident candidate batch, growing only capacity-dependent
+    /// instance storage and bindings when necessary.
     ///
     /// # Errors
-    /// Rejects a requested capacity beyond the device limits.
-    pub fn reserve(&mut self, required: u32) -> Result<bool> {
-        if self.compactor.reserve(required)? {
+    /// Rejects candidate batches beyond the device limits.
+    pub fn set_candidates(
+        &mut self,
+        queue: &wgpu::Queue,
+        candidates: &[PackedInstance],
+    ) -> Result<bool> {
+        if self.compactor.set_candidates(queue, candidates)? {
             self.instance_bindings = instance_bindings(
                 self.pipelines.device(),
                 &self.pipelines.instance_layout,
@@ -1017,19 +1020,18 @@ impl TreeRenderer {
         queue.write_buffer(&self.impostor_uniforms, 0, bytemuck::bytes_of(&uniform));
     }
 
-    /// Classify the submitted candidates, then copy each GPU-computed tier
+    /// Classify resident candidates, then copy each GPU-computed tier
     /// count into its material indirect arguments in the same encoder.
     ///
     /// # Errors
-    /// Rejects candidate batches exceeding the reserved capacity.
+    /// Rejects a GPU LOD layout that cannot fit the shader uniform ABI.
     pub fn encode(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        candidates: &[PackedInstance],
         view: GpuView,
     ) -> Result<()> {
-        self.compactor.encode(queue, encoder, candidates, view)?;
+        self.compactor.encode(queue, encoder, view)?;
         for material in &self.mesh_draws {
             encoder.copy_buffer_to_buffer(
                 self.compactor.indirect(),
