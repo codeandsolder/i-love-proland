@@ -5,7 +5,7 @@
 struct Config {
     side:u32, slot:u32, count:u32, steps:u32,
     spacing:f32, dt:f32, gravity:f32, slop:f32,
-    iterations:u32, padding0:u32, padding1:u32, padding2:u32,
+    iterations:u32, stop_at_contact:u32, padding1:u32, padding2:u32,
 }
 struct Contact { normal:vec3<f32>, depth:f32 }
 struct Constraint {
@@ -186,6 +186,12 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
         }
         b.clock.x+=1u;
         if b.clock.x==0u{b.clock.y+=1u;}
+        if count>0u && b.metadata.w==0u {
+            b.metadata.w=1u;
+            b.clock.z=b.clock.x;
+            b.clock.w=b.clock.y;
+            if config.stop_at_contact!=0u{b.metadata.z=3u;break;}
+        }
     }
     bodies[id.x]=b;
 }

@@ -4,7 +4,7 @@ use i_love_proland::terrain::{
     Region, RegionCell, RegionChart,
     gpu::{
         TerrainGpu, TerrainRequest,
-        physics::{PhysicsConfig, PhysicsGpu, RigidBody, SimulationClock, Sphere},
+        physics::{PhysicsConfig, PhysicsGpu, RigidBody, SimulationClock, Sphere, StepBatch},
     },
 };
 use std::{
@@ -50,6 +50,7 @@ const CONFIG: PhysicsConfig = PhysicsConfig {
     gravity_m_s2: 9.81,
     contact_slop_m: 0.001,
     solver_iterations: 5,
+    stop_at_contact: false,
 };
 fn simulate(
     device: &wgpu::Device,
@@ -218,12 +219,51 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     }];
     let initial = [body([32.0, 32.0, 103.0], [0.0; 3], 1)];
     let (a, _) = simulate(device, queue, &terrain, &initial, &sphere, 64)?;
+    let mut predictor = PhysicsGpu::new(
+        device,
+        &terrain,
+        0,
+        PhysicsConfig {
+            stop_at_contact: true,
+            ..CONFIG
+        },
+        &initial,
+        &sphere,
+    )?;
+    let mut prediction_commands = encoder(device);
+    predictor.encode(
+        device,
+        &mut prediction_commands,
+        &terrain,
+        StepBatch {
+            start_tick: 0,
+            steps: 960,
+            hz: CONFIG.hz,
+        },
+    )?;
+    let predicted = predictor.snapshot(device, &mut prediction_commands);
+    queue.submit([prediction_commands.finish()]);
+    let mut pending = predicted.begin();
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let predicted = pending
+        .try_take()?
+        .ok_or_else(|| io::Error::other("prediction unfinished"))?;
+    assert_eq!(predicted[0].metadata[2], 3);
+    assert_eq!(predicted[0].first_contact_tick(), a[0].first_contact_tick());
+    assert_eq!(
+        predicted[0].first_contact_tick(),
+        Some(predicted[0].completed_tick())
+    );
+    println!(
+        "GPU_PHYSICS predicted_first_contact={:?}",
+        predicted[0].first_contact_tick()
+    );
     let (b, _) = simulate(device, queue, &terrain, &initial, &sphere, 7)?;
     assert_eq!(
         bytemuck::cast_slice::<_, u8>(&a),
         bytemuck::cast_slice::<_, u8>(&b)
     );
-    assert_eq!(a[0].metadata, [0, 1, 0, 0]);
+    assert_eq!(a[0].metadata, [0, 1, 0, 1]);
     assert_eq!(a[0].completed_tick(), 1440);
     assert!(
         (a[0].position[2] - 100.5).abs() < 0.015,
@@ -253,7 +293,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     lander.rotation = [0.099_833_42, 0.0, 0.0, 0.995_004_2];
     let (compound, _) = simulate(device, queue, &terrain, &[lander], &feet, 64)?;
     println!("GPU_PHYSICS landed={:?}", compound[0]);
-    assert_eq!(compound[0].metadata, [0, 4, 0, 0]);
+    assert_eq!(compound[0].metadata, [0, 4, 0, 1]);
     assert_eq!(compound[0].completed_tick(), 1440);
     assert!((compound[0].position[2] - 100.65).abs() < 0.04);
     assert!(compound[0].rotation[0].abs() < 0.06);

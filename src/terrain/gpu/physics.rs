@@ -23,9 +23,10 @@ pub struct Sphere {
 /// A GPU-resident rigid body. Position is tile-relative west/north/up;
 /// rotation is a unit quaternion xyzw. Last components encode properties.
 ///
-/// Metadata is [first sphere, sphere count, status, reserved]:
+/// Metadata is [first sphere, sphere count, status, contact recorded]:
 /// status 0 active, 1 terrain coverage exhausted, 2 step too large.
-/// The body is retained at its last successfully integrated state on a stop.
+/// Status 3 is a successful first-contact prediction stop. Other stops retain
+/// the last successfully integrated state.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RigidBody {
@@ -35,7 +36,7 @@ pub struct RigidBody {
     pub angular: [f32; 4],
     pub inverse_inertia: [f32; 4],
     pub metadata: [u32; 4],
-    /// Low/high words of the absolute u64 tick, followed by two reserved words.
+    /// Absolute completed tick and first-contact tick, each as low/high words.
     pub clock: [u32; 4],
 }
 
@@ -44,6 +45,16 @@ impl RigidBody {
     pub const fn completed_tick(&self) -> u64 {
         (self.clock[1] as u64) << 32 | self.clock[0] as u64
     }
+    /// First detected solid contact at an integrated tick, not a swept TOI.
+    #[must_use = "Use the physical contact timestamp rather than submission time"]
+    pub const fn first_contact_tick(&self) -> Option<u64> {
+        if self.metadata[3] == 0 {
+            None
+        } else {
+            Some((self.clock[3] as u64) << 32 | self.clock[2] as u64)
+        }
+    }
+
     fn valid(&self, shape_count: usize, initial_tick: u64) -> bool {
         let finite = [
             self.position,
@@ -81,6 +92,8 @@ pub struct PhysicsConfig {
     pub gravity_m_s2: f32,
     pub contact_slop_m: f32,
     pub solver_iterations: u32,
+    /// Finish a predictive calculation at the first discrete contact.
+    pub stop_at_contact: bool,
 }
 
 #[repr(C)]
@@ -95,7 +108,8 @@ struct StepConfig {
     gravity: f32,
     slop: f32,
     iterations: u32,
-    padding: [u32; 3],
+    stop_at_contact: u32,
+    padding: [u32; 2],
 }
 
 /// One batch of independent rigid bodies over a pinned terrain slot.
@@ -185,7 +199,8 @@ impl PhysicsGpu {
             gravity: config.gravity_m_s2,
             slop: config.contact_slop_m,
             iterations: config.solver_iterations,
-            padding: [0; 3],
+            stop_at_contact: u32::from(config.stop_at_contact),
+            padding: [0; 2],
         };
         Ok(Self {
             pipeline,
