@@ -56,18 +56,22 @@ impl CollisionGrid {
     /// both fine collision and future chart-grid rendering.
     #[must_use = "Use this topology with the reconstructed solid vertices"]
     pub fn triangles(&self) -> impl Iterator<Item = [u32; 3]> + '_ {
-        let cells = self.side.saturating_sub(1);
-        (0..cells).flat_map(move |row| {
-            (0..cells).flat_map(move |column| {
-                let sw = row * self.side + column;
-                let se = sw + 1;
-                let nw = sw + self.side;
-                let ne = nw + 1;
-                // West x north is outward in RegionChart coordinates.
-                [[sw, se, ne], [sw, ne, nw]]
-            })
-        })
+        grid_triangles(self.side)
     }
+}
+
+pub(super) fn grid_triangles(side: u32) -> impl Iterator<Item = [u32; 3]> {
+    let cells = side.saturating_sub(1);
+    (0..cells).flat_map(move |row| {
+        (0..cells).flat_map(move |column| {
+            let sw = row * side + column;
+            let se = sw + 1;
+            let nw = sw + side;
+            let ne = nw + 1;
+            // West x north is outward in RegionChart coordinates.
+            [[sw, se, ne], [sw, ne, nw]]
+        })
+    })
 }
 
 #[cfg(test)]

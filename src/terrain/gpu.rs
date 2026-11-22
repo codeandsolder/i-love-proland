@@ -255,6 +255,13 @@ impl TerrainGpu {
         self.side() * self.side()
     }
 
+    /// The canonical outward-facing solid grid topology. Reuse one index
+    /// buffer for all slots having the same side length.
+    #[must_use = "Render exactly the triangles used by terrain collision"]
+    pub fn triangles(&self) -> impl Iterator<Item = [u32; 3]> {
+        collision::grid_triangles(self.side())
+    }
+
     /// Encode a batch of unique sorted slot replacements. No CPU evaluation
     /// of terrain detail and no implicit readback. Submit encoders in order.
     ///
