@@ -67,9 +67,14 @@ Atlas tiles are row-major with **8 azimuth columns × 4 elevation rows**:
 | Elevation | 0°, 30°, 60°, 90° (side to directly overhead) |
 
 Every atlas image cell is `tile_size × tile_size`; `gutter` pixels on
-each side are filled from *the same tile's* content. The texture sampler
-is bilinear with no mipmaps. Fragment shading blends the two neighbouring
-azimuths and two neighbouring elevations for smooth camera movement.
+each side are filled from *the same tile's* content. GPU upload crops
+those duplicated gutters into 32 independent texture-array layers.
+Each mip is the exact area average of the original view content in
+linear premultiplied RGBA, including odd dimensions. Trilinear
+sampling cannot leak adjacent view colors or distort transparent
+coverage. Fragment shading blends the two neighbouring azimuths and two
+neighbouring elevations in premultiplied space, then unpremultiplies
+before alpha-to-coverage or ordered dithering.
 The quad faces the camera; its dimensions are derived from the projected
 source ellipsoid, conservatively covering nonuniform XYZ scale. Its right/up
 axes follow the source orientation, including a stable overhead fallback.
@@ -132,9 +137,9 @@ a screenshot of the original `.mu` asset.
 
 - `SourceImage::upload` creates one uncompressed RGBA8 mip level for the
   reference/example; a host-provided compressed GPU texture view retains its
-  original compressed mip chain. The generated angular atlas currently has
-  only one mip level; production needs per-level coverage preservation and
-  isolated atlas tile borders at every mip. The far canopy shader is separate.
+  original compressed mip chain. The generated angular atlas has a complete
+  isolated, area-averaged premultiplied mip chain. The far canopy shader is
+  separate.
 - Multi-material source geometry must be grouped by source texture and alpha
   cutoff. The sample test tree is synthetic geometry, even when its texture
   data is supplied from the user's actual Parallax assets.

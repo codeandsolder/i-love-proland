@@ -4,7 +4,9 @@
 use crate::gpu::{CompactedBin, GpuCompactor, IndexedDraw};
 use crate::{
     Error, Result,
+    atlas_bake::to_byte,
     billboard::Billboard,
+    material::{linear_to_srgb, srgb_to_linear},
     wind::{WindFrame, WindParameters},
 };
 use wgpu::util::DeviceExt;
@@ -149,29 +151,31 @@ impl AtlasImage {
         &self.rgba
     }
 
-    /// Upload actual sRGB texture data to a GPU using a single mip level.
+    /// Upload each angular view as an independent, coverage-filtered
+    /// texture-array layer. The disk/CPU atlas retains its original layout.
     ///
     /// # Errors
-    /// Rejects a texture too large for the selected device.
+    /// Rejects dimensions unsupported by the selected device.
     pub fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<AtlasTexture> {
         let limits = device.limits();
-        if self.width() > limits.max_texture_dimension_2d
-            || self.height() > limits.max_texture_dimension_2d
-        {
+        let side = self.tile_size - 2 * self.gutter;
+        let layers = AZIMUTH_VIEWS * ELEVATION_VIEWS;
+        if side > limits.max_texture_dimension_2d || layers > limits.max_texture_array_layers {
             return Err(Error::InvalidConfiguration(
-                "impostor atlas exceeds GPU texture limit",
+                "impostor view array exceeds GPU texture limit",
             ));
         }
+        let (mip_level_count, data) = self.isolated_mips();
         let texture = device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {
-                label: Some("i-love-proland 32-view impostor atlas"),
+                label: Some("i-love-proland independently filtered angular views"),
                 size: wgpu::Extent3d {
-                    width: self.width(),
-                    height: self.height(),
-                    depth_or_array_layers: 1,
+                    width: side,
+                    height: side,
+                    depth_or_array_layers: layers,
                 },
-                mip_level_count: 1,
+                mip_level_count,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -179,16 +183,94 @@ impl AtlasImage {
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            &self.rgba,
+            &data,
         );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let tile = f32::from(u16::try_from(self.tile_size).map_err(|_| Error::IndexOverflow)?);
-        let gutter = f32::from(u16::try_from(self.gutter).map_err(|_| Error::IndexOverflow)?);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         Ok(AtlasTexture {
             _texture: texture,
             view,
-            gutter_fraction: gutter / tile,
         })
+    }
+
+    /// Crop the duplicated atlas gutters. Each output texel is the exact
+    /// area average of the original content in linear premultiplied RGBA,
+    /// including arbitrary (non-power-of-two and odd) source dimensions.
+    /// Derive every level from the unquantized base, never from a quantized
+    /// intermediate. No angular neighbours can contribute to a view's mip.
+    fn isolated_mips(&self) -> (u32, Vec<u8>) {
+        let side = self.tile_size - 2 * self.gutter;
+        let pitch = self.width() as usize;
+        let levels = side.bit_width();
+        let mut data = Vec::new();
+        let mut linear = [0.0; 256];
+        for (slot, byte) in linear.iter_mut().zip(0..=u8::MAX) {
+            *slot = srgb_to_linear(byte);
+        }
+        let mut base = Vec::with_capacity((side * side) as usize);
+        for elevation in 0..ELEVATION_VIEWS {
+            for azimuth in 0..AZIMUTH_VIEWS {
+                base.clear();
+                let x0 = azimuth * self.tile_size + self.gutter;
+                let y0 = elevation * self.tile_size + self.gutter;
+                for y in y0..y0 + side {
+                    for x in x0..x0 + side {
+                        let i = 4 * (y as usize * pitch + x as usize);
+                        let p = &self.rgba[i..i + 4];
+                        let a = f32::from(p[3]) / 255.0;
+                        base.push([
+                            linear[p[0] as usize] * a,
+                            linear[p[1] as usize] * a,
+                            linear[p[2] as usize] * a,
+                            a,
+                        ]);
+                    }
+                }
+                for level in 0..levels {
+                    append_area_mip(&base, side, side >> level, &mut data);
+                }
+            }
+        }
+        (levels, data)
+    }
+}
+
+// Coordinates use exact integer overlap lengths in units of 1/dest_side
+// of an original texel. Each output square has total weight source_side².
+fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &mut Vec<u8>) {
+    let norm = f64::from(source_side).powi(2).recip();
+    for y in 0..dest_side {
+        let y0 = y * source_side;
+        let y1 = y0 + source_side;
+        for x in 0..dest_side {
+            let x0 = x * source_side;
+            let x1 = x0 + source_side;
+            let mut sum = [0.0_f64; 4];
+            for sy in y0 / dest_side..y1.div_ceil(dest_side) {
+                let wy = y1.min((sy + 1) * dest_side) - y0.max(sy * dest_side);
+                for sx in x0 / dest_side..x1.div_ceil(dest_side) {
+                    let wx = x1.min((sx + 1) * dest_side) - x0.max(sx * dest_side);
+                    let weight = f64::from(wx * wy);
+                    let p = base[(sy * source_side + sx) as usize];
+                    for (sum, channel) in sum.iter_mut().zip(p) {
+                        *sum = weight.mul_add(f64::from(channel), *sum);
+                    }
+                }
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "normalized area averages are converted to the f32 color transfer function before 8-bit quantization"
+            )]
+            let average = sum.map(|v| (v * norm) as f32);
+            data.extend_from_slice(&[
+                to_byte(linear_to_srgb(average[0])),
+                to_byte(linear_to_srgb(average[1])),
+                to_byte(linear_to_srgb(average[2])),
+                to_byte(average[3]),
+            ]);
+        }
     }
 }
 
@@ -196,7 +278,6 @@ impl AtlasImage {
 pub struct AtlasTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
-    gutter_fraction: f32,
 }
 
 /// Explicit camera-relative projection. The application owns view rotation.
@@ -269,7 +350,6 @@ impl TreeCamera {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DrawUniform {
     projection: [[f32; 4]; 4],
-    atlas: [f32; 4],
     material: [f32; 4],
     wind_parameters: [f32; 4],
     wind_source: [f32; 4],
@@ -356,7 +436,6 @@ pub struct TreeRenderer {
     source_indirect: wgpu::Buffer,
     impostor_indirect_offset: u64,
     quad_indices: wgpu::Buffer,
-    gutter_fraction: f32,
     alpha_to_coverage: bool,
 }
 
@@ -453,7 +532,7 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
                     multisampled: false,
                 },
                 count: None,
@@ -552,7 +631,7 @@ fn make_source_sampler(device: &wgpu::Device) -> wgpu::Sampler {
         address_mode_v: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
         ..Default::default()
     })
 }
@@ -725,7 +804,7 @@ impl TreeRenderer {
             .bin(compactor.mesh_lods().impostor_bin())
             .ok_or(Error::InvalidConfiguration("missing impostor bin"))?;
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("i-love-proland impostor atlas bilinear sampler"),
+            label: Some("i-love-proland angular view trilinear sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
@@ -804,7 +883,6 @@ impl TreeRenderer {
             source_indirect: impostor_bin.indirect.clone(),
             impostor_indirect_offset: impostor_bin.indirect_offset,
             quad_indices,
-            gutter_fraction: atlas.gutter_fraction,
             alpha_to_coverage: config.sample_count > 1,
         })
     }
@@ -813,7 +891,6 @@ impl TreeRenderer {
     pub fn set_camera(&self, queue: &wgpu::Queue, camera: TreeCamera) {
         let mut uniform = DrawUniform {
             projection: camera.projection,
-            atlas: [8.0, 4.0, self.gutter_fraction, 0.0],
             material: [0.0, f32::from(u8::from(self.alpha_to_coverage)), 0.0, 0.0],
             wind_parameters: [0.0; 4],
             wind_source: [0.0; 4],
@@ -902,6 +979,59 @@ mod tests {
         assert!(AtlasImage::new(4, 1, vec![]).is_err());
         assert!(AtlasImage::new(16, 4, vec![]).is_err());
         assert!(AtlasImage::new(16, 2, vec![]).is_err());
+    }
+
+    #[test]
+    fn isolated_mips_preserve_odd_sized_view_coverage_and_color() {
+        let tile = 13_u32;
+        let gutter = 2_u32;
+        let side = tile - 2 * gutter;
+        let width = tile * AZIMUTH_VIEWS;
+        let mut rgba = vec![255; (width * tile * ELEVATION_VIEWS * 4) as usize];
+        // Deliberately unrelated opaque white gutters and transparent
+        // saturated magenta content must not leak into neighbouring views.
+        for e in 0..ELEVATION_VIEWS {
+            for a in 0..AZIMUTH_VIEWS {
+                for y in 0..side {
+                    for x in 0..side {
+                        let i = (4 * ((e * tile + gutter + y) * width + a * tile + gutter + x))
+                            as usize;
+                        let visible = x == y;
+                        rgba[i..i + 4].copy_from_slice(if !visible {
+                            &[255, 0, 255, 0]
+                        } else if a == 0 && e == 0 {
+                            &[255, 0, 0, 255]
+                        } else {
+                            &[0, 255, 0, 255]
+                        });
+                    }
+                }
+            }
+        }
+        let atlas = AtlasImage::new(tile, gutter, rgba).unwrap();
+        let (levels, bytes) = atlas.isolated_mips();
+        assert_eq!(levels, 4);
+        let layer_bytes: usize = (0..levels).map(|l| ((side >> l).pow(2) * 4) as usize).sum();
+        assert_eq!(bytes.len(), layer_bytes * 32);
+        for (view, layer) in bytes.chunks_exact(layer_bytes).enumerate() {
+            let mut offset = 0;
+            for level in 0..levels {
+                let size = (side >> level).pow(2) as usize;
+                let pixels = &layer[offset..offset + size * 4];
+                let mut mean = 0.0;
+                for pixel in pixels.as_chunks::<4>().0 {
+                    let alpha = f64::from(pixel[3]) / 255.0;
+                    mean += alpha;
+                    let channel = if view == 0 { pixel[0] } else { pixel[1] };
+                    let other = if view == 0 { pixel[1] } else { pixel[0] };
+                    assert_eq!((other, pixel[2]), (0, 0));
+                    assert!((f64::from(srgb_to_linear(channel)) - alpha).abs() < 0.007);
+                }
+                mean /= f64::from((side >> level).pow(2));
+                assert!((mean - 1.0 / f64::from(side)).abs() <= 0.5 / 255.0 + 1e-9);
+                offset += size * 4;
+            }
+        }
     }
 
     #[test]
