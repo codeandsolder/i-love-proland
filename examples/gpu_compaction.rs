@@ -297,6 +297,53 @@ fn validate_replacement(
     Ok(())
 }
 
+fn validate_moving_handoff(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    compactor: &mut GpuCompactor,
+    candidates: &[PackedInstance],
+    frustum: GpuView,
+) -> Result<(), Box<dyn Error>> {
+    // Move the eye against one immutable resident population. Compare
+    // all GPU output identities and bins with the CPU classifier.
+    let local_candidates = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut c = *c;
+            let offset = [1024.0, 2048.0, -4096.0];
+            for (coordinate, shift) in c.position_radius[..3].iter_mut().zip(offset) {
+                *coordinate += shift;
+            }
+            let anchor = c.position_radius[..3].try_into()?;
+            let rank = f32::from(u8::try_from(i % 251)?) / 251.0;
+            Ok(c.with_handoff_anchor(anchor, rank)?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    assert!(!compactor.set_candidates(queue, &local_candidates)?);
+    for eye in [
+        [1024.0, 2048.0, -4096.0],
+        [1032.0, 2020.0, -3920.0],
+        [1100.0, 2100.0, -3190.0],
+    ] {
+        let moving = frustum
+            .with_eye(eye)?
+            .with_distance_handoff(900.0, 1000.0)?;
+        let (expected, _) = reference(&local_candidates, moving, compactor.mesh_lods());
+        gpu_parity(
+            device,
+            queue,
+            compactor,
+            &local_candidates,
+            moving,
+            &expected,
+        )?;
+    }
+    println!("GPU_RESIDENT_MOVING_HANDOFF_PARITY PASS");
+    assert!(!compactor.set_candidates(queue, candidates)?);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let (candidates, generation_ms) = generate_sample()?;
     let view = GpuView::unculled(540.0, 32.0, 1.0)?.with_source_center([0.12, 0.4, -0.19])?;
@@ -384,43 +431,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|d| d.instance_count)
             .collect::<Vec<_>>()
     );
-    // Move the eye against one immutable resident population. Compare
-    // all GPU output identities and bins with the CPU classifier.
-    let local_candidates = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let mut c = *c;
-            let offset = [1024.0, 2048.0, -4096.0];
-            for (coordinate, shift) in c.position_radius[..3].iter_mut().zip(offset) {
-                *coordinate += shift;
-            }
-            let anchor = c.position_radius[..3].try_into()?;
-            let rank = f32::from(u8::try_from(i % 251)?) / 251.0;
-            Ok(c.with_handoff_anchor(anchor, rank)?)
-        })
-        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
-    assert!(!compactor.set_candidates(&queue, &local_candidates)?);
-    for eye in [
-        [1024.0, 2048.0, -4096.0],
-        [1032.0, 2020.0, -3920.0],
-        [1100.0, 2100.0, -3190.0],
-    ] {
-        let moving = frustum
-            .with_eye(eye)?
-            .with_distance_handoff(900.0, 1000.0)?;
-        let (expected, _) = reference(&local_candidates, moving, compactor.mesh_lods());
-        gpu_parity(
-            &device,
-            &queue,
-            &compactor,
-            &local_candidates,
-            moving,
-            &expected,
-        )?;
-    }
-    println!("GPU_RESIDENT_MOVING_HANDOFF_PARITY PASS");
-    assert!(!compactor.set_candidates(&queue, &candidates)?);
+    validate_moving_handoff(&device, &queue, &mut compactor, &candidates, frustum)?;
     let frame_ms = benchmark(&device, &queue, &mut compactor, Some(&candidates), view)?;
     let resident_ms = benchmark(&device, &queue, &mut compactor, None, view)?;
     println!("GPU_RESIDENT_INPUT upload_ms={frame_ms:.4} resident_ms={resident_ms:.4}");
