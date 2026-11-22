@@ -3,12 +3,13 @@
 // CPU. GPU atomics affect *storage order only*, never the object population.
 
 struct PackedInstance {
-    position_radius: vec4<f32>,    // camera-relative xyz, physical crown radius
+    position_radius: vec4<f32>,    // local-frame xyz, physical crown radius
     rotation: vec4<f32>,           // normalized source quaternion XYZW
     axis_radii: vec4<f32>,         // physical XYZ scale, appearance variation
     object_id: vec4<u32>,          // full stable u128, low word first
     metadata: vec4<u32>,           // variant u64 + layer u64
     tint: vec4<f32>,               // per-instance linear RGB, alpha multiplier
+    handoff_anchor_rank: vec4<f32>, // physical anchor xyz and stable handoff rank
 }
 
 struct IndexedDraw {
@@ -25,6 +26,8 @@ struct View {
     forward: vec4<f32>,            // normalized camera forward
     source_center: vec4<f32>,      // normalized original mesh bounds centre
     planes: array<vec4<f32>, 6>,   // xyz normal, w offset; camera-relative
+    eye: vec4<f32>,               // eye in resident local frame
+    handoff_range: vec4<f32>,     // begin/end, zero pair disables
 }
 
 @group(0) @binding(0) var<storage, read> input: array<PackedInstance>;
@@ -46,7 +49,20 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     let instance = input[input_id];
-    let position = instance.position_radius.xyz;
+    if camera.handoff_range.y > camera.handoff_range.x {
+        let distance = length(instance.handoff_anchor_rank.xyz - camera.eye.xyz);
+        if distance >= camera.handoff_range.y {
+            return;
+        }
+        if distance > camera.handoff_range.x {
+            let t = (distance - camera.handoff_range.x) / (camera.handoff_range.y - camera.handoff_range.x);
+            let fraction = t * t * fma(-2.0, t, 3.0);
+            if instance.handoff_anchor_rank.w < fraction {
+                return;
+            }
+        }
+    }
+    let position = instance.position_radius.xyz - camera.eye.xyz;
     let radius = instance.position_radius.w;
     // Mesh sphere plus animation, or the circumscribed sphere of a
     // conservative impostor square. Keep visual LOD diameter unchanged.

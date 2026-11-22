@@ -1,5 +1,5 @@
 // Generic fully rotated source-mesh and multi-angle tree impostor renderer.
-// Camera-relative records are produced by the compactor. The source object
+// Resident local-frame records are indexed by the compactor. The source object
 // identity, material variant, and placement remain independent of visual LOD.
 
 const TAU: f32 = 6.283185307179586;
@@ -14,6 +14,7 @@ struct Instance {
     object_id: vec4<u32>,
     metadata: vec4<u32>,
     tint: vec4<f32>,
+    handoff_anchor_rank: vec4<f32>,
 }
 
 struct RenderUniform {
@@ -26,6 +27,7 @@ struct RenderUniform {
     field_phase: vec4<f32>, // camera origin modulo texture repetition, time scroll
     camera_forward: vec4<f32>,
     billboard_source: vec4<f32>, // normalized source center, original radius (zero = static)
+    eye: vec4<f32>,              // eye in the resident local frame
 }
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
@@ -114,7 +116,7 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
         vertex = local.x * right + vec3<f32>(0.0, local.y, 0.0)
             + local.z * back - source.xyz;
     }
-    let world = object.position_radius.xyz
+    let world = (object.position_radius.xyz - camera.eye.xyz)
         + rotate(object.rotation, vertex * object.axis_radii.xyz);
     var out: MeshOutput;
     let source_y = vertex.y * camera.wind_source.y + camera.wind_source.x;
@@ -148,7 +150,7 @@ fn impostor_vs(
     @builtin(instance_index) instance_id: u32,
 ) -> ImpostorOutput {
     let object = objects[visible_indices[instance_id]];
-    let center = object.position_radius.xyz;
+    let center = object.position_radius.xyz - camera.eye.xyz;
     let radius = object.position_radius.w;
     let to_eye = select(normalize(-center), vec3<f32>(0.0, 0.0, 1.0), dot(center, center) < 0.000001);
 

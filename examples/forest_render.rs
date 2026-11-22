@@ -513,21 +513,19 @@ fn render_overhead(
     color: &wgpu::Texture,
     prefix: &str,
 ) -> Result<(), Box<dyn Error>> {
-    // Same canonical objects, rebased 480m for the 90 degree downwards view.
-    let mut overhead = scene.candidates.to_vec();
-    for tree in &mut overhead {
-        tree.position_radius[1] -= 480.0;
-    }
+    // Same resident canonical objects, with the eye moved 480m upward.
     let (overhead_camera, overhead_view) = pitched_view(core::f32::consts::FRAC_PI_2)?;
+    let eye = [0.0, 480.0, 0.0];
+    let overhead_camera = overhead_camera.with_eye(eye)?;
+    let overhead_view = overhead_view.with_eye(eye)?;
     scene.renderer.set_camera(scene.queue, overhead_camera);
-    scene.renderer.set_candidates(scene.queue, &overhead)?;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("fully overhead forest atlas test"),
     });
     render_frame(
         &mut encoder,
         &ForestPass {
-            candidates: &overhead,
+            candidates: scene.candidates,
             view: overhead_view,
             background,
             queue: scene.queue,
@@ -539,9 +537,6 @@ fn render_overhead(
     let pixels = capture(device, scene.queue, encoder, color)?;
     write_ppm(&format!("{prefix}-overhead.ppm"), WIDTH, HEIGHT, &pixels)?;
     scene.renderer.set_camera(scene.queue, low_camera);
-    scene
-        .renderer
-        .set_candidates(scene.queue, scene.candidates)?;
     Ok(())
 }
 
@@ -623,6 +618,7 @@ fn validate_source_billboards(
         axis_radii: [1.4, 0.8, 1.7, 1.0],
         object_id: [1; 4],
         metadata: [2; 4],
+        handoff_anchor_rank: [0.0; 4],
         tint: [1.0; 4],
     }];
     let (camera, view) = pitched_view(0.0)?;
@@ -860,6 +856,7 @@ fn validate_capacity_growth(
         axis_radii: [8.0, 8.0, 8.0, 1.0],
         object_id: [1; 4],
         metadata: [2; 4],
+        handoff_anchor_rank: [0.0; 4],
         tint: [1.0; 4],
     });
     let lods = renderer.compactor().mesh_lods();
