@@ -179,15 +179,15 @@ fn raster_triangle(
                 texel[2] * rgba[2],
                 1.0,
             ];
-            let n: [f32; 3] = core::array::from_fn(|i| {
+            let interpolated_normal: [f32; 3] = core::array::from_fn(|i| {
                 weights[0].mul_add(
                     a.normal[i],
                     weights[1].mul_add(b.normal[i], weights[2] * c.normal[i]),
                 )
             });
-            let inverse_length = dot(n, n).sqrt().recip();
+            let inverse_length = dot(interpolated_normal, interpolated_normal).sqrt().recip();
             let unit = if inverse_length.is_finite() {
-                n.map(|v| v * inverse_length)
+                interpolated_normal.map(|v| v * inverse_length)
             } else {
                 [0.0, 1.0, 0.0]
             };
