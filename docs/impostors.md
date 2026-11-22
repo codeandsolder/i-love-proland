@@ -34,7 +34,9 @@ a CPU-side visibility simulation.
   and per-tier dynamic bind groups; all immutable mesh/material and pipeline
   resources survive capacity changes.
   Each material receives the count from its own compacted tier, keeping
-  its source index count. One compacted instance binding is shared by all materials in a tier. Call `renderer.set_camera(queue, camera)` before
+  its source index count. One compacted index binding is shared by all materials in a tier. Vertex
+  shaders dereference those frame-local u32 slots into the single original
+  candidate buffer. No copied 96-byte records are needed per bin. Call `renderer.set_camera(queue, camera)` before
   submission; inside the pass `renderer.draw(pass)` emits every tier's
   source materials and **one** composite 32-view impostor. One compute
   dispatch classifies all candidate objects regardless of mesh-tier or
