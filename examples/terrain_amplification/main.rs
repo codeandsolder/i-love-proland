@@ -1,6 +1,7 @@
 //! Regional terrain amplification A/B. An experimental heightfield generator,
 //! not yet a canonical planet surface or a reproduction of a published solver.
 mod directed;
+mod landscape;
 
 use std::{
     cmp::Ordering, collections::BinaryHeap, error::Error, fs, io, path::Path, time::Instant,
@@ -514,8 +515,39 @@ fn statistics(grid: &Grid, label: &str) {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let [map, output, biome, dem, mode] = args.as_slice() {
+        if mode != "natural" {
+            return Err("expected natural".into());
+        }
+        let output = Path::new(output);
+        fs::create_dir_all(output)?;
+        return landscape::run_natural(
+            &StockMap::read(Path::new(map))?,
+            Path::new(biome),
+            Path::new(dem),
+            output,
+        );
+    }
+    if let [map, output, biome, dem] = args.as_slice() {
+        let output = Path::new(output);
+        fs::create_dir_all(output)?;
+        return landscape::run_exemplars(
+            &StockMap::read(Path::new(map))?,
+            Path::new(biome),
+            Path::new(dem),
+            output,
+        );
+    }
+    if let [map, output, biome] = args.as_slice() {
+        let output = Path::new(output);
+        fs::create_dir_all(output)?;
+        return landscape::run(&StockMap::read(Path::new(map))?, Path::new(biome), output);
+    }
     let [map, output] = args.as_slice() else {
-        return Err("usage: terrain_amplification KERBIN_MAP OUTPUT_DIR".into());
+        return Err(
+            "usage: terrain_amplification KERBIN_MAP OUTPUT_DIR [BIOME_RGB [DEM_RAW [natural]]]"
+                .into(),
+        );
     };
     let output = Path::new(output);
     fs::create_dir_all(output)?;
