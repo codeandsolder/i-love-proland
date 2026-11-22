@@ -33,7 +33,7 @@ fn slope_region(slope: f64) -> io::Result<Region> {
         .collect::<io::Result<Vec<_>>>()?;
     Region::new(chart, cells, vec![])
 }
-fn body(position: [f32; 3], velocity: [f32; 3], count: u32) -> RigidBody {
+const fn body(position: [f32; 3], velocity: [f32; 3], count: u32) -> RigidBody {
     RigidBody {
         position: [position[0], position[1], position[2], 1.0],
         rotation: [0.0, 0.0, 0.0, 1.0],
@@ -170,7 +170,10 @@ fn check_presentation(
     }
     let final_state = physics.snapshot(device, &mut commands);
     queue.submit([commands.finish()]);
-    let mut pending: Vec<_> = snapshots.into_iter().map(|s| s.begin()).collect();
+    let mut pending: Vec<_> = snapshots
+        .into_iter()
+        .map(i_love_proland::terrain::gpu::RecordedReadback::begin)
+        .collect();
     let mut final_state = final_state.begin();
     device.poll(wgpu::PollType::wait_indefinitely())?;
     let poses = pending
@@ -194,7 +197,7 @@ fn check_presentation(
     Ok(())
 }
 
-pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = slope_region(0.0)?;
     let mut terrain = TerrainGpu::new(device, &region, 65, 1, 0, 0.0)?;
     let mut commands = encoder(device);
@@ -247,7 +250,7 @@ pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         },
     ];
     let mut lander = body([32.0, 32.0, 103.0], [1.0, 0.0, 0.0], 4);
-    lander.rotation = [0.09983342, 0.0, 0.0, 0.9950042];
+    lander.rotation = [0.099_833_42, 0.0, 0.0, 0.995_004_2];
     let (compound, _) = simulate(device, queue, &terrain, &[lander], &feet, 64)?;
     println!("GPU_PHYSICS landed={:?}", compound[0]);
     assert_eq!(compound[0].metadata, [0, 4, 0, 0]);
@@ -287,7 +290,8 @@ pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let result = result[0];
     assert_eq!(result.completed_tick(), start + 1440);
     assert_eq!(result.metadata[2], 0);
-    let distance = (result.position[2] - 100.0 - 0.1 * result.position[0]) / 1.01_f32.sqrt();
+    let distance =
+        0.1_f32.mul_add(-result.position[0], result.position[2] - 100.0) / 1.01_f32.sqrt();
     assert!(
         (distance - 0.5).abs() < 0.035,
         "slope contact distance {distance}"

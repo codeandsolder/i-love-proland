@@ -165,7 +165,7 @@ fn profile(device: &wgpu::Device, queue: &wgpu::Queue, region: &Region, side: u1
         .iter()
         .max_by(|a, b| a.a.width.total_cmp(&b.a.width));
     let center = reach.map_or([extent * 0.5; 2], |r| r.a.xy);
-    let center = center.map(|v| (v - span * 0.5).clamp(0.0, extent - span));
+    let center = center.map(|v| span.mul_add(-0.5, v).clamp(0.0, extent - span));
     #[expect(
         clippy::cast_possible_truncation,
         reason = "validated regional chart extent in integer ticks"
