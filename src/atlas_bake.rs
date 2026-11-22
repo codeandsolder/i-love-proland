@@ -219,7 +219,7 @@ fn render_view(surfaces: &[PreparedSurface<'_>], side: u16, azi: u16, elev: u16)
     clippy::cast_sign_loss,
     reason = "saturating clamp excludes negative values before u8 quantization"
 )]
-fn to_byte(value: f32) -> u8 {
+pub(crate) fn to_byte(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 

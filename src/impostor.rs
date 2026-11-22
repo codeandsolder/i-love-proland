@@ -4,6 +4,7 @@
 use crate::gpu::{CompactedBin, GpuCompactor, IndexedDraw};
 use crate::{
     Error, Result,
+    atlas_bake::to_byte,
     billboard::Billboard,
     material::{linear_to_srgb, srgb_to_linear},
     wind::{WindFrame, WindParameters},
@@ -202,9 +203,12 @@ impl AtlasImage {
     fn isolated_mips(&self) -> (u32, Vec<u8>) {
         let side = self.tile_size - 2 * self.gutter;
         let pitch = self.width() as usize;
-        let levels = u32::BITS - side.leading_zeros();
+        let levels = side.bit_width();
         let mut data = Vec::new();
-        let linear: [f32; 256] = core::array::from_fn(|i| srgb_to_linear(i as u8));
+        let mut linear = [0.0; 256];
+        for (slot, byte) in linear.iter_mut().zip(0..=u8::MAX) {
+            *slot = srgb_to_linear(byte);
+        }
         let mut base = Vec::with_capacity((side * side) as usize);
         for elevation in 0..ELEVATION_VIEWS {
             for azimuth in 0..AZIMUTH_VIEWS {
@@ -251,17 +255,20 @@ fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &m
                     let weight = f64::from(wx * wy);
                     let p = base[(sy * source_side + sx) as usize];
                     for (sum, channel) in sum.iter_mut().zip(p) {
-                        *sum += weight * f64::from(channel);
+                        *sum = weight.mul_add(f64::from(channel), *sum);
                     }
                 }
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "normalized area averages are converted to the f32 color transfer function before 8-bit quantization"
+            )]
             let average = sum.map(|v| (v * norm) as f32);
-            let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             data.extend_from_slice(&[
-                byte(linear_to_srgb(average[0])),
-                byte(linear_to_srgb(average[1])),
-                byte(linear_to_srgb(average[2])),
-                byte(average[3]),
+                to_byte(linear_to_srgb(average[0])),
+                to_byte(linear_to_srgb(average[1])),
+                to_byte(linear_to_srgb(average[2])),
+                to_byte(average[3]),
             ]);
         }
     }
@@ -1020,7 +1027,7 @@ mod tests {
                     assert_eq!((other, pixel[2]), (0, 0));
                     assert!((f64::from(srgb_to_linear(channel)) - alpha).abs() < 0.007);
                 }
-                mean /= size as f64;
+                mean /= f64::from((side >> level).pow(2));
                 assert!((mean - 1.0 / f64::from(side)).abs() <= 0.5 / 255.0 + 1e-9);
                 offset += size * 4;
             }
