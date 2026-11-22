@@ -38,16 +38,7 @@ fn ground_at(grid: &Grid, p: [f64; 2]) -> f64 {
     )
 }
 
-pub(in super::super) fn build(grid: &Grid, flow: &Rivers) -> io::Result<ChannelField> {
-    let mut inflow = vec![usize::MAX; flow.receiver.len()];
-    for (i, &j) in flow.receiver.iter().enumerate() {
-        if j == usize::MAX || flow.discharge[i] < MIN_DISCHARGE || grid.heights[i] <= 0.0 {
-            continue;
-        }
-        if inflow[j] == usize::MAX || flow.discharge[i] > flow.discharge[inflow[j]] {
-            inflow[j] = i;
-        }
-    }
+fn initial_sections(grid: &Grid, flow: &Rivers, inflow: &[usize]) -> Vec<Section> {
     // Filled heights are monotone along the receiver graph, and width
     // increases downstream. Subtracting a width-dependent incision
     // therefore yields a monotone water profile, including confluences.
@@ -56,7 +47,7 @@ pub(in super::super) fn build(grid: &Grid, flow: &Rivers) -> io::Result<ChannelF
         let stage = if grid.heights[i] <= 0.0 {
             0.0
         } else {
-            (flow.filled[i] - (1.4 + 0.043 * width)).max(0.0)
+            (flow.filled[i] - 0.043f64.mul_add(width, 1.4)).max(0.0)
         };
         Section {
             xy: xy(grid, i).map(|v| v * grid.spacing),
@@ -94,11 +85,15 @@ pub(in super::super) fn build(grid: &Grid, flow: &Rivers) -> io::Result<ChannelF
             let limit = grid.spacing * 0.9;
             let scale = (limit / norm(delta).max(1e-9)).min(1.0);
             node.xy = [
-                original[0] + delta[0] * scale,
-                original[1] + delta[1] * scale,
+                delta[0].mul_add(scale, original[0]),
+                delta[1].mul_add(scale, original[1]),
             ];
         }
     }
+    nodes
+}
+
+fn meander_sections(grid: &Grid, flow: &Rivers, inflow: &[usize], nodes: &mut [Section]) {
     // Integrate meander phase downstream-to-upstream so the
     // wavelength scales with discharge without phase jumps as width
     // changes. Branches share a phase at their confluence.
@@ -113,42 +108,45 @@ pub(in super::super) fn build(grid: &Grid, flow: &Rivers) -> io::Result<ChannelF
         phase[i] = phase[j]
             + norm(difference(nodes[i].xy, nodes[j].xy)) * std::f64::consts::TAU / wavelength;
     }
-    let coarse = nodes.clone();
-    for (i, node) in nodes.iter_mut().enumerate() {
-        let j = flow.receiver[i];
-        let k = inflow[i];
-        if j == usize::MAX
-            || k == usize::MAX
-            || flow.discharge[i] < MIN_DISCHARGE
-            || grid.heights[i] <= 0.0
-            || grid.heights[j] <= 0.0
+    let coarse = nodes.to_vec();
+    for (index, node) in nodes.iter_mut().enumerate() {
+        let downstream = flow.receiver[index];
+        let upstream = inflow[index];
+        if downstream == usize::MAX
+            || upstream == usize::MAX
+            || flow.discharge[index] < MIN_DISCHARGE
+            || grid.heights[index] <= 0.0
+            || grid.heights[downstream] <= 0.0
         {
             continue;
         }
-        let d = difference(coarse[j].xy, coarse[k].xy);
-        let span = norm(d).max(1.0);
-        let grade = (coarse[k].stage - coarse[j].stage).abs() / span;
-        let (x, y) = grid.coordinates(i);
+        let axis = difference(coarse[downstream].xy, coarse[upstream].xy);
+        let span = norm(axis).max(1.0);
+        let grade = (coarse[upstream].stage - coarse[downstream].stage).abs() / span;
+        let (x, y) = grid.coordinates(index);
         let [gx, gy] = super::super::gradient(grid, x, y);
         let slope = gx.hypot(gy);
         let flat = (1.0 - unit((grade - 0.006) / 0.055)) * (1.0 - unit((slope - 0.065) / 0.22));
-        let wavelength_phase = phase[i];
+        let wavelength_phase = phase[index];
         let amplitude = (node.width * 0.95).min(100.0) * flat;
         let offset = amplitude
-            * (0.76 * wavelength_phase.sin() + 0.24 * (wavelength_phase * 0.47 + 1.2).sin());
+            * 0.24f64.mul_add(
+                f64::mul_add(wavelength_phase, 0.47, 1.2).sin(),
+                0.76 * wavelength_phase.sin(),
+            );
         let target = [
-            node.xy[0] - offset * d[1] / span,
-            node.xy[1] + offset * d[0] / span,
+            node.xy[0] - offset * axis[1] / span,
+            node.xy[1] + offset * axis[0] / span,
         ];
         // Reject large excursions into opposing hillsides. This is
         // deliberately local and does not change the regional graph.
         let relief = ground_at(grid, target) - node.stage;
         let accept = unit((relief + 5.0) / 6.0) * (1.0 - unit((relief - 18.0) / 22.0));
         node.xy = mix(node.xy, target, accept);
-        node.width *= 1.0 + 0.12 * flat * (wavelength_phase * 1.7 + 0.5).sin();
+        node.width *= (0.12 * flat).mul_add(f64::mul_add(wavelength_phase, 1.7, 0.5).sin(), 1.0);
         node.width = node.width.clamp(3.0, 180.0);
     }
-    let moved = nodes.clone();
+    let moved = nodes.to_vec();
     for (i, node) in nodes.iter_mut().enumerate() {
         let j = flow.receiver[i];
         let k = inflow[i];
@@ -157,9 +155,23 @@ pub(in super::super) fn build(grid: &Grid, flow: &Rivers) -> io::Result<ChannelF
         }
         let a = difference(moved[i].xy, moved[k].xy);
         let b = difference(moved[j].xy, moved[i].xy);
-        let bend = (a[0] * b[1] - a[1] * b[0]) / (norm(a) * norm(b)).max(1.0);
+        let bend = a[1].mul_add(-b[0], a[0] * b[1]) / (norm(a) * norm(b)).max(1.0);
         node.bend = (bend * 2.5).clamp(-1.0, 1.0);
     }
+}
+
+pub(in super::super) fn build(grid: &Grid, flow: &Rivers) -> io::Result<ChannelField> {
+    let mut inflow = vec![usize::MAX; flow.receiver.len()];
+    for (i, &j) in flow.receiver.iter().enumerate() {
+        if j == usize::MAX || flow.discharge[i] < MIN_DISCHARGE || grid.heights[i] <= 0.0 {
+            continue;
+        }
+        if inflow[j] == usize::MAX || flow.discharge[i] > flow.discharge[inflow[j]] {
+            inflow[j] = i;
+        }
+    }
+    let mut nodes = initial_sections(grid, flow, &inflow);
+    meander_sections(grid, flow, &inflow, &mut nodes);
     let mut reaches = Vec::new();
     for (i, &j) in flow.receiver.iter().enumerate() {
         if j == usize::MAX || flow.discharge[i] < MIN_DISCHARGE || grid.heights[i] <= 0.0 {

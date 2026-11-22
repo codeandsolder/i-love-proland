@@ -31,8 +31,8 @@ impl FineCell {
         for j in 0..=subdiv {
             for i in 0..=subdiv {
                 let p = [
-                    f64::from(x) * grid.spacing + f64::from(i) * spacing,
-                    f64::from(y) * grid.spacing + f64::from(j) * spacing,
+                    f64::mul_add(f64::from(i), spacing, f64::from(x) * grid.spacing),
+                    f64::mul_add(f64::from(j), spacing, f64::from(y) * grid.spacing),
                 ];
                 // At the outer regional border sample the shared last vertex
                 // directly rather than asking the half-open sample domain.
@@ -71,8 +71,12 @@ impl FineCell {
 }
 
 fn bilinear(values: [f64; 4], u: f64, v: f64) -> f64 {
-    let [a, b, c, d] = values;
-    lerp(lerp(a, b, u), lerp(c, d, u), v)
+    let [southwest, southeast, northwest, northeast] = values;
+    lerp(
+        lerp(southwest, southeast, u),
+        lerp(northwest, northeast, u),
+        v,
+    )
 }
 
 fn hit_patch(
@@ -96,7 +100,7 @@ fn hit_patch(
     let c = eval(end);
     let middle = eval(start.midpoint(end));
     // gap(u)=quadratic*u²+linear*u+a, u in [0,1].
-    let quadratic = 2.0 * (a + c - 2.0 * middle);
+    let quadratic = 2.0 * 2.0f64.mul_add(-middle, a + c);
     let linear = c - a - quadratic;
     let mut upper = end;
     if quadratic > 0.0 {
@@ -136,10 +140,10 @@ fn walk<T>(
     origin: [f64; 2],
     spacing: f64,
     cells: u16,
-    start: f64,
-    end: f64,
+    interval: [f64; 2],
     mut visit: impl FnMut(u16, u16, f64, f64) -> Option<T>,
 ) -> Option<T> {
+    let [start, end] = interval;
     let mut cell: [i32; 2] = std::array::from_fn(|i| {
         let q = (ray[i].mul_add(start, eye[i]) - origin[i]) / spacing;
         let index = if ray[i] < 0.0 {
@@ -170,7 +174,7 @@ fn walk<T>(
                 return f64::INFINITY;
             }
             let edge = cell[i] + i32::from(direction[i] > 0);
-            (f64::from(edge) * spacing + origin[i] - eye[i]) / ray[i]
+            (f64::mul_add(f64::from(edge), spacing, origin[i]) - eye[i]) / ray[i]
         });
         let stop = next[0].min(next[1]).min(end).max(current);
         if stop > current {
@@ -236,8 +240,7 @@ impl<'a> ChannelMesh<'a> {
             [0.0; 2],
             grid.spacing,
             grid.cells,
-            start,
-            end,
+            [start, end],
             |x, y, t0, t1| {
                 let indices = [
                     grid.index(x, y),
@@ -258,8 +261,8 @@ impl<'a> ChannelMesh<'a> {
                     .into_iter()
                     .any(|(u, v)| {
                         channels.has_channel([
-                            origin[0] + u * grid.spacing,
-                            origin[1] + v * grid.spacing,
+                            f64::mul_add(u, grid.spacing, origin[0]),
+                            f64::mul_add(v, grid.spacing, origin[1]),
                         ])
                     });
                 if !active {
@@ -279,43 +282,51 @@ impl<'a> ChannelMesh<'a> {
                     .entry(indices[0])
                     .or_insert_with(|| FineCell::new(grid, surface, channels, x, y, subdiv));
                 let spacing = grid.spacing / f64::from(subdiv);
-                walk(eye, ray, origin, spacing, subdiv, t0, t1, |ix, iy, a, b| {
-                    let vertices = fine.patch(ix, iy);
-                    let corner = vertices.map(|v| v.top);
-                    if ray[2].mul_add(a, eye[2]).min(ray[2].mul_add(b, eye[2]))
-                        > corner.into_iter().fold(f64::NEG_INFINITY, f64::max)
-                    {
-                        return None;
-                    }
-                    let cell_origin = [
-                        origin[0] + f64::from(ix) * spacing,
-                        origin[1] + f64::from(iy) * spacing,
-                    ];
-                    let distance = hit_patch(corner, cell_origin, spacing, eye, ray, a, b)?;
-                    let p = [
-                        ray[0].mul_add(distance, eye[0]),
-                        ray[1].mul_add(distance, eye[1]),
-                    ];
-                    let sample = Sample::at(grid, p[0], p[1])?;
-                    let u = ((p[0] - cell_origin[0]) / spacing).clamp(0.0, 1.0);
-                    let v = ((p[1] - cell_origin[1]) / spacing).clamp(0.0, 1.0);
-                    let mut weather = weather_at(grid, surface, channels, &sample, p);
-                    let bed = vertices.map(|v| v.bed);
-                    weather.bed = bilinear(bed, u, v);
-                    let top = bilinear(corner, u, v);
-                    weather.depth = (top - weather.bed).max(0.0);
-                    weather.water = (weather.depth > 0.025).then_some(top);
-                    let [a, b, c, d] = bed;
-                    let dx = lerp(b - a, d - c, v) / spacing;
-                    let dy = lerp(c - a, d - b, u) / spacing;
-                    let normal = normalize([-dx, -dy, 1.0]);
-                    Some(Hit {
-                        sample,
-                        distance,
-                        weather,
-                        normal: Some(normal),
-                    })
-                })
+                walk(
+                    eye,
+                    ray,
+                    origin,
+                    spacing,
+                    subdiv,
+                    [t0, t1],
+                    |ix, iy, a, b| {
+                        let vertices = fine.patch(ix, iy);
+                        let corner = vertices.map(|v| v.top);
+                        if ray[2].mul_add(a, eye[2]).min(ray[2].mul_add(b, eye[2]))
+                            > corner.into_iter().fold(f64::NEG_INFINITY, f64::max)
+                        {
+                            return None;
+                        }
+                        let cell_origin = [
+                            f64::mul_add(f64::from(ix), spacing, origin[0]),
+                            f64::mul_add(f64::from(iy), spacing, origin[1]),
+                        ];
+                        let distance = hit_patch(corner, cell_origin, spacing, eye, ray, a, b)?;
+                        let p = [
+                            ray[0].mul_add(distance, eye[0]),
+                            ray[1].mul_add(distance, eye[1]),
+                        ];
+                        let sample = Sample::at(grid, p[0], p[1])?;
+                        let u = ((p[0] - cell_origin[0]) / spacing).clamp(0.0, 1.0);
+                        let v = ((p[1] - cell_origin[1]) / spacing).clamp(0.0, 1.0);
+                        let mut weather = weather_at(grid, surface, channels, &sample, p);
+                        let bed = vertices.map(|v| v.bed);
+                        weather.bed = bilinear(bed, u, v);
+                        let top = bilinear(corner, u, v);
+                        weather.depth = (top - weather.bed).max(0.0);
+                        weather.water = (weather.depth > 0.025).then_some(top);
+                        let [southwest, southeast, northwest, northeast] = bed;
+                        let dx = lerp(southeast - southwest, northeast - northwest, v) / spacing;
+                        let dy = lerp(northwest - southwest, northeast - southeast, u) / spacing;
+                        let normal = normalize([-dx, -dy, 1.0]);
+                        Some(Hit {
+                            sample,
+                            distance,
+                            weather,
+                            normal: Some(normal),
+                        })
+                    },
+                )
             },
         )
     }
@@ -354,8 +365,7 @@ mod tests {
             [0.0, 0.0],
             1.0,
             2,
-            0.0,
-            2.0,
+            [0.0, 2.0],
             |x, y, a, b| {
                 seen.push((x, y, a, b));
                 None

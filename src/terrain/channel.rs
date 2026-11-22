@@ -37,7 +37,8 @@ fn sediment_variation(p: [f64; 2], scale: f64, seed: u64) -> f64 {
             seed ^ u64::from(u32::from_ne_bytes((x + dx).to_ne_bytes())).rotate_left(19)
                 ^ u64::from(u32::from_ne_bytes((y + dy).to_ne_bytes())).rotate_left(47),
         );
-        f64::from(u32::try_from(key >> 32).unwrap_or_default()) / f64::from(u32::MAX) * 2.0 - 1.0
+        (f64::from(u32::try_from(key >> 32).unwrap_or_default()) / f64::from(u32::MAX))
+            .mul_add(2.0, -1.0)
     };
     let [tx, ty] = q.map(|v| unit(v - v.floor()));
     lerp(
@@ -56,6 +57,7 @@ pub struct Section {
 }
 
 impl Section {
+    #[must_use = "Use the interpolated channel section"]
     pub fn mix(self, other: Self, t: f64) -> Self {
         Self {
             xy: mix(self.xy, other.xy, t),
@@ -89,6 +91,7 @@ pub struct Weathered {
 }
 
 impl Weathered {
+    #[must_use = "Use the computed visible surface height"]
     pub fn elevation(self) -> f64 {
         self.water.map_or(self.bed, |w| self.bed.max(w))
     }
@@ -101,8 +104,21 @@ pub struct ChannelField {
     side: usize,
 }
 
+struct Profile {
+    radius: f64,
+    stage: f64,
+    valley: f64,
+    inner: f64,
+    outer: f64,
+    sediment: f64,
+    cross: f64,
+}
+
 impl ChannelField {
     /// Build an index of validated reaches for a finite square chart.
+    ///
+    /// # Errors
+    /// Returns invalid-data errors for invalid chart extent or nonfinite or out-of-range reach parameters.
     pub fn new(extent: f64, reaches: Vec<Reach>) -> io::Result<Self> {
         if !(1.0..=250_000.0).contains(&extent)
             || reaches.len() > 1_000_000
@@ -134,13 +150,13 @@ impl ChannelField {
             side,
         };
         for (i, reach) in result.reaches.iter().enumerate() {
-            let radius = reach.a.width.max(reach.b.width) * 0.5;
-            let margin = radius * 1.2
-                + 1.8 * (10.0 + 0.48 * radius * 1.2 + 24.0 * reach.valley)
-                + 25.0
-                + radius * 1.2 * (0.6 + 2.0 * reach.valley)
-                + 100.0 * reach.valley
-                + 20.0;
+            let radius = reach.a.width.max(reach.b.width) * 0.6;
+            let bank = 24.0_f64.mul_add(reach.valley, 0.48_f64.mul_add(radius, 10.0));
+            let terrace = 100.0_f64.mul_add(
+                reach.valley,
+                radius.mul_add(2.0_f64.mul_add(reach.valley, 0.6), 25.0),
+            );
+            let margin = 1.8_f64.mul_add(bank, radius + terrace + 20.0);
             let [xmin, ymin] =
                 std::array::from_fn(|c| result.bin(reach.a.xy[c].min(reach.b.xy[c]) - margin));
             let [xmax, ymax] =
@@ -155,6 +171,7 @@ impl ChannelField {
     }
 
     /// Return the original directed segments, in deterministic graph order.
+    #[must_use = "Use the directed channel segments"]
     pub fn reaches(&self) -> &[Reach] {
         &self.reaches
     }
@@ -175,32 +192,25 @@ impl ChannelField {
         let delta = difference(p, reach.a.xy);
         let length_sq = d[0].mul_add(d[0], d[1] * d[1]).max(1e-9);
         let t = (delta[0].mul_add(d[0], delta[1] * d[1]) / length_sq).clamp(0.0, 1.0);
-        let dx = delta[0] - t * d[0];
-        let dy = delta[1] - t * d[1];
+        let dx = t.mul_add(-d[0], delta[0]);
+        let dy = t.mul_add(-d[1], delta[1]);
         (dx.mul_add(dx, dy * dy), t)
     }
 
     pub const MAX_RAISE: f64 = 6.0;
 
-    pub fn at(&self, p: [f64; 2], base: f64) -> Weathered {
-        let candidates = self.candidates(p);
-        if candidates.is_empty() || base <= 0.0 {
-            return Weathered {
-                bed: base,
-                ..Weathered::default()
-            };
+    fn profile(&self, point: [f64; 2]) -> Option<Profile> {
+        let candidates = self.candidates(point);
+        if candidates.is_empty() {
+            return None;
         }
         let nearest = candidates
             .iter()
-            .map(|&i| Self::projection(self.reaches[i], p).0)
+            .map(|&i| Self::projection(self.reaches[i], point).0)
             .fold(f64::INFINITY, f64::min)
             .sqrt();
-        let mut result = Weathered {
-            bed: base,
-            ..Weathered::default()
-        };
-        if nearest >= MAX_REACH || base <= 0.0 {
-            return result;
+        if nearest >= MAX_REACH {
+            return None;
         }
         // Smoothly interpolate competing reaches within a short distance of
         // the closest centerline point. At segment joins this avoids a
@@ -211,91 +221,138 @@ impl ChannelField {
             width: 0.0,
             bend: 0.0,
         };
-        let mut valley = 0.0;
+        let mut valley = 0.0_f64;
         let mut tangent = [0.0; 2];
         let mut sum = 0.0;
-        for &i in candidates {
-            let r = self.reaches[i];
-            let (d2, t) = Self::projection(r, p);
-            if d2 > (nearest + 18.0).powi(2) {
+        for &index in candidates {
+            let reach = self.reaches[index];
+            let (distance_sq, fraction) = Self::projection(reach, point);
+            if distance_sq > (nearest + 18.0).powi(2) {
                 continue;
             }
-            let distance = d2.sqrt();
-            let s = r.a.mix(r.b, t);
-            let blend = (s.width * 0.16).clamp(4.0, 18.0);
+            let distance = distance_sq.sqrt();
+            let sample = reach.a.mix(reach.b, fraction);
+            let blend = (sample.width * 0.16).clamp(4.0, 18.0);
             let weight = 1.0 - unit((distance - nearest) / blend);
             if weight == 0.0 {
                 continue;
             }
             // Length weighting limits sensitivity to curve tessellation.
-            let w = weight * norm(difference(r.a.xy, r.b.xy)).max(0.01);
-            sum += w;
-            section.stage += w * s.stage;
-            section.xy[0] += w * s.xy[0];
-            section.xy[1] += w * s.xy[1];
-            section.bend += w * s.bend;
-            let direction = difference(r.b.xy, r.a.xy);
-            let length = norm(direction).max(1e-6);
-            tangent[0] += w * direction[0] / length;
-            tangent[1] += w * direction[1] / length;
-            section.width += w * s.width;
-            valley += w * r.valley;
+            let direction = difference(reach.b.xy, reach.a.xy);
+            let length = norm(direction);
+            let weighted_length = weight * length.max(0.01);
+            sum += weighted_length;
+            section.stage = weighted_length.mul_add(sample.stage, section.stage);
+            section.xy[0] = weighted_length.mul_add(sample.xy[0], section.xy[0]);
+            section.xy[1] = weighted_length.mul_add(sample.xy[1], section.xy[1]);
+            section.bend = weighted_length.mul_add(sample.bend, section.bend);
+            let length = length.max(1e-6);
+            tangent[0] = (weighted_length / length).mul_add(direction[0], tangent[0]);
+            tangent[1] = (weighted_length / length).mul_add(direction[1], tangent[1]);
+            section.width = weighted_length.mul_add(sample.width, section.width);
+            valley = weighted_length.mul_add(reach.valley, valley);
         }
         if sum == 0.0 {
-            return result;
+            return None;
         }
         let radius = section.width / (2.0 * sum);
         let stage = section.stage / sum;
         let valley = valley / sum;
         let center = section.xy.map(|v| v / sum);
         let tangent = tangent.map(|v| v / norm(tangent).max(1e-9));
-        let delta = difference(p, center);
-        let signed = (tangent[0] * delta[1] - tangent[1] * delta[0]) / radius.max(1.0);
+        let delta = difference(point, center);
+        let signed = tangent[0].mul_add(delta[1], -tangent[1] * delta[0]) / radius.max(1.0);
         let side = signed.clamp(-1.0, 1.0);
         let bend = (section.bend / sum) * side * valley;
         let inner = bend.max(0.0);
         let outer = (-bend).max(0.0);
-        let sediment = sediment_variation(p, 65.0, 0x534544);
-        let radius = radius * (1.0 - 0.27 * inner + 0.13 * outer + 0.06 * sediment);
-        let cross = nearest;
-        let bank_width = (10.0 + 0.48 * radius + 24.0 * valley) * (1.0 + 0.8 * inner - 0.3 * outer);
-        let terrace_width = 25.0 + radius * (0.6 + 2.0 * valley) + 100.0 * valley;
+        let sediment = sediment_variation(point, 65.0, 0x53_45_44);
+        Some(Profile {
+            radius,
+            stage,
+            valley,
+            inner,
+            outer,
+            sediment,
+            cross: nearest,
+        })
+    }
+
+    /// Sample the channel-conditioned solid ground and separate liquid stage.
+    #[must_use = "Use the weathered bed and water stage"]
+    pub fn at(&self, point: [f64; 2], base: f64) -> Weathered {
+        let mut result = Weathered {
+            bed: base,
+            ..Weathered::default()
+        };
+        if base <= 0.0 {
+            return result;
+        }
+        let Some(Profile {
+            radius,
+            stage,
+            valley,
+            inner,
+            outer,
+            sediment,
+            cross,
+        }) = self.profile(point)
+        else {
+            return result;
+        };
+        let radius = radius
+            * 0.06f64.mul_add(
+                sediment,
+                0.13f64.mul_add(outer, 0.27f64.mul_add(-inner, 1.0)),
+            );
+        let bank_width = 24.0f64.mul_add(valley, 0.48f64.mul_add(radius, 10.0))
+            * 0.3f64.mul_add(-outer, 0.8f64.mul_add(inner, 1.0));
+        let terrace_width = 100.0f64.mul_add(
+            valley,
+            f64::mul_add(radius, 2.0f64.mul_add(valley, 0.6), 25.0),
+        );
         let reach = radius + bank_width + terrace_width;
         if cross >= reach {
             return result;
         }
         // A continuous incised bed joins the free surface at its banks;
         // the outer profile grades into a floodplain or narrow rock terrace.
-        let depth = (0.65 + 0.068 * radius) * (1.0 + 0.35 * outer - 0.35 * inner);
-        let rise = (2.0 + 0.08 * radius) * (1.0 + 0.65 * outer - 0.45 * inner);
+        let depth =
+            0.068f64.mul_add(radius, 0.65) * 0.35f64.mul_add(-inner, 0.35f64.mul_add(outer, 1.0));
+        let rise =
+            0.08f64.mul_add(radius, 2.0) * 0.45f64.mul_add(-inner, 0.65f64.mul_add(outer, 1.0));
         let u = cross / radius;
         // Inner bends accumulate a shelving point bar that can emerge at
         // ordinary water level. Outside bends retain deeper scour.
         let bar_shelf = inner * unit((u - 0.38) / 0.47) * (1.0 - unit((u - 0.94) / 0.06));
-        let sediment_fine = sediment_variation(p, 13.0, 0x524950);
+        let sediment_fine = sediment_variation(point, 13.0, 0x52_49_50);
         let target = if cross <= radius {
-            stage - depth * (1.0 - u.powf(3.5 + 2.0 * outer - 2.2 * inner))
-                + depth * 0.78 * bar_shelf * (1.0 + 0.22 * sediment)
-                + 0.32 * bar_shelf * sediment_fine
+            let exponent = 2.2_f64.mul_add(-inner, 2.0_f64.mul_add(outer, 3.5));
+            let thalweg = depth.mul_add(u.powf(exponent) - 1.0, stage);
+            let bar_deposit = depth * 0.78 * bar_shelf;
+            let deposited = bar_deposit.mul_add(0.22_f64.mul_add(sediment, 1.0), thalweg);
+            (0.32 * bar_shelf).mul_add(sediment_fine, deposited)
         } else {
             let lateral = (cross - radius) / bank_width;
             let bar = inner * (1.0 - unit((lateral - 0.3).abs() / 0.8));
-            stage
-                + rise * unit(lateral)
-                + 0.018 * (cross - radius - bank_width).max(0.0)
-                + 0.9 * bar * unit(lateral * 3.0)
-                + (0.3 + 0.65 * valley) * sediment * unit(lateral) * (1.0 - unit(lateral / 4.0))
-                + (0.35 + 0.5 * outer)
-                    * sediment_fine
-                    * unit(lateral * 3.0)
-                    * (1.0 - unit(lateral / 3.0))
+            let bank_height = rise.mul_add(unit(lateral), stage);
+            let terrace = 0.018_f64.mul_add((cross - radius - bank_width).max(0.0), bank_height);
+            let with_bar = (0.9 * bar).mul_add(unit(lateral * 3.0), terrace);
+            let sediment_coarse = 0.65_f64.mul_add(valley, 0.3) * sediment * unit(lateral);
+            let with_coarse = sediment_coarse.mul_add(1.0 - unit(lateral / 4.0), with_bar);
+            let fine = 0.5_f64.mul_add(outer, 0.35) * sediment_fine * unit(lateral * 3.0);
+            fine.mul_add(1.0 - unit(lateral / 3.0), with_coarse)
         };
         let support = 1.0 - unit((cross - radius - bank_width) / terrace_width);
         let local = lerp(base, target, support);
-        result.bed = local.clamp(base - 42.0 * support, base + Self::MAX_RAISE * support);
+        result.bed = local.clamp(
+            42.0f64.mul_add(-support, base),
+            f64::mul_add(Self::MAX_RAISE, support, base),
+        );
         result.bank = (1.0 - unit((cross - radius).abs() / bank_width)) * support;
-        result.gravel =
-            (1.0 - unit((cross - radius - bank_width * 0.45).abs() / (bank_width * 1.4))) * support;
+        result.gravel = (1.0
+            - unit(f64::mul_add(bank_width, -0.45, cross - radius).abs() / (bank_width * 1.4)))
+            * support;
         result.point_bar = (inner * result.gravel).max(bar_shelf);
         result.gravel = result.gravel.max(bar_shelf);
         result.scour = outer * result.bank;
@@ -309,6 +366,7 @@ impl ChannelField {
         result
     }
 
+    #[must_use = "Use the broad-phase channel query to select candidate regions"]
     pub fn has_channel(&self, p: [f64; 2]) -> bool {
         !self.candidates(p).is_empty()
     }

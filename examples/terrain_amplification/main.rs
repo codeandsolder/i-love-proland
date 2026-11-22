@@ -80,7 +80,7 @@ fn smooth(t: f64) -> f64 {
     t * t * 2.0_f64.mul_add(-t, 3.0)
 }
 
-fn hash(mut key: u64) -> u64 {
+const fn hash(mut key: u64) -> u64 {
     key = (key ^ (key >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     key = (key ^ (key >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     key ^ (key >> 31)
@@ -124,7 +124,9 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 
 fn midpoint(a: f64, b: f64, c: f64, d: f64) -> f64 {
     // Cubic interpolation clamped to the enclosing samples (no new extrema).
-    ((b + c) * 0.5625 - (a + d) * 0.0625).clamp(b.min(c), b.max(c))
+    (a + d)
+        .mul_add(-0.0625, (b + c) * 0.5625)
+        .clamp(b.min(c), b.max(c))
 }
 
 fn upsample(parent: &Grid, seed: u64, amplitude: f64) -> Grid {
@@ -156,10 +158,8 @@ fn upsample(parent: &Grid, seed: u64, amplitude: f64) -> Grid {
                 )
             };
             let i = child.index(x, y);
-            child.heights[i] = h + noise(seed, x, y)
-                * amplitude
-                * child.boundary_weight(x, y)
-                * (h / 100.0).clamp(0.0, 1.0);
+            child.heights[i] = (noise(seed, x, y) * amplitude * child.boundary_weight(x, y))
+                .mul_add((h / 100.0).clamp(0.0, 1.0), h);
         }
     }
     child
@@ -228,7 +228,7 @@ impl Drainage {
                 }
             }
         }
-        let mut area = vec![1.0; n];
+        let mut area: Vec<f64> = vec![1.0; n];
         let mut slope = vec![0.0; n];
         // Multiple-flow-direction routing across strictly descending filled
         // slopes; flats follow their priority-flood parent. Reverse flood
@@ -247,8 +247,9 @@ impl Drainage {
                 let mut mean = 0.0;
                 for (j, d) in grid.neighbors(i) {
                     let fraction = weight(j, d) / total;
-                    area[j] += upstream * fraction;
-                    mean += fraction * ((grid.heights[i] - grid.heights[j]) / d).max(0.0);
+                    area[j] = upstream.mul_add(fraction, area[j]);
+                    mean =
+                        fraction.mul_add(((grid.heights[i] - grid.heights[j]) / d).max(0.0), mean);
                 }
                 slope[i] = mean;
             } else {
@@ -293,7 +294,7 @@ fn erode(grid: &mut Grid, steps: u32) {
                     * (flow.area[i] * 0.25).powf(0.42)
                     * flow.slope[i].sqrt())
                 .min(0.2 * grid.spacing);
-                change[i] -= w * incision.min(height);
+                change[i] = w.mul_add(-incision.min(height), change[i]);
             }
             // Conservative pairwise talus relaxation across land cells;
             // each pair visited once and fixed boundary stays fixed.
@@ -304,7 +305,7 @@ fn erode(grid: &mut Grid, steps: u32) {
                 let (jx, jy) = grid.coordinates(j);
                 let pair_weight = w.min(grid.boundary_weight(jx, jy));
                 let delta = height - grid.heights[j];
-                let excess = (delta.abs() - 0.40 * d).max(0.0);
+                let excess = 0.40f64.mul_add(-d, delta.abs()).max(0.0);
                 let flux = pair_weight * 0.05 * excess.copysign(delta);
                 change[i] -= flux;
                 change[j] += flux;
@@ -370,9 +371,11 @@ impl StockMap {
         })
     }
     fn at(&self, x: u16, y: u16) -> f64 {
-        f64::from(self.values[usize::from(y) * usize::from(self.width) + usize::from(x)])
-            * (5000.0 / 255.0)
-            - 1500.0
+        f64::mul_add(
+            f64::from(self.values[usize::from(y) * usize::from(self.width) + usize::from(x)]),
+            5000.0 / 255.0,
+            -1500.0,
+        )
     }
     fn sample(&self, x: f64, y: f64) -> f64 {
         let x = x.rem_euclid(f64::from(self.width));
@@ -412,7 +415,7 @@ impl StockMap {
                     }
                 }
                 let score = if low > 100.0 {
-                    (high - low) + sum / count * 0.3
+                    f64::mul_add(sum / count, 0.3, high - low)
                 } else {
                     f64::NEG_INFINITY
                 };
@@ -451,7 +454,8 @@ fn shade(grid: &Grid, x: u16, y: u16) -> [u8; 3] {
     let gx = (grid.at(xp, y) - grid.at(xm, y)) / (f64::from(xp - xm) * grid.spacing);
     let gy = (grid.at(x, yp) - grid.at(x, ym)) / (f64::from(yp - ym) * grid.spacing);
     let steepness = gx.hypot(gy);
-    let illumination = (0.68 + 0.48 * gx - 0.56 * gy) / (1.0 + steepness * steepness).sqrt();
+    let illumination =
+        0.56f64.mul_add(-gy, 0.48f64.mul_add(gx, 0.68)) / steepness.mul_add(steepness, 1.0).sqrt();
     let rock = smooth(((steepness - 0.15) / 0.65).clamp(0.0, 1.0));
     let alpine = smooth(((h - 2200.0) / 900.0).clamp(0.0, 1.0));
     let base = [
@@ -459,7 +463,7 @@ fn shade(grid: &Grid, x: u16, y: u16) -> [u8; 3] {
         lerp(119.0, 148.0, rock),
         lerp(72.0, 119.0, rock),
     ];
-    let brightness = 0.28 + 0.85 * illumination.max(0.0);
+    let brightness = 0.85f64.mul_add(illumination.max(0.0), 0.28);
     base.map(|c| {
         let value = if h <= 0.0 {
             70.0
@@ -496,7 +500,7 @@ fn statistics(grid: &Grid, label: &str) {
         let (x, y) = grid.coordinates(i);
         let dx = (grid.at((x + 1).min(grid.cells), y) - h) / grid.spacing;
         let dy = (grid.at(x, (y + 1).min(grid.cells)) - h) / grid.spacing;
-        gradient_sq += dx * dx + dy * dy;
+        gradient_sq += dy.mul_add(dy, dx * dx);
         if flow.filled[i] > h + 1.0 {
             pit_area += 1.0;
         }

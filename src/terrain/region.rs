@@ -36,6 +36,7 @@ pub struct RegionChart {
 }
 
 impl RegionChart {
+    #[must_use = "Use the chart extent for addressing"]
     pub fn extent(self) -> f64 {
         self.spacing_m * f64::from(self.cells)
     }
@@ -54,8 +55,11 @@ impl RegionChart {
     }
     /// Same tangent-metric chart used by the regional terrain generator:
     /// X increases west, Y increases north. No render tile identity enters it.
+    #[must_use = "Use the chart coordinates for terrain sampling"]
     pub fn project(self, direction: [f64; 3]) -> Option<[f64; 2]> {
-        if !direction.iter().all(|v| v.is_finite()) || direction == [0.0; 3] {
+        if !direction.iter().all(|v| v.is_finite())
+            || direction.iter().all(|&component| component == 0.0)
+        {
             return None;
         }
         let latitude = direction[1].atan2(direction[0].hypot(direction[2]));
@@ -71,13 +75,15 @@ impl RegionChart {
     }
 
     /// Inverse chart projection, convenient for tile/point validation.
-    pub fn direction(self, p: [f64; 2]) -> [f64; 3] {
+    #[must_use = "Use the body-fixed direction"]
+    pub fn direction(self, point: [f64; 2]) -> [f64; 3] {
         let half = self.extent() * 0.5;
-        let lat = (p[1] - half) / self.radius_m + self.latitude_rad;
-        let lon = self.longitude_rad - (p[0] - half) / (self.radius_m * self.latitude_rad.cos());
-        let (s, c) = lat.sin_cos();
-        let (z, x) = lon.sin_cos();
-        [c * x, s, c * z]
+        let lat = (point[1] - half) / self.radius_m + self.latitude_rad;
+        let lon =
+            self.longitude_rad - (point[0] - half) / (self.radius_m * self.latitude_rad.cos());
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        let (sin_lon, cos_lon) = lon.sin_cos();
+        [cos_lat * cos_lon, sin_lat, cos_lat * sin_lon]
     }
 }
 
@@ -91,6 +97,9 @@ pub struct RegionCell {
 impl RegionCell {
     /// The 0.25m quantization covers -8191.75 to +8191.75 m. Reject
     /// out-of-range inputs rather than silently distorting the geography.
+    ///
+    /// # Errors
+    /// Returns invalid data for heights outside the quantization range or invalid RGB.
     pub fn new(height: f64, lake: Option<f64>, rgb: [f64; 3]) -> io::Result<Self> {
         fn quantize(v: f64) -> io::Result<i16> {
             let q = (v / QUANTUM).round();
@@ -137,7 +146,20 @@ pub struct Region {
     max_elevation: f64,
 }
 
+fn read_section(input: &mut impl Read) -> io::Result<Section> {
+    Ok(Section {
+        xy: [read_f64(input)?, read_f64(input)?],
+        stage: read_f64(input)?,
+        width: read_f64(input)?,
+        bend: read_f64(input)?,
+    })
+}
+
 impl Region {
+    /// Construct a validated immutable regional surface.
+    ///
+    /// # Errors
+    /// Returns invalid data for bad chart, cell count or channel geometry.
     pub fn new(
         chart: RegionChart,
         cells: Vec<RegionCell>,
@@ -160,27 +182,32 @@ impl Region {
         })
     }
 
-    pub fn chart(&self) -> RegionChart {
+    #[must_use = "Use the chart coordinate system"]
+    pub const fn chart(&self) -> RegionChart {
         self.chart
     }
-    pub fn max_elevation(&self) -> f64 {
+    #[must_use = "Use the conservative terrain bound"]
+    pub const fn max_elevation(&self) -> f64 {
         self.max_elevation
     }
+    #[must_use = "Use the directed channel segments"]
     pub fn reaches(&self) -> &[Reach] {
         self.channels.reaches()
     }
 
     /// Canonical body-fixed query, with no allocation or mutable cache.
+    #[must_use = "Use the canonical terrain sample"]
     pub fn sample(&self, direction: [f64; 3]) -> Option<RegionSample> {
         let p = self.chart.project(direction)?;
         self.sample_chart(p)
     }
-    pub fn sample_chart(&self, p: [f64; 2]) -> Option<RegionSample> {
+    #[must_use = "Use the canonical terrain sample"]
+    pub fn sample_chart(&self, point: [f64; 2]) -> Option<RegionSample> {
         let extent = self.chart.extent();
-        if !p.iter().all(|&v| (0.0..=extent).contains(&v)) {
+        if !point.iter().all(|&v| (0.0..=extent).contains(&v)) {
             return None;
         }
-        let q = p.map(|v| v / self.chart.spacing_m);
+        let grid = point.map(|v| v / self.chart.spacing_m);
         #[expect(
             clippy::cast_possible_truncation,
             reason = "coordinates bounded by the chart's u16 cell count"
@@ -189,23 +216,27 @@ impl Region {
             clippy::cast_sign_loss,
             reason = "validated nonnegative chart coordinates"
         )]
-        let [x, y] = q.map(|v| v.floor() as u16);
-        let x = x.min(self.chart.cells - 1);
-        let y = y.min(self.chart.cells - 1);
+        let [column, row] = grid.map(|v| v.floor() as u16);
+        let column = column.min(self.chart.cells - 1);
+        let row = row.min(self.chart.cells - 1);
         let side = usize::from(self.chart.cells) + 1;
-        let i = usize::from(y) * side + usize::from(x);
+        let index = usize::from(row) * side + usize::from(column);
         let points = [
-            self.cells[i],
-            self.cells[i + 1],
-            self.cells[i + side],
-            self.cells[i + side + 1],
+            self.cells[index],
+            self.cells[index + 1],
+            self.cells[index + side],
+            self.cells[index + side + 1],
         ];
-        let [tx, ty] = [q[0] - f64::from(x), q[1] - f64::from(y)];
+        let [tx, ty] = [grid[0] - f64::from(column), grid[1] - f64::from(row)];
         let interpolate = |f: &dyn Fn(RegionCell) -> f64| {
-            let [a, b, c, d] = points.map(f);
-            lerp(lerp(a, b, tx), lerp(c, d, tx), ty)
+            let [southwest, southeast, northwest, northeast] = points.map(f);
+            lerp(
+                lerp(southwest, southeast, tx),
+                lerp(northwest, northeast, tx),
+                ty,
+            )
         };
-        let h = interpolate(&|c| f64::from(c.height) * QUANTUM);
+        let height = interpolate(&|c| f64::from(c.height) * QUANTUM);
         let water = interpolate(&|c| {
             let ground = f64::from(c.height) * QUANTUM;
             if c.lake == NO_LAKE {
@@ -214,15 +245,15 @@ impl Region {
                 ground.max(f64::from(c.lake) * QUANTUM)
             }
         });
-        let weather = if water > h + 0.02 {
+        let weather = if water > height + 0.02 {
             Weathered {
-                bed: h,
+                bed: height,
                 water: Some(water),
-                depth: water - h,
+                depth: water - height,
                 ..Weathered::default()
             }
         } else {
-            self.channels.at(p, h)
+            self.channels.at(point, height)
         };
         let rgb = std::array::from_fn(|i| {
             let base = interpolate(&|c| f64::from(c.rgb[i]) / 255.0);
@@ -230,15 +261,22 @@ impl Region {
             let alluvium = lerp(
                 vegetated,
                 [0.50, 0.465, 0.385][i],
-                (0.25 * weather.gravel + 0.65 * weather.point_bar).clamp(0.0, 1.0),
+                0.65f64
+                    .mul_add(weather.point_bar, 0.25 * weather.gravel)
+                    .clamp(0.0, 1.0),
             );
             lerp(
                 alluvium,
                 [0.25, 0.245, 0.20][i],
-                (0.22 * weather.bank + 0.28 * weather.scour).clamp(0.0, 1.0),
+                0.28f64
+                    .mul_add(weather.scour, 0.22 * weather.bank)
+                    .clamp(0.0, 1.0),
             )
         });
-        let edge = p[0].min(p[1]).min(extent - p[0]).min(extent - p[1]);
+        let edge = point[0]
+            .min(point[1])
+            .min(extent - point[0])
+            .min(extent - point[1]);
         let t = (edge / 4000.0_f64.min(extent * 0.25)).clamp(0.0, 1.0);
         let weight = t * t * 2.0_f64.mul_add(-t, 3.0);
         Some(RegionSample {
@@ -249,6 +287,9 @@ impl Region {
     }
 
     /// Little-endian, versioned format. No machine-dependent struct layout.
+    ///
+    /// # Errors
+    /// Propagates write failures.
     pub fn write(&self, mut out: impl Write) -> io::Result<()> {
         out.write_all(MAGIC)?;
         for v in [
@@ -281,6 +322,10 @@ impl Region {
         Ok(())
     }
 
+    /// Decode and validate one complete regional asset.
+    ///
+    /// # Errors
+    /// Rejects invalid, truncated or trailing data and out-of-range chart or channel geometry.
     pub fn read(bytes: &[u8]) -> io::Result<Self> {
         let mut input = Cursor::new(bytes);
         if &read_array::<8>(&mut input)? != MAGIC {
@@ -316,18 +361,10 @@ impl Region {
             });
         }
         let mut reaches = Vec::with_capacity(count);
-        fn section(input: &mut impl Read) -> io::Result<Section> {
-            Ok(Section {
-                xy: [read_f64(input)?, read_f64(input)?],
-                stage: read_f64(input)?,
-                width: read_f64(input)?,
-                bend: read_f64(input)?,
-            })
-        }
         for _ in 0..count {
             reaches.push(Reach {
-                a: section(&mut input)?,
-                b: section(&mut input)?,
+                a: read_section(&mut input)?,
+                b: read_section(&mut input)?,
                 valley: read_f64(&mut input)?,
             });
         }

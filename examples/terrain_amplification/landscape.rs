@@ -51,7 +51,9 @@ impl Biomes {
             ));
         }
         let labels = bytes
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|p| {
                 PALETTE
                     .iter()
@@ -99,11 +101,11 @@ impl Biomes {
 }
 
 fn blur(grid: &Grid, input: &[f64], passes: u32) -> Vec<f64> {
-    let mut a = input.to_vec();
-    let mut b = vec![0.0; a.len()];
+    let mut source = input.to_vec();
+    let mut destination = vec![0.0; source.len()];
     for _ in 0..passes {
         for horizontal in [true, false] {
-            for (i, v) in b.iter_mut().enumerate() {
+            for (i, v) in destination.iter_mut().enumerate() {
                 let (x, y) = grid.coordinates(i);
                 let (x, y) = (i32::from(x), i32::from(y));
                 *v = (-2..=2)
@@ -126,14 +128,14 @@ fn blur(grid: &Grid, input: &[f64], passes: u32) -> Vec<f64> {
                         } else {
                             grid.index(clamp(x), clamp(y + d))
                         };
-                        a[j] * w / 16.0
+                        source[j] * w / 16.0
                     })
                     .sum();
             }
-            std::mem::swap(&mut a, &mut b);
+            std::mem::swap(&mut source, &mut destination);
         }
     }
-    a
+    source
 }
 
 struct Climate {
@@ -174,6 +176,33 @@ impl Climate {
     }
 }
 
+/// Raising each modified cell to its new spill envelope minus the original
+/// depression depth guarantees that the final depression cannot be deeper.
+/// Raising to at most the current envelope cannot increase that envelope.
+fn preserve_depression_depth(
+    grid: &mut Grid,
+    original: &Grid,
+    original_filled: &[f64],
+) -> (usize, f64) {
+    let after = Drainage::compute(grid);
+    let mut corrected = 0;
+    let mut max_lift = 0.0_f64;
+    for (index, height) in grid.heights.iter_mut().enumerate() {
+        if original.heights[index] <= 0.0 {
+            continue;
+        }
+        let old_depth = (original_filled[index] - original.heights[index]).max(0.0);
+        let low = after.filled[index] - old_depth;
+        let lift = (low - *height).max(0.0);
+        if lift > 1e-8 {
+            corrected += 1;
+            max_lift = max_lift.max(lift);
+        }
+        *height = height.max(low);
+    }
+    (corrected, max_lift)
+}
+
 fn initial_relief(base: &Grid, climate: &Climate, strength: f64) -> Grid {
     let local = blur(base, &base.heights, 1);
     let broad = blur(base, &local, 12);
@@ -188,8 +217,8 @@ fn initial_relief(base: &Grid, climate: &Climate, strength: f64) -> Grid {
         // Counter broad rounded stock summits; coherent uplift amplifies
         // relief on mountain belts, not everywhere with random spikes.
         let uplift =
-            strength * (0.2 + 0.8 * mountain.max(highland)) * (local[i] - broad[i]).max(0.0);
-        *h = original + weight * (local[i] - original + uplift);
+            strength * 0.8f64.mul_add(mountain.max(highland), 0.2) * (local[i] - broad[i]).max(0.0);
+        *h = weight.mul_add(local[i] - original + uplift, original);
     }
     result
 }
@@ -253,13 +282,14 @@ fn evolve(grid: &mut Grid, climate: &Climate, steps: usize) {
             };
             let k = (260.0 / distance)
                 * rivers.discharge[i].powf(0.42)
-                * (1.0 - 0.45 * rock)
-                * (1.0 - 0.35 * arid);
+                * 0.45f64.mul_add(-rock, 1.0)
+                * 0.35f64.mul_add(-arid, 1.0);
             let downstream = bed[j].max(0.0);
             if height > downstream {
-                let lowered = (height + k * downstream) / (1.0 + k);
-                bed[i] = height
-                    - (height - lowered).min(grid.spacing * 0.16) * grid.boundary_weight(x, y);
+                let lowered = k.mul_add(downstream, height) / (1.0 + k);
+                bed[i] = (height - lowered)
+                    .min(grid.spacing * 0.16)
+                    .mul_add(-grid.boundary_weight(x, y), height);
             }
         }
         // Widen incision into a valley instead of leaving a one-pixel trench.
@@ -275,8 +305,8 @@ fn evolve(grid: &mut Grid, climate: &Climate, steps: usize) {
             let border = x.min(y).min(grid.cells - x).min(grid.cells - y);
             let edge = smooth((f64::from(border) * grid.spacing / 4000.0).min(1.0));
             let incision = 0.35_f64.mul_add(incision[i], 0.65 * broad[i]);
-            let diffusion = (smoothed[i] - bed[i]) * (0.22 - 0.15 * rock);
-            grid.heights[i] += edge * w * (diffusion - incision);
+            let diffusion = (smoothed[i] - bed[i]) * 0.15f64.mul_add(-rock, 0.22);
+            grid.heights[i] = (edge * w).mul_add(diffusion - incision, grid.heights[i]);
         }
     }
 }
@@ -319,8 +349,9 @@ fn divide_uplift(grid: &mut Grid, climate: &Climate, level: u32) {
         let mountain = climate.at(i)[1];
         let high = smooth(((h - 500.0) / 1450.0).clamp(0.0, 1.0));
         let ridge = smooth(((h - broad[i] + 90.0) / 220.0).clamp(0.0, 1.0));
-        let factor = (0.3 * mountain + 0.7 * high) * ridge * grid.boundary_weight(x, y);
-        grid.heights[i] += factor * 0.55 * distance[i].min(3.0 * grid.spacing);
+        let factor = 0.7f64.mul_add(high, 0.3 * mountain) * ridge * grid.boundary_weight(x, y);
+        grid.heights[i] =
+            (factor * 0.55).mul_add(distance[i].min(3.0 * grid.spacing), grid.heights[i]);
     }
 }
 
@@ -336,12 +367,12 @@ fn generate(base: &Grid, mut climate: Climate, strength: f64, divides: bool) -> 
             let (x, y) = grid.coordinates(i);
             let [_, mountain, arid, _, _] = climate.at(i);
             let h = grid.heights[i];
-            let roughness = 0.018 + 0.065 * mountain + 0.025 * arid;
-            grid.heights[i] += roughness
+            let roughness = 0.025f64.mul_add(arid, 0.065f64.mul_add(mountain, 0.018));
+            grid.heights[i] = (roughness
                 * spacing
                 * noise(hash(SEED ^ u64::from(level)), x, y)
-                * smooth((h / 120.0).clamp(0.0, 1.0))
-                * grid.boundary_weight(x, y);
+                * smooth((h / 120.0).clamp(0.0, 1.0)))
+            .mul_add(grid.boundary_weight(x, y), grid.heights[i]);
         }
         if divides && level < 3 {
             divide_uplift(&mut grid, &climate, level);
@@ -369,7 +400,7 @@ fn coast_region(stock: &StockMap) -> (u16, u16) {
                 }
             }
             if (8..=30).contains(&sea) {
-                let score = high - f64::from((sea - 18_i32).abs()) * 20.0;
+                let score = f64::mul_add(f64::from((sea - 18_i32).abs()), -20.0, high);
                 if score > best.0 {
                     best = (score, x, y);
                 }
@@ -418,17 +449,21 @@ fn materials(grid: &Grid, climate: &Climate) -> Surface {
         let slope = gx.hypot(gy);
         let [rain, mountain, arid, cold, veg] = climate.at(i);
         let moist = smooth((rain / 1.2).clamp(0.0, 1.0));
-        let variation = noise(SEED ^ 8, x, y) * 0.06 + noise(SEED ^ 9, x / 4, y / 4) * 0.12;
-        let rock = smooth(((slope - 0.20 + variation * 0.18) / 0.70).clamp(0.0, 1.0));
+        let variation = noise(SEED ^ 9, x / 4, y / 4).mul_add(0.12, noise(SEED ^ 8, x, y) * 0.06);
+        let rock = smooth((variation.mul_add(0.18, slope - 0.20) / 0.70).clamp(0.0, 1.0));
         let talus = smooth(((broad_heights[i] - h) / 70.0).clamp(0.0, 1.0))
             * smooth((slope / 0.45).clamp(0.0, 1.0))
             * (1.0 - rock);
-        let snowline = 3100.0 - 900.0 * cold + 280.0 * gy.clamp(-1.0, 1.0);
-        let snow = smooth(((h - snowline + variation * 450.0) / 500.0).clamp(0.0, 1.0))
-            * (1.0 - 0.65 * rock);
+        let snowline = 280.0f64.mul_add(gy.clamp(-1.0, 1.0), 900.0f64.mul_add(-cold, 3100.0));
+        let snow = smooth((variation.mul_add(450.0, h - snowline) / 500.0).clamp(0.0, 1.0))
+            * 0.65f64.mul_add(-rock, 1.0);
         let floodplain =
             smooth((flow.discharge[i] / 25.0).min(1.0)) * (1.0 - smooth((slope / 0.16).min(1.0)));
-        let forest = smooth((veg * moist * (1.0 - 0.6 * mountain) + variation).clamp(0.0, 1.0));
+        let forest = smooth(
+            (veg * moist)
+                .mul_add(0.6f64.mul_add(-mountain, 1.0), variation)
+                .clamp(0.0, 1.0),
+        );
         let grass = [0.37, 0.43, 0.25];
         let forest_color = [0.19, 0.28, 0.14];
         let dry = [0.54, 0.40, 0.23];
@@ -494,7 +529,8 @@ fn rgb(value: f64) -> u8 {
 }
 fn light(grid: &Grid, x: u16, y: u16) -> f64 {
     let [gx, gy] = gradient(grid, x, y);
-    let diffuse = (0.67 + 0.48 * gx - 0.56 * gy) / (1.0 + gx * gx + gy * gy).sqrt();
+    let diffuse = 0.56f64.mul_add(-gy, 0.48f64.mul_add(gx, 0.67))
+        / f64::mul_add(gy, gy, f64::mul_add(gx, gx, 1.0)).sqrt();
     // Approximate terrain self-shadow along sun direction using exponentially
     // spaced samples. Soft transition avoids integer-grid shadow streaks.
     let h = grid.at(x, y);
@@ -511,7 +547,7 @@ fn light(grid: &Grid, x: u16, y: u16) -> f64 {
         horizon = horizon.max((grid.at(sx, sy) - h) / (f64::from(d) * grid.spacing * 1.25));
     }
     let shadow = 1.0 - smooth(((horizon - 0.82) / 0.22).clamp(0.0, 1.0));
-    0.52 + 0.70 * diffuse.max(0.0) * shadow
+    f64::mul_add(0.70 * diffuse.max(0.0), shadow, 0.52)
 }
 fn save(grid: &Grid, surface: &Surface, path: &Path, water_enabled: bool) -> io::Result<()> {
     let side = grid.cells + 1;
@@ -524,7 +560,7 @@ fn save(grid: &Grid, surface: &Surface, path: &Path, water_enabled: bool) -> io:
             let color: [u8; 3] = std::array::from_fn(|c| {
                 rgb(lerp(
                     surface.colors[i][c] * illum,
-                    [0.095, 0.34, 0.42][c] * (0.85 + 0.15 * illum),
+                    [0.095, 0.34, 0.42][c] * 0.15f64.mul_add(illum, 0.85),
                     water,
                 ))
             });
@@ -552,7 +588,7 @@ fn export_layers(grid: &Grid, surface: &Surface, output: &Path, label: &str) -> 
             albedo.extend(color);
             landcover.extend(surface.cover[i]);
             let water = surface.water[i];
-            let shade = 0.30 + 0.35 * light(grid, x, y);
+            let shade = 0.35f64.mul_add(light(grid, x, y), 0.30);
             let color: [u8; 3] =
                 std::array::from_fn(|c| rgb(lerp(shade, [0.12, 0.55, 0.90][c], water)));
             hydro.extend(color);
@@ -568,7 +604,7 @@ fn export_layers(grid: &Grid, surface: &Surface, output: &Path, label: &str) -> 
     )
 }
 
-pub(super) fn run(stock: &StockMap, biome: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+pub fn run(stock: &StockMap, biome: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     let biomes = Biomes::read(biome)?;
     for (label, center) in [
         ("mountains", stock.select_region()),
@@ -646,7 +682,7 @@ pub(super) fn run(stock: &StockMap, biome: &Path, output: &Path) -> Result<(), B
     Ok(())
 }
 
-pub(super) fn run_exemplars(
+pub fn run_exemplars(
     stock: &StockMap,
     biome: &Path,
     dem: &Path,
@@ -735,7 +771,7 @@ pub(super) fn run_exemplars(
     Ok(())
 }
 
-pub(super) fn run_natural(
+pub fn run_natural(
     stock: &StockMap,
     biome: &Path,
     dem: &Path,
@@ -781,10 +817,7 @@ pub(super) fn run_natural(
                 .zip(old.filled.iter().zip(&before.heights))
                 .map(|((a, b), (c, d))| ((a - b) - (c - d)).max(0.0))
                 .fold(0.0_f64, f64::max);
-            println!(
-                "maximum new depression depth beyond original {:.6}m",
-                excess
-            );
+            println!("maximum new depression depth beyond original {excess:.6}m");
             let surface = materials(&grid, &climate);
             let tag = format!("{label}-{name}");
             super::statistics(&grid, &tag);
@@ -819,6 +852,7 @@ fn export_region(
     path: &Path,
 ) -> Result<(), Box<dyn Error>> {
     use i_love_proland::terrain::{Region, RegionCell, RegionChart};
+    use std::io::Write;
     let latitude = (f64::from(center.1) / f64::from(stock.height) - 0.5) * std::f64::consts::PI;
     let longitude = ((1.75 - f64::from(center.0) / f64::from(stock.width)) * std::f64::consts::TAU)
         .rem_euclid(std::f64::consts::TAU)
@@ -857,7 +891,6 @@ fn export_region(
     );
     let mut file = io::BufWriter::new(fs::File::create(path)?);
     region.write(&mut file)?;
-    use std::io::Write;
     file.flush()?;
     println!(
         "region artifact {} bytes, {} reaches",
@@ -867,7 +900,7 @@ fn export_region(
     Ok(())
 }
 
-pub(super) fn run_sharp(
+pub fn run_sharp(
     stock: &StockMap,
     biome: &Path,
     dem: &Path,

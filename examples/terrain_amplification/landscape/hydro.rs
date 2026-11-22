@@ -67,27 +67,30 @@ fn lakes(grid: &Grid, flow: &Rivers) -> (Vec<f64>, usize) {
     (result, count)
 }
 
-fn splat(grid: &Grid, a: [f64; 2], b: [f64; 2], width_m: f64, mask: &mut [f64]) {
-    let r = width_m / (2.0 * grid.spacing);
-    let reach = r + 1.0;
-    let d = [b[0] - a[0], b[1] - a[1]];
-    let length_sq = d[0].mul_add(d[0], d[1] * d[1]).max(1e-9);
+fn splat(grid: &Grid, start: [f64; 2], end: [f64; 2], width_m: f64, mask: &mut [f64]) {
+    let radius = width_m / (2.0 * grid.spacing);
+    let reach = radius + 1.0;
+    let axis = [end[0] - start[0], end[1] - start[1]];
+    let length_sq = axis[0].mul_add(axis[0], axis[1] * axis[1]).max(1e-9);
     #[expect(clippy::cast_possible_truncation, reason = "bounded grid-space box")]
     let (xmin, xmax, ymin, ymax) = (
-        (a[0].min(b[0]) - reach).floor() as i32,
-        (a[0].max(b[0]) + reach).ceil() as i32,
-        (a[1].min(b[1]) - reach).floor() as i32,
-        (a[1].max(b[1]) + reach).ceil() as i32,
+        (start[0].min(end[0]) - reach).floor() as i32,
+        (start[0].max(end[0]) + reach).ceil() as i32,
+        (start[1].min(end[1]) - reach).floor() as i32,
+        (start[1].max(end[1]) + reach).ceil() as i32,
     );
     for y in ymin.max(0)..=ymax.min(i32::from(grid.cells)) {
         for x in xmin.max(0)..=xmax.min(i32::from(grid.cells)) {
-            let p = [f64::from(x) - a[0], f64::from(y) - a[1]];
-            let t = (p[0].mul_add(d[0], p[1] * d[1]) / length_sq).clamp(0.0, 1.0);
-            let dist = (p[0] - t * d[0]).hypot(p[1] - t * d[1]);
-            let coverage = (reach - dist).clamp(0.0, 1.0) * (2.0 * r).min(1.0);
+            let delta = [f64::from(x) - start[0], f64::from(y) - start[1]];
+            let fraction =
+                (delta[0].mul_add(axis[0], delta[1] * axis[1]) / length_sq).clamp(0.0, 1.0);
+            let dist = fraction
+                .mul_add(-axis[0], delta[0])
+                .hypot(fraction.mul_add(-axis[1], delta[1]));
+            let coverage = (reach - dist).clamp(0.0, 1.0) * (2.0 * radius).min(1.0);
             if let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) {
-                let i = grid.index(x, y);
-                mask[i] = mask[i].max(coverage);
+                let index = grid.index(x, y);
+                mask[index] = mask[index].max(coverage);
             }
         }
     }
@@ -235,12 +238,20 @@ impl<'a> RiverCoverage<'a> {
             spacing: grid.spacing,
         };
         for (i, s) in water.segments.iter().enumerate() {
-            let margin = s.width * 0.5 + Self::MAX_FILTER_M;
+            let margin = f64::mul_add(s.width, 0.5, Self::MAX_FILTER_M);
             let [xmin, ymin] = std::array::from_fn(|c| {
-                index.bin(s.start_xy[c].min(s.end_xy[c]) * grid.spacing - margin)
+                index.bin(f64::mul_add(
+                    s.start_xy[c].min(s.end_xy[c]),
+                    grid.spacing,
+                    -margin,
+                ))
             });
             let [xmax, ymax] = std::array::from_fn(|c| {
-                index.bin(s.start_xy[c].max(s.end_xy[c]) * grid.spacing + margin)
+                index.bin(f64::mul_add(
+                    s.start_xy[c].max(s.end_xy[c]),
+                    grid.spacing,
+                    margin,
+                ))
             });
             for y in ymin..=ymax {
                 for x in xmin..=xmax {
@@ -261,23 +272,24 @@ impl<'a> RiverCoverage<'a> {
         result.min(self.side - 1)
     }
 
-    pub(super) fn at(&self, p: [f64; 2], footprint: f64) -> f64 {
-        let [x, y] = p.map(|v| self.bin(v));
+    pub(super) fn at(&self, point: [f64; 2], footprint: f64) -> f64 {
+        let [x, y] = point.map(|v| self.bin(v));
         let half = (footprint * 0.5).clamp(0.4, Self::MAX_FILTER_M);
         let mut coverage = 0.0_f64;
-        for &i in &self.buckets[y * self.side + x] {
-            let s = &self.segments[i];
-            let a = s.start_xy.map(|v| v * self.spacing);
-            let b = s.end_xy.map(|v| v * self.spacing);
-            let d = [b[0] - a[0], b[1] - a[1]];
-            let delta = [p[0] - a[0], p[1] - a[1]];
-            let t = (delta[0].mul_add(d[0], delta[1] * d[1])
-                / d[0].mul_add(d[0], d[1] * d[1]).max(1e-9))
+        for &index in &self.buckets[y * self.side + x] {
+            let segment = &self.segments[index];
+            let start = segment.start_xy.map(|v| v * self.spacing);
+            let end = segment.end_xy.map(|v| v * self.spacing);
+            let axis = [end[0] - start[0], end[1] - start[1]];
+            let delta = [point[0] - start[0], point[1] - start[1]];
+            let fraction = (delta[0].mul_add(axis[0], delta[1] * axis[1])
+                / axis[0].mul_add(axis[0], axis[1] * axis[1]).max(1e-9))
             .clamp(0.0, 1.0);
-            let distance = (delta[0] - t * d[0]).hypot(delta[1] - t * d[1]);
-            let radius = s.width * 0.5;
+            let distance = f64::mul_add(fraction, -axis[0], delta[0])
+                .hypot(f64::mul_add(fraction, -axis[1], delta[1]));
+            let radius = segment.width * 0.5;
             // Approximate pixel integral of an infinite strip locally:
-            // a subpixel river cannot cover the entire pixel, even at its
+            // start subpixel river cannot cover the entire pixel, even at its
             // centerline. The union of segment capsules is approximated by max.
             let alpha = (radius + half - distance).clamp(0.0, (2.0 * radius).min(2.0 * half))
                 / (2.0 * half);

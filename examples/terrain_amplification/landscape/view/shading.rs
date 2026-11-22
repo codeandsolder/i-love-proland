@@ -9,43 +9,60 @@ const SUN: V3 = [-0.48, 0.56, 0.67];
 const SKY: V3 = [0.53, 0.70, 0.82];
 const HORIZON: V3 = [0.68, 0.77, 0.80];
 
-pub(super) fn cubic(a: f64, b: f64, c: f64, d: f64, t: f64) -> (f64, f64) {
-    let p = 0.5 * (-a + 3.0 * b - 3.0 * c + d);
-    let q = a - 2.5 * b + 2.0 * c - 0.5 * d;
-    let r = 0.5 * (c - a);
+pub(super) fn cubic(before: f64, lower: f64, upper: f64, after: f64, fraction: f64) -> (f64, f64) {
+    let cubic_term = f64::midpoint(
+        3.0f64.mul_add(-upper, 3.0f64.mul_add(lower, -before)),
+        after,
+    );
+    let quadratic = 0.5f64.mul_add(
+        -after,
+        2.0f64.mul_add(upper, 2.5f64.mul_add(-lower, before)),
+    );
+    let linear = 0.5 * (upper - before);
     (
-        ((p * t + q) * t + r) * t + b,
-        (3.0 * p * t + 2.0 * q) * t + r,
+        cubic_term
+            .mul_add(fraction, quadratic)
+            .mul_add(fraction, linear)
+            .mul_add(fraction, lower),
+        2.0f64
+            .mul_add(quadratic, 3.0 * cubic_term * fraction)
+            .mul_add(fraction, linear),
     )
 }
 
 fn normal(grid: &Grid, sample: &Sample) -> V3 {
-    let (x, y) = grid.coordinates(sample.ids[0]);
+    let (column, row_origin) = grid.coordinates(sample.ids[0]);
     let clamp = |v: i32| u16::try_from(v.clamp(0, i32::from(grid.cells))).unwrap_or_default();
     let data: [(f64, f64); 4] = std::array::from_fn(|row| {
-        let yy = clamp(i32::from(y) + i32::try_from(row).unwrap_or_default() - 1);
-        let [a, b, c, d] = [-1, 0, 1, 2].map(|dx| grid.at(clamp(i32::from(x) + dx), yy));
-        cubic(a, b, c, d, sample.tx)
+        let yy = clamp(i32::from(row_origin) + i32::try_from(row).unwrap_or_default() - 1);
+        let [before, lower, upper, after] =
+            [-1, 0, 1, 2].map(|dx| grid.at(clamp(i32::from(column) + dx), yy));
+        cubic(before, lower, upper, after, sample.tx)
     });
-    let [a, b, c, d] = data.map(|p| p.0);
-    let (_, dy) = cubic(a, b, c, d, sample.ty);
-    let [a, b, c, d] = data.map(|p| p.1);
-    let (dx, _) = cubic(a, b, c, d, sample.ty);
+    let [before, lower, upper, after] = data.map(|p| p.0);
+    let (_, dy) = cubic(before, lower, upper, after, sample.ty);
+    let [before, lower, upper, after] = data.map(|p| p.1);
+    let (dx, _) = cubic(before, lower, upper, after, sample.ty);
     normalize([-dx / grid.spacing, -dy / grid.spacing, 1.0])
 }
 
 /// Smooth scalar lattice field and its analytic gradient in world units.
 /// All octaves are spatially keyed; no mutable RNG or camera-dependent phase.
-fn field(p: V3, size: V3, seed: u64) -> (f64, V3) {
-    let q: V3 = std::array::from_fn(|i| p[i] / size[i]);
+fn field(point: V3, size: V3, seed: u64) -> (f64, V3) {
+    let chart: V3 = std::array::from_fn(|i| point[i] / size[i]);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "regional world-space lattice coordinates fit i32"
     )]
-    let cell = q.map(|v| v.floor() as i32);
-    let t: V3 = std::array::from_fn(|i| q[i] - f64::from(cell[i]));
-    let f = t.map(|v| v * v * v * (v * (6.0 * v - 15.0) + 10.0));
-    let df = t.map(|v| 30.0 * v * v * (v - 1.0).powi(2));
+    let cell = chart.map(|amplitude| amplitude.floor() as i32);
+    let fraction: V3 = std::array::from_fn(|i| chart[i] - f64::from(cell[i]));
+    let fade = fraction.map(|amplitude| {
+        amplitude
+            * amplitude
+            * amplitude
+            * f64::mul_add(amplitude, 6.0f64.mul_add(amplitude, -15.0), 10.0)
+    });
+    let df = fraction.map(|amplitude| 30.0 * amplitude * amplitude * (amplitude - 1.0).powi(2));
     let mut value = 0.0;
     let mut deriv = [0.0; 3];
     for z in 0..=1_i32 {
@@ -60,16 +77,22 @@ fn field(p: V3, size: V3, seed: u64) -> (f64, V3) {
                         ^ u64::from(u32::from_ne_bytes((cell[2] + z).to_ne_bytes()))
                             .rotate_left(47),
                 );
-                let v = f64::from(u32::try_from(key >> 32).unwrap_or_default())
-                    / f64::from(u32::MAX)
-                    * 2.0
-                    - 1.0;
-                let w: V3 = std::array::from_fn(|i| if bits[i] == 0 { 1.0 - f[i] } else { f[i] });
-                value += v * w[0] * w[1] * w[2];
+                let amplitude = f64::mul_add(
+                    f64::from(u32::try_from(key >> 32).unwrap_or_default()) / f64::from(u32::MAX),
+                    2.0,
+                    -1.0,
+                );
+                let weights: V3 =
+                    std::array::from_fn(|i| if bits[i] == 0 { 1.0 - fade[i] } else { fade[i] });
+                value = (amplitude * weights[0] * weights[1]).mul_add(weights[2], value);
                 for axis in 0..3 {
                     let sign = if bits[axis] == 0 { -1.0 } else { 1.0 };
-                    deriv[axis] +=
-                        v * sign * df[axis] * w[(axis + 1) % 3] * w[(axis + 2) % 3] / size[axis];
+                    deriv[axis] += amplitude
+                        * sign
+                        * df[axis]
+                        * weights[(axis + 1) % 3]
+                        * weights[(axis + 2) % 3]
+                        / size[axis];
                 }
             }
         }
@@ -95,33 +118,35 @@ fn microdetail(p: V3, n: V3, footprint: f64, rock: f64) -> (V3, f64) {
             continue;
         }
         let (v, g) = field(p, size, seed);
-        let strength = band * (0.25 + 0.75 * rock);
-        tint += strength * color * v;
+        let strength = band * 0.75f64.mul_add(rock, 0.25);
+        tint = (strength * color).mul_add(v, tint);
         for (out, derivative) in grad.iter_mut().zip(g) {
-            *out += strength * height * derivative;
+            *out = (strength * height).mul_add(derivative, *out);
         }
     }
     // Gradient of the scalar relief projected into the surface tangent
     // plane; this also works on steep slopes without stretched UVs.
     let along = dot(n, grad);
-    let bumped = normalize(std::array::from_fn(|i| n[i] - (grad[i] - along * n[i])));
+    let bumped = normalize(std::array::from_fn(|i| {
+        n[i] - along.mul_add(-n[i], grad[i])
+    }));
     (bumped, 1.0 + tint)
 }
 
-fn visibility(grid: &Grid, p: V3) -> f64 {
+fn visibility(grid: &Grid, point: V3) -> f64 {
     let horiz = SUN[0].hypot(SUN[1]);
     let sun_slope = SUN[2] / horiz;
     let mut horizon = f64::NEG_INFINITY;
-    for d in [
+    for distance in [
         45.0, 90.0, 180.0, 360.0, 720.0, 1440.0, 2880.0, 5760.0, 11520.0,
     ] {
-        let x = p[0] + d * SUN[0] / horiz;
-        let y = p[1] + d * SUN[1] / horiz;
-        let Some(s) = Sample::at(grid, x, y) else {
+        let sample_x = point[0] + distance * SUN[0] / horiz;
+        let sample_y = point[1] + distance * SUN[1] / horiz;
+        let Some(sample) = Sample::at(grid, sample_x, sample_y) else {
             break;
         };
-        let h = s.blend(|i| grid.heights[i]);
-        horizon = horizon.max((h - p[2]) / d);
+        let height = sample.blend(|i| grid.heights[i]);
+        horizon = horizon.max((height - point[2]) / distance);
     }
     1.0 - smooth(((horizon - sun_slope + 0.035) / 0.07).clamp(0.0, 1.0))
 }
@@ -134,10 +159,10 @@ fn linear(c: f64) -> f64 {
     }
 }
 fn srgb(c: f64) -> f64 {
-    if c <= 0.0031308 {
+    if c <= 0.003_130_8 {
         12.92 * c
     } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
+        1.055f64.mul_add(c.powf(1.0 / 2.4), -0.055)
     }
 }
 
@@ -156,16 +181,27 @@ pub(super) enum Style<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct IncidentRay {
+    pub(super) position: V3,
+    pub(super) direction: V3,
+    pub(super) distance: f64,
+    pub(super) pixel_angle: f64,
+}
+
 pub(super) fn shade(
     grid: &Grid,
     surface: &Surface,
     sample: &Sample,
-    p: V3,
-    ray: V3,
-    distance: f64,
-    pixel_angle: f64,
+    incident: IncidentRay,
     style: Style<'_>,
 ) -> V3 {
+    let IncidentRay {
+        position: p,
+        direction: ray,
+        distance,
+        pixel_angle,
+    } = incident;
     let n = normal(grid, sample);
     let footprint = distance * pixel_angle / (-dot(n, ray)).abs().max(0.24);
     let rock = smooth((((1.0 - n[2]) - 0.035) / 0.27_f64).clamp(0.0, 1.0));
@@ -200,15 +236,18 @@ pub(super) fn shade(
     let ambient = if geologic {
         // Directional sky fill reveals small-scale relief even on faces
         // looking away from the sun, unlike a constant ambient intensity.
-        0.12 + 0.21 * bump[2].max(0.0) + 0.23 * dot(bump, normalize([0.76, -0.41, 0.5])).max(0.0)
+        0.23f64.mul_add(
+            dot(bump, normalize([0.76, -0.41, 0.5])).max(0.0),
+            0.21f64.mul_add(bump[2].max(0.0), 0.12),
+        )
     } else {
-        0.19 + 0.25 * bump[2].max(0.0)
+        0.25f64.mul_add(bump[2].max(0.0), 0.19)
     };
-    let illumination = ambient + 1.05 * sun;
+    let illumination = 1.05f64.mul_add(sun, ambient);
     let fog = 1.0 - (-distance / if geologic { 128_000.0 } else { 78_000.0 }).exp();
     std::array::from_fn(|i| {
         let land = linear(albedo[i]) * illumination * tint;
-        let wet = linear([0.095, 0.34, 0.42][i]) * (0.8 + 0.2 * shade);
+        let wet = linear([0.095, 0.34, 0.42][i]) * 0.2f64.mul_add(shade, 0.8);
         srgb(lerp(lerp(land, wet, water), linear(HORIZON[i]), fog))
     })
 }
@@ -220,11 +259,11 @@ fn geologic_albedo(p: V3, bump: V3, mut albedo: V3) -> V3 {
     // Green valleys break into vegetation and exposed soils;
     // talus / bedrock transitions depend on the local normal.
     let snow = smooth(((albedo[0].min(albedo[1]).min(albedo[2]) - 0.5) / 0.25).clamp(0.0, 1.0));
-    let exposed =
-        smooth(((1.0 - local_slope - 0.075 + 0.12 * v) / 0.4).clamp(0.0, 1.0)) * (1.0 - snow);
+    let exposed = smooth((0.12f64.mul_add(v, 1.0 - local_slope - 0.075) / 0.4).clamp(0.0, 1.0))
+        * (1.0 - snow);
     let green = smooth(((albedo[1] - albedo[0] + 0.01) / 0.09).clamp(0.0, 1.0));
     let patch = smooth(((v + 0.3) / 0.75).clamp(0.0, 1.0));
-    let variation = 1.0 + 0.14 * v + 0.08 * small;
+    let variation = 0.08f64.mul_add(small, 0.14f64.mul_add(v, 1.0));
     for (i, c) in albedo.iter_mut().enumerate() {
         let soil = lerp(*c, [0.40, 0.34, 0.24][i], green * patch * 0.22);
         let stone = [0.48, 0.455, 0.42][i] * variation;
@@ -233,20 +272,71 @@ fn geologic_albedo(p: V3, bump: V3, mut albedo: V3) -> V3 {
     albedo
 }
 
-use super::Weathered;
+fn water_fine_band(footprint: f64) -> f64 {
+    1.0 - smooth(((footprint / 4.0 - 0.25) / 0.75).clamp(0.0, 1.0))
+}
+
+fn fluvial_albedo(p: V3, n: V3, footprint: f64, weather: super::Weathered, albedo: &mut V3) -> f64 {
+    let (v, _) = field(p, [105.0, 85.0, 47.0], 0x414c_4c55);
+    let (grain, _) = field(p, [21.0, 17.0, 13.0], 0x0053_4544);
+    // Spatially coherent riparian vegetation clumps and sorted gravel.
+    // Fade each small-scale band before it becomes smaller than a pixel.
+    let fine_band = water_fine_band(footprint);
+    let mid_band = 1.0 - smooth(((footprint / 16.0 - 0.25) / 0.75).clamp(0.0, 1.0));
+    let (fine, _) = field(p, [4.1, 3.2, 2.8], 0x4752_4156);
+    let (clumps, _) = field(p, [12.0, 17.0, 9.0], 0x5249_5041);
+    let sorted = (clumps * mid_band).mul_add(0.75, fine * fine_band * 0.25);
+    let flat = smooth(((n[2] - 0.72) / 0.28).clamp(0.0, 1.0));
+    let patch = smooth(((v + 0.22) / 0.85).clamp(0.0, 1.0));
+    let grain_mask = smooth(((grain + 0.15) / 0.75).clamp(0.0, 1.0));
+    let gravel = 0.12f64.mul_add(
+        smooth((weather.deposit / 2.5).min(1.0)),
+        1.1f64.mul_add(weather.point_bar, 0.32 * weather.gravel * patch),
+    ) * flat;
+    let bank = weather
+        .scour
+        .mul_add(0.29, weather.bank * 0.24f64.mul_add(grain_mask, 0.13));
+    let flood = weather.floodplain
+        * flat
+        * 0.60f64.mul_add(
+            smooth(0.32f64.mul_add(sorted, v + 0.4).clamp(0.0, 1.0)),
+            0.12,
+        );
+    for (i, c) in albedo.iter_mut().enumerate() {
+        let sediment =
+            [0.50, 0.465, 0.385][i] * 0.29f64.mul_add(sorted, 0.23f64.mul_add(grain, 1.0));
+        let damp = [0.25, 0.245, 0.20][i] * 0.19f64.mul_add(v, 1.0);
+        let riparian = [0.18, 0.30, 0.115][i]
+            * 0.30f64.mul_add(sorted, 0.18f64.mul_add(grain, 0.25f64.mul_add(v, 1.0)));
+        *c = lerp(
+            lerp(
+                lerp(*c, riparian, flood.clamp(0.0, 1.0)),
+                sediment,
+                gravel.clamp(0.0, 1.0),
+            ),
+            damp,
+            bank.clamp(0.0, 1.0),
+        );
+    }
+    sorted
+}
 
 pub(super) fn shade_weathered(
     grid: &Grid,
     surface: &Surface,
-    sample: &Sample,
-    p: V3,
-    ray: V3,
-    distance: f64,
-    pixel_angle: f64,
+    hit: &super::channel_mesh::Hit,
+    incident: IncidentRay,
     atlas: &RockAtlas,
-    weather: Weathered,
-    fine_normal: Option<V3>,
 ) -> V3 {
+    let IncidentRay {
+        position: p,
+        direction: ray,
+        distance,
+        pixel_angle,
+    } = incident;
+    let sample = &hit.sample;
+    let weather = hit.weather;
+    let fine_normal = hit.normal;
     let coarse = normal(grid, sample);
     let mask = weather.bank.max(weather.gravel).max(weather.floodplain);
     let blend = smooth((mask * 4.0).clamp(0.0, 1.0));
@@ -261,61 +351,31 @@ pub(super) fn shade_weathered(
         bump,
         std::array::from_fn(|i| sample.blend(|j| surface.colors[j][i])),
     );
-    let (v, _) = field(p, [105.0, 85.0, 47.0], 0x414c4c55);
-    let (grain, _) = field(p, [21.0, 17.0, 13.0], 0x534544);
-    // Spatially coherent riparian vegetation clumps and sorted gravel.
-    // Fade each small-scale band before it becomes smaller than a pixel.
-    let fine_band = 1.0 - smooth(((footprint / 4.0 - 0.25) / 0.75).clamp(0.0, 1.0));
-    let mid_band = 1.0 - smooth(((footprint / 16.0 - 0.25) / 0.75).clamp(0.0, 1.0));
-    let (fine, _) = field(p, [4.1, 3.2, 2.8], 0x47524156);
-    let (clumps, _) = field(p, [12.0, 17.0, 9.0], 0x52495041);
-    let sorted = fine * fine_band * 0.25 + clumps * mid_band * 0.75;
-    let flat = smooth(((n[2] - 0.72) / 0.28).clamp(0.0, 1.0));
-    let patch = smooth(((v + 0.22) / 0.85).clamp(0.0, 1.0));
-    let grain_mask = smooth(((grain + 0.15) / 0.75).clamp(0.0, 1.0));
-    let gravel = (0.32 * weather.gravel * patch
-        + 1.1 * weather.point_bar
-        + 0.12 * smooth((weather.deposit / 2.5).min(1.0)))
-        * flat;
-    let bank = weather.bank * (0.13 + 0.24 * grain_mask) + weather.scour * 0.29;
-    let flood = weather.floodplain
-        * flat
-        * (0.12 + 0.60 * smooth((v + 0.4 + 0.32 * sorted).clamp(0.0, 1.0)));
-    for (i, c) in albedo.iter_mut().enumerate() {
-        let sediment = [0.50, 0.465, 0.385][i] * (1.0 + 0.23 * grain + 0.29 * sorted);
-        let damp = [0.25, 0.245, 0.20][i] * (1.0 + 0.19 * v);
-        let riparian = [0.18, 0.30, 0.115][i] * (1.0 + 0.25 * v + 0.18 * grain + 0.30 * sorted);
-        *c = lerp(
-            lerp(
-                lerp(*c, riparian, flood.clamp(0.0, 1.0)),
-                sediment,
-                gravel.clamp(0.0, 1.0),
-            ),
-            damp,
-            bank.clamp(0.0, 1.0),
-        );
-    }
+    let sorted = fluvial_albedo(p, n, footprint, weather, &mut albedo);
+    let fine_band = water_fine_band(footprint);
     let sun = normalize(SUN);
     let shade = visibility(grid, p);
-    let ambient =
-        0.12 + 0.21 * bump[2].max(0.0) + 0.23 * dot(bump, normalize([0.76, -0.41, 0.5])).max(0.0);
-    let illumination = ambient + 1.05 * dot(bump, sun).max(0.0) * shade;
+    let ambient = 0.23f64.mul_add(
+        dot(bump, normalize([0.76, -0.41, 0.5])).max(0.0),
+        0.21f64.mul_add(bump[2].max(0.0), 0.12),
+    );
+    let illumination = (1.05 * dot(bump, sun).max(0.0)).mul_add(shade, ambient);
     let fog = 1.0 - (-distance / 128_000.0).exp();
     let standing = weather.water.is_some();
     let water_color = if standing {
         // A water surface reflects the sky at grazing angles and transmits
         // the submerged sediment at normal incidence. Depth controls
         // attenuation; do not illuminate water like a blue terrain texture.
-        let band = 1.0 - smooth(((footprint / 12.0 - 0.25) / 0.75).clamp(0.0, 1.0));
-        let (_, g) = field(p, [12.0, 8.0, 30.0], 0x57415645);
-        let (_, g2) = field(p, [4.0, 5.7, 18.0], 0x57415646);
+        let wave_filter = 1.0 - smooth(((footprint / 12.0 - 0.25) / 0.75).clamp(0.0, 1.0));
+        let (_, g) = field(p, [12.0, 8.0, 30.0], 0x5741_5645);
+        let (_, g2) = field(p, [4.0, 5.7, 18.0], 0x5741_5646);
         let wn = normalize([
-            -0.54 * band * g[0] - 0.16 * fine_band * g2[0],
-            -0.54 * band * g[1] - 0.16 * fine_band * g2[1],
+            (0.16 * fine_band).mul_add(-g2[0], -0.54 * wave_filter * g[0]),
+            (0.16 * fine_band).mul_add(-g2[1], -0.54 * wave_filter * g[1]),
             1.0,
         ]);
-        let fresnel = 0.025 + 0.975 * (1.0 - (-dot(wn, ray)).clamp(0.0, 1.0)).powi(5);
-        let reflect = std::array::from_fn(|i| ray[i] - 2.0 * dot(wn, ray) * wn[i]);
+        let fresnel = 0.975f64.mul_add((1.0 - (-dot(wn, ray)).clamp(0.0, 1.0)).powi(5), 0.025);
+        let reflect = std::array::from_fn(|i| (2.0 * dot(wn, ray)).mul_add(-wn[i], ray[i]));
         let reflected = sky(reflect);
         let sparkle = dot(normalize(std::array::from_fn(|i| sun[i] - ray[i])), wn)
             .max(0.0)
@@ -323,15 +383,18 @@ pub(super) fn shade_weathered(
             * shade;
         let depth = weather.depth;
         std::array::from_fn(|i| {
-            let bed = linear([0.47, 0.435, 0.335][i] * (1.0 + 0.22 * sorted));
+            let bed = linear([0.47, 0.435, 0.335][i] * 0.22f64.mul_add(sorted, 1.0));
             let transmission =
                 (-depth / ([1.7, 3.8, 3.0][i] * (-dot(wn, ray)).abs().max(0.25))).exp();
             let transmitted = lerp(linear([0.09, 0.245, 0.225][i]), bed, transmission);
-            lerp(
-                transmitted * (0.45 + 0.55 * shade),
-                linear(reflected[i]),
-                fresnel,
-            ) + 0.14 * sparkle
+            0.14f64.mul_add(
+                sparkle,
+                lerp(
+                    transmitted * 0.55f64.mul_add(shade, 0.45),
+                    linear(reflected[i]),
+                    fresnel,
+                ),
+            )
         })
     } else {
         [0.0; 3]

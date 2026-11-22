@@ -1,7 +1,7 @@
 //! Widen the slope break at the foot of mountain valleys with a compact
 //! drainage-conditioned colluvial apron. Leave channels, summits and sea
 //! level intact. This is a regional geomorphic filter, not a fluid solver.
-use super::{Climate, Drainage, Grid, Rivers, blur, gradient, smooth};
+use super::{Climate, Grid, Rivers, blur, gradient, smooth};
 
 fn unit(x: f64) -> f64 {
     smooth(x.clamp(0.0, 1.0))
@@ -47,24 +47,12 @@ pub(super) fn blend(grid: &mut Grid, climate: &Climate) {
         let foot = valley * lateral * unit(old / 100.0) * original.boundary_weight(x, y);
         // Concave slope bases accumulate debris, while convex lower spurs
         // relax; no flattening of high ridges and no changing channel beds.
-        let delta = (0.68 * (broad[i] - old) + 0.32 * (local[i] - old)).clamp(-85.0, 125.0);
+        let delta = 0.32f64
+            .mul_add(local[i] - old, 0.68 * (broad[i] - old))
+            .clamp(-85.0, 125.0);
         let activity = unit((slope - 0.035) / 0.27);
-        *h = old + foot * (0.45 + 0.55 * activity) * delta;
+        *h = (foot * 0.55f64.mul_add(activity, 0.45)).mul_add(delta, old);
     }
-    // The new minimax spill envelope is a drainage certificate. Raising
-    // the modified terrain no higher than this envelope minus each
-    // original local depression depth cannot increase that depth.
-    // The major channel centerlines are already fixed by the relief mask.
-    let new = Drainage::compute(grid);
-    let mut correction = 0.0_f64;
-    for (i, h) in grid.heights.iter_mut().enumerate() {
-        if original.heights[i] <= 0.0 {
-            continue;
-        }
-        let old_depth = (flow.filled[i] - original.heights[i]).max(0.0);
-        let repaired = (*h).max(new.filled[i] - old_depth);
-        correction = correction.max(repaired - *h);
-        *h = repaired;
-    }
+    let (_, correction) = super::preserve_depression_depth(grid, &original, &flow.filled);
     println!("foothill drainage correction max {correction:.3} m");
 }

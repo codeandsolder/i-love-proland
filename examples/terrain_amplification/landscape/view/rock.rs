@@ -21,17 +21,17 @@ impl RockAtlas {
 
     // Translate overlapping source patches deterministically. Each source
     // patch has a full support halo so no atlas wrap seam is ever sampled.
-    fn plane(&self, p: [f64; 2], pixel: f64, seed: u64) -> (f64, [f64; 2]) {
-        let q = p.map(|v| v / (pixel * f64::from(PATCH)));
+    fn plane(&self, point: [f64; 2], pixel: f64, seed: u64) -> (f64, [f64; 2]) {
+        let chart = point.map(|value| value / (pixel * f64::from(PATCH)));
         #[expect(
             clippy::cast_possible_truncation,
             reason = "bounded regional material coordinates"
         )]
-        let cell = q.map(|v| v.floor() as i32);
-        let t: [f64; 2] = std::array::from_fn(|i| q[i] - f64::from(cell[i]));
-        let f = t.map(smooth);
-        let df = t.map(|v| 6.0 * v * (1.0 - v) / (pixel * f64::from(PATCH)));
-        let mut v = 0.0;
+        let cell = chart.map(|value| value.floor() as i32);
+        let fraction: [f64; 2] = std::array::from_fn(|i| chart[i] - f64::from(cell[i]));
+        let fade = fraction.map(smooth);
+        let df = fraction.map(|value| 6.0 * value * (1.0 - value) / (pixel * f64::from(PATCH)));
+        let mut value = 0.0;
         let mut deriv = [0.0; 2];
         let margin = PATCH + 2;
         let range = u64::try_from(i32::from(self.residual.cells) - 2 * margin + 1).unwrap_or(1);
@@ -45,8 +45,8 @@ impl RockAtlas {
                 );
                 let ox = margin + i32::try_from(key % range).unwrap_or_default();
                 let oy = margin + i32::try_from(hash(key) % range).unwrap_or_default();
-                let ax = f64::from(ox) + (t[0] - f64::from(x)) * f64::from(PATCH);
-                let ay = f64::from(oy) + (t[1] - f64::from(y)) * f64::from(PATCH);
+                let ax = (fraction[0] - f64::from(x)).mul_add(f64::from(PATCH), f64::from(ox));
+                let ay = (fraction[1] - f64::from(y)).mul_add(f64::from(PATCH), f64::from(oy));
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "patch halo bounds atlas coordinates"
@@ -56,67 +56,69 @@ impl RockAtlas {
                 let (tx, ty) = (ax.fract(), ay.fract());
                 let rows: [(f64, f64); 4] = std::array::from_fn(|r| {
                     let yy = iy - 1 + u16::try_from(r).unwrap_or_default();
-                    let [a, b, c, d] =
+                    let [before, lower, upper, after] =
                         [ix - 1, ix, ix + 1, ix + 2].map(|xx| self.residual.at(xx, yy));
-                    shading::cubic(a, b, c, d, tx)
+                    shading::cubic(before, lower, upper, after, tx)
                 });
-                let [a, b, c, d] = rows.map(|r| r.0);
-                let (h, gy) = shading::cubic(a, b, c, d, ty);
-                let [a, b, c, d] = rows.map(|r| r.1);
-                let (gx, _) = shading::cubic(a, b, c, d, ty);
+                let [before, lower, upper, after] = rows.map(|r| r.0);
+                let (relief, gy) = shading::cubic(before, lower, upper, after, ty);
+                let [before, lower, upper, after] = rows.map(|r| r.1);
+                let (gx, _) = shading::cubic(before, lower, upper, after, ty);
                 let (wx, dwx) = if x == 0 {
-                    (1.0 - f[0], -df[0])
+                    (1.0 - fade[0], -df[0])
                 } else {
-                    (f[0], df[0])
+                    (fade[0], df[0])
                 };
                 let (wy, dwy) = if y == 0 {
-                    (1.0 - f[1], -df[1])
+                    (1.0 - fade[1], -df[1])
                 } else {
-                    (f[1], df[1])
+                    (fade[1], df[1])
                 };
                 // Preserve dimensionless source relief after spatial scaling.
-                let height = h * pixel / self.residual.spacing;
-                v += height * wx * wy;
-                deriv[0] += gx / self.residual.spacing * wx * wy + height * dwx * wy;
-                deriv[1] += gy / self.residual.spacing * wx * wy + height * wx * dwy;
+                let height = relief * pixel / self.residual.spacing;
+                value = (height * wx).mul_add(wy, value);
+                deriv[0] += (height * dwx).mul_add(wy, gx / self.residual.spacing * wx * wy);
+                deriv[1] += (height * wx).mul_add(dwy, gy / self.residual.spacing * wx * wy);
             }
         }
-        (v, deriv)
+        (value, deriv)
     }
 
-    pub(super) fn sample(&self, p: V3, n: V3, footprint: f64, rock: f64) -> (V3, f64) {
-        let weights = n.map(|v| v.powi(4));
+    pub(super) fn sample(&self, point: V3, normal: V3, footprint: f64, rock: f64) -> (V3, f64) {
+        let weights = normal.map(|v| v.powi(4));
         let total: f64 = weights.iter().sum();
-        let mut g = [0.0; 3];
+        let mut gradient = [0.0; 3];
         let mut tint = 0.0;
         for (pixel, amp, seed) in [(39.0, 0.8, 81), (12.0, 0.65, 97), (3.5, 0.4, 113)] {
             let band = 1.0 - smooth(((footprint / (pixel * 2.4) - 0.35) / 0.65).clamp(0.0, 1.0));
             if band == 0.0 {
                 continue;
             }
-            let strength = band * (0.22 + 0.78 * rock) * amp;
-            for (axis, w) in weights.into_iter().enumerate() {
-                if w < 0.002 {
+            let strength = band * 0.78f64.mul_add(rock, 0.22) * amp;
+            for (axis, weight) in weights.into_iter().enumerate() {
+                if weight < 0.002 {
                     continue;
                 }
-                let a = (axis + 1) % 3;
-                let b = (axis + 2) % 3;
-                let (h, d) = self.plane(
-                    [p[a], p[b]],
+                let axis_u = (axis + 1) % 3;
+                let axis_v = (axis + 2) % 3;
+                let (height, derivative) = self.plane(
+                    [point[axis_u], point[axis_v]],
                     pixel,
                     seed ^ u64::try_from(axis).unwrap_or_default(),
                 );
-                let w = w / total * strength;
-                g[a] += w * d[0];
-                g[b] += w * d[1];
+                let weight = weight / total * strength;
+                gradient[axis_u] = weight.mul_add(derivative[0], gradient[axis_u]);
+                gradient[axis_v] = weight.mul_add(derivative[1], gradient[axis_v]);
                 // Exposed crests and weathered recesses differ in albedo.
                 // Use bounded residual rather than an arbitrary color noise.
-                tint += w * (h / (pixel * 0.45)).clamp(-1.0, 1.0) * 0.23;
+                tint = (weight * (height / (pixel * 0.45)).clamp(-1.0, 1.0)).mul_add(0.23, tint);
             }
         }
-        let along = dot(n, g);
+        let along = dot(normal, gradient);
         (
-            normalize(std::array::from_fn(|i| n[i] - (g[i] - along * n[i]))),
+            normalize(std::array::from_fn(|i| {
+                normal[i] - along.mul_add(-normal[i], gradient[i])
+            })),
             1.0 + tint,
         )
     }

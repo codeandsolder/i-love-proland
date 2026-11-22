@@ -6,27 +6,29 @@ use super::{Climate, Grid, Rivers, SEED, blur, hash, noise, smooth, upsample};
 fn step(grid: &mut Grid, climate: &Climate, reference: &Grid, uplift: &[f64]) {
     let flow = Rivers::route(grid, climate);
     let mut bed = grid.heights.clone();
-    for &i in &flow.order {
-        let j = flow.receiver[i];
-        let h = grid.heights[i];
-        if j == usize::MAX || reference.heights[i] <= 0.0 {
+    for &index in &flow.order {
+        let receiver = flow.receiver[index];
+        let height = grid.heights[index];
+        if receiver == usize::MAX || reference.heights[index] <= 0.0 {
             continue;
         }
-        let (x, y) = grid.coordinates(i);
-        let (jx, jy) = grid.coordinates(j);
+        let (x, y) = grid.coordinates(index);
+        let (jx, jy) = grid.coordinates(receiver);
         let distance = grid.spacing * f64::from(x.abs_diff(jx)).hypot(f64::from(y.abs_diff(jy)));
-        let [_, rock, arid, _, _] = climate.at(i);
-        let w = grid.boundary_weight(x, y) * smooth((reference.heights[i] / 120.0).clamp(0.0, 1.0));
-        let rise =
-            grid.spacing * uplift[i] * (1.0 - (h - reference.heights[i]) / 3600.0).clamp(0.0, 1.5);
-        let lifted = h + w * rise;
-        let k = (570.0 / distance)
-            * flow.discharge[i].powf(0.45)
-            * (1.0 - 0.48 * rock)
-            * (1.0 - 0.30 * arid);
-        let downstream = bed[j].max(0.0);
-        let cut = (lifted - downstream).max(0.0) * k / (1.0 + k);
-        bed[i] = (lifted - w * cut).max(0.02);
+        let [_, rock, arid, _, _] = climate.at(index);
+        let boundary =
+            grid.boundary_weight(x, y) * smooth((reference.heights[index] / 120.0).clamp(0.0, 1.0));
+        let rise = grid.spacing
+            * uplift[index]
+            * (1.0 - (height - reference.heights[index]) / 3600.0).clamp(0.0, 1.5);
+        let lifted = boundary.mul_add(rise, height);
+        let incision = (570.0 / distance)
+            * flow.discharge[index].powf(0.45)
+            * 0.48f64.mul_add(-rock, 1.0)
+            * 0.30f64.mul_add(-arid, 1.0);
+        let downstream = bed[receiver].max(0.0);
+        let cut = (lifted - downstream).max(0.0) * incision / (1.0 + incision);
+        bed[index] = boundary.mul_add(-cut, lifted).max(0.02);
     }
 
     // Hillslope transport distributes material conservatively, with much
@@ -49,9 +51,12 @@ fn step(grid: &mut Grid, climate: &Climate, reference: &Grid, uplift: &[f64]) {
             let w = a.min(grid.boundary_weight(jx, jy));
             let rock = climate.at(i)[1].midpoint(climate.at(j)[1]);
             let delta = bed[i] - bed[j];
-            let critical = (0.75 + 0.45 * rock) * d;
+            let critical = 0.45f64.mul_add(rock, 0.75) * d;
             let excess = (delta.abs() - critical).max(0.0);
-            let flux = w * ((0.034 - 0.018 * rock) * delta + 0.085 * excess.copysign(delta));
+            let flux = w * 0.085f64.mul_add(
+                excess.copysign(delta),
+                0.018f64.mul_add(-rock, 0.034) * delta,
+            );
             transport[i] -= flux;
             transport[j] += flux;
         }
@@ -75,10 +80,11 @@ pub(super) fn generate(base: &Grid, mut climate: Climate, strength: f64) -> (Gri
         let (x, y) = base.coordinates(i);
         let [_, rock, arid, _, _] = climate.at(i);
         let high = smooth(((regional[i] - 400.0) / 1800.0).clamp(0.0, 1.0));
-        let uplift = 0.025 + strength * (0.30 * high + 0.15 * rock) * (1.0 - 0.4 * arid);
+        let uplift = (strength * 0.15f64.mul_add(rock, 0.30 * high))
+            .mul_add(0.4f64.mul_add(-arid, 1.0), 0.025);
         // Heterogeneity of uplift over several kilometres, not height noise.
         *r = uplift
-            * (1.0 + 0.42 * noise(hash(SEED ^ 90), x, y))
+            * 0.42f64.mul_add(noise(hash(SEED ^ 0x5a), x, y), 1.0)
             * smooth((base.heights[i] / 180.0).clamp(0.0, 1.0));
     }
     for (level, steps) in [28, 14, 6, 0].into_iter().enumerate() {
@@ -94,11 +100,9 @@ pub(super) fn generate(base: &Grid, mut climate: Climate, strength: f64) -> (Gri
             let (x, y) = grid.coordinates(i);
             let h = grid.heights[i];
             let rock = climate.at(i)[1];
-            let amplitude = grid.spacing * (0.016 + 0.045 * rock);
-            grid.heights[i] += amplitude
-                * noise(seed, x, y)
-                * grid.boundary_weight(x, y)
-                * smooth((h / 130.0).clamp(0.0, 1.0));
+            let amplitude = grid.spacing * 0.045f64.mul_add(rock, 0.016);
+            grid.heights[i] = (amplitude * noise(seed, x, y) * grid.boundary_weight(x, y))
+                .mul_add(smooth((h / 130.0).clamp(0.0, 1.0)), grid.heights[i]);
         }
     }
     (grid, climate)

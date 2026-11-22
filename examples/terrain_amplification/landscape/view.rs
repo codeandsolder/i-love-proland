@@ -24,9 +24,9 @@ fn normalize(a: V3) -> V3 {
 }
 fn cross(a: V3, b: V3) -> V3 {
     [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
+        a[2].mul_add(-b[1], a[1] * b[2]),
+        a[0].mul_add(-b[2], a[2] * b[0]),
+        a[1].mul_add(-b[0], a[0] * b[1]),
     ]
 }
 fn sub(a: V3, b: V3) -> V3 {
@@ -71,8 +71,12 @@ impl Sample {
         })
     }
     fn blend(&self, f: impl Fn(usize) -> f64) -> f64 {
-        let [a, b, c, d] = self.ids.map(f);
-        lerp(lerp(a, b, self.tx), lerp(c, d, self.tx), self.ty)
+        let [southwest, southeast, northwest, northeast] = self.ids.map(f);
+        lerp(
+            lerp(southwest, southeast, self.tx),
+            lerp(northwest, northeast, self.tx),
+            self.ty,
+        )
     }
     fn elevation(&self, grid: &Grid, surface: &Surface) -> f64 {
         self.blend(|i| grid.heights[i].max(surface.water_level[i]).max(0.0))
@@ -155,11 +159,14 @@ fn trace(
     ray: V3,
     max_slope: f64,
 ) -> Option<(Sample, f64)> {
-    let speed = ray[2].abs() + max_slope * ray[0].hypot(ray[1]);
+    let speed = max_slope.mul_add(ray[0].hypot(ray[1]), ray[2].abs());
     let mut distance = 0.0_f64;
     let mut previous = 0.0_f64;
     let sample_at = |t: f64| Sample::at(grid, ray[0].mul_add(t, eye[0]), ray[1].mul_add(t, eye[1]));
-    while distance < 95_000.0 {
+    loop {
+        if !distance.is_finite() || distance >= 95_000.0 {
+            return None;
+        }
         let sample = sample_at(distance)?;
         let gap = ray[2].mul_add(distance, eye[2]) - sample.elevation(grid, surface);
         if gap <= 0.0 {
@@ -179,7 +186,6 @@ fn trace(
         previous = distance;
         distance += (gap / speed).clamp(0.5, 400.0);
     }
-    None
 }
 
 fn weather_at(
@@ -213,9 +219,12 @@ fn trace_weathered(
     bound: f64,
 ) -> Option<channel_mesh::Hit> {
     let horizontal = ray[0].hypot(ray[1]);
-    let speed = ray[2].abs() + bound * horizontal;
+    let speed = bound.mul_add(horizontal, ray[2].abs());
     let mut distance = 0.0_f64;
-    while distance < 95_000.0 {
+    loop {
+        if !distance.is_finite() || distance >= 95_000.0 {
+            return None;
+        }
         let x = ray[0].mul_add(distance, eye[0]);
         let y = ray[1].mul_add(distance, eye[1]);
         let sample = Sample::at(grid, x, y)?;
@@ -225,7 +234,6 @@ fn trace_weathered(
         }
         distance += ((gap - ChannelField::MAX_RAISE) / speed).min(400.0);
     }
-    None
 }
 
 fn render_weathered(
@@ -235,9 +243,9 @@ fn render_weathered(
     channels: &ChannelField,
     atlas: &rock::RockAtlas,
     path: &Path,
-    width: u16,
-    height: u16,
+    dimensions: [u16; 2],
 ) -> io::Result<()> {
+    let [width, height] = dimensions;
     let bound = max_slope(grid, surface);
     let subdiv = if width <= 960 { 32 } else { 16 };
     let mut mesh = channel_mesh::ChannelMesh::new(grid, surface, channels, subdiv);
@@ -245,10 +253,10 @@ fn render_weathered(
     let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
     for y in 0..height {
         for x in 0..width {
-            let u = (f64::from(x) + 0.5) * pixel_angle - 0.76;
-            let v = (f64::from(height) * 0.5 - f64::from(y) - 0.5) * pixel_angle;
+            let u = f64::mul_add(f64::from(x) + 0.5, pixel_angle, -0.76);
+            let v = (f64::mul_add(f64::from(height), 0.5, -f64::from(y)) - 0.5) * pixel_angle;
             let ray = normalize(std::array::from_fn(|i| {
-                camera.forward[i] + camera.right[i] * u + camera.up[i] * v
+                camera.up[i].mul_add(v, camera.right[i].mul_add(u, camera.forward[i]))
             }));
             let color = if let Some(hit) =
                 trace_weathered(grid, surface, &mut mesh, camera.eye, ray, bound)
@@ -257,14 +265,14 @@ fn render_weathered(
                 shading::shade_weathered(
                     grid,
                     surface,
-                    &hit.sample,
-                    p,
-                    ray,
-                    hit.distance,
-                    pixel_angle,
+                    &hit,
+                    shading::IncidentRay {
+                        position: p,
+                        direction: ray,
+                        distance: hit.distance,
+                        pixel_angle,
+                    },
                     atlas,
-                    hit.weather,
-                    hit.normal,
                 )
             } else {
                 shading::sky(ray)
@@ -298,8 +306,7 @@ pub(super) fn compare_weathering(
         channels,
         &atlas,
         &path.join(format!("{label}-weathered.ppm")),
-        1280,
-        720,
+        [1280, 720],
     )?;
     if let Some((center, direction)) = super::hydro::weathering::viewpoint(
         channels,
@@ -310,8 +317,16 @@ pub(super) fn compare_weathering(
         if norm > 0.0 {
             let tangent = direction.map(|v| v / norm);
             let eye_xy = [
-                center[0] - tangent[0] * 380.0 + tangent[1] * 220.0,
-                center[1] - tangent[1] * 380.0 - tangent[0] * 220.0,
+                f64::mul_add(
+                    tangent[1],
+                    220.0,
+                    f64::mul_add(tangent[0], -380.0, center[0]),
+                ),
+                f64::mul_add(
+                    tangent[0],
+                    -220.0,
+                    f64::mul_add(tangent[1], -380.0, center[1]),
+                ),
             ];
             if let (Some(eye_sample), Some(target_sample)) = (
                 Sample::at(grid, eye_xy[0], eye_xy[1]),
@@ -339,8 +354,7 @@ pub(super) fn compare_weathering(
                     channels,
                     &atlas,
                     &path.join(format!("{label}-river-close.ppm")),
-                    960,
-                    540,
+                    [960, 540],
                 )?;
             }
         }
@@ -373,7 +387,7 @@ fn render_legacy(
             std::array::from_fn::<_, 3, _>(|c| {
                 lerp(
                     surface.colors[i][c] * illum,
-                    [0.095, 0.34, 0.42][c] * (0.85 + 0.15 * illum),
+                    [0.095, 0.34, 0.42][c] * 0.15f64.mul_add(illum, 0.85),
                     surface.water[i],
                 )
             })
@@ -387,7 +401,7 @@ fn render_legacy(
                 (1.0 - 2.0 * (f64::from(y) + 0.5) / f64::from(height)) * 0.76 * f64::from(height)
                     / f64::from(width);
             let ray = normalize(std::array::from_fn(|i| {
-                camera.forward[i] + camera.right[i] * u + camera.up[i] * v
+                camera.up[i].mul_add(v, camera.right[i].mul_add(u, camera.forward[i]))
             }));
             let sky = [0.53, 0.70, 0.82];
             let horizon = [0.68, 0.77, 0.80];
@@ -450,16 +464,27 @@ pub(super) fn compare_shading(
         let mut bytes = format!("P6\n{W} {H}\n255\n").into_bytes();
         for y in 0..H {
             for x in 0..W {
-                let u = (f64::from(x) + 0.5) * pixel_angle - 0.76;
-                let v = (f64::from(H) * 0.5 - f64::from(y) - 0.5) * pixel_angle;
+                let u = f64::mul_add(f64::from(x) + 0.5, pixel_angle, -0.76);
+                let v = (f64::mul_add(f64::from(H), 0.5, -f64::from(y)) - 0.5) * pixel_angle;
                 let ray = normalize(std::array::from_fn(|i| {
-                    camera.forward[i] + camera.right[i] * u + camera.up[i] * v
+                    camera.up[i].mul_add(v, camera.right[i].mul_add(u, camera.forward[i]))
                 }));
                 let color = if let Some((sample, distance)) =
                     trace(grid, surface, camera.eye, ray, bound)
                 {
                     let p = std::array::from_fn(|i| ray[i].mul_add(distance, camera.eye[i]));
-                    shading::shade(grid, surface, &sample, p, ray, distance, pixel_angle, style)
+                    shading::shade(
+                        grid,
+                        surface,
+                        &sample,
+                        shading::IncidentRay {
+                            position: p,
+                            direction: ray,
+                            distance,
+                            pixel_angle,
+                        },
+                        style,
+                    )
                 } else {
                     shading::sky(ray)
                 };

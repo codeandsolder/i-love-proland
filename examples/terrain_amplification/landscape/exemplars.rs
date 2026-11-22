@@ -15,7 +15,7 @@ struct Patch {
     descriptor: Descriptor,
 }
 
-fn rotate(o: u8, x: i32, y: i32) -> (i32, i32) {
+const fn rotate(o: u8, x: i32, y: i32) -> (i32, i32) {
     match o {
         0 => (x, y),
         1 => (-y, x),
@@ -32,21 +32,28 @@ fn offset(g: &Grid, x: u16, y: u16, dx: i32, dy: i32) -> usize {
     let clamp = |v: i32| u16::try_from(v.clamp(0, i32::from(g.cells))).unwrap_or_default();
     g.index(clamp(i32::from(x) + dx), clamp(i32::from(y) + dy))
 }
-fn describe(g: &Grid, heights: &[f64], x: u16, y: u16, orientation: u8, radius: u16) -> Descriptor {
+fn describe(
+    grid: &Grid,
+    heights: &[f64],
+    x: u16,
+    y: u16,
+    orientation: u8,
+    radius: u16,
+) -> Descriptor {
     let sample = |dx, dy| {
         let (dx, dy) = rotate(orientation, dx, dy);
-        heights[offset(g, x, y, dx, dy)]
+        heights[offset(grid, x, y, dx, dy)]
     };
     let half = i32::from(radius / 2);
-    let a = sample(-half, 0);
-    let b = sample(half, 0);
-    let c = sample(0, -half);
-    let d = sample(0, half);
-    let length = f64::from(radius) * g.spacing;
+    let west = sample(-half, 0);
+    let east = sample(half, 0);
+    let south = sample(0, -half);
+    let north = sample(0, half);
+    let length = f64::from(radius) * grid.spacing;
     Descriptor([
-        (b - a) / length,
-        (d - c) / length,
-        (sample(0, 0) - (a + b + c + d) * 0.25) / (length * 0.5),
+        (east - west) / length,
+        (north - south) / length,
+        f64::mul_add(west + east + south + north, -0.25, sample(0, 0)) / (length * 0.5),
     ])
 }
 
@@ -74,8 +81,8 @@ impl Atlas {
             ));
         }
         let mut source = Grid::new(CELLS, 62.5);
-        for (height, chunk) in source.heights.iter_mut().zip(bytes.chunks_exact(2)) {
-            *height = f64::from(i16::from_le_bytes([chunk[0], chunk[1]]));
+        for (height, chunk) in source.heights.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            *height = f64::from(i16::from_le_bytes(*chunk));
         }
         let broad = blur(&source, &source.heights, passes);
         let residual: Vec<_> = source
@@ -113,7 +120,7 @@ impl Atlas {
             limit,
         })
     }
-    pub(super) fn source(&self) -> &Grid {
+    pub(super) const fn source(&self) -> &Grid {
         &self.source
     }
     fn choose(&self, target: Descriptor, key: u64) -> Option<Patch> {
@@ -128,8 +135,7 @@ impl Atlas {
                         hash(key ^ u64::try_from(i).unwrap_or_default()) & 0xffff_ffff,
                     )
                     .unwrap_or_default();
-                    x.mul_add(x, y * y)
-                        + 2.0 * k * k
+                    f64::mul_add(2.0 * k, k, x.mul_add(x, y * y))
                         + 0.045 * f64::from(bits) / f64::from(u32::MAX)
                 };
                 score(*ia, *a).total_cmp(&score(*ib, *b))
@@ -197,7 +203,7 @@ impl Atlas {
                         let i = grid.index(x, y);
                         let w = (1.0 - smooth(f64::from(dx.abs()) / f64::from(radius)))
                             * (1.0 - smooth(f64::from(dy.abs()) / f64::from(radius)));
-                        result[i] += w * self.residual[source];
+                        result[i] = w.mul_add(self.residual[source], result[i]);
                         weights[i] += w;
                     }
                 }
@@ -213,30 +219,19 @@ impl Atlas {
             let [gx, gy] = super::gradient(&original, x, y);
             let relief = smooth((gx.hypot(gy) / 0.55).min(1.0));
             let amplitude = strength
-                * (0.16 + 0.84 * rock.max(relief))
-                * (1.0 - 0.8 * arid)
+                * 0.84f64.mul_add(rock.max(relief), 0.16)
+                * 0.8f64.mul_add(-arid, 1.0)
                 * smooth((h / 600.0).clamp(0.0, 1.0))
                 * smooth((distance[i] / 320.0).min(1.0))
                 * grid.boundary_weight(x, y);
-            grid.heights[i] += amplitude * (result[i] / weights[i]).clamp(-self.limit, self.limit);
+            grid.heights[i] = amplitude.mul_add(
+                (result[i] / weights[i]).clamp(-self.limit, self.limit),
+                grid.heights[i],
+            );
         }
         if constrain {
-            let after = super::Drainage::compute(grid);
-            let mut corrected = 0;
-            let mut max_lift = 0.0_f64;
-            for i in 0..grid.heights.len() {
-                if original.heights[i] <= 0.0 {
-                    continue;
-                }
-                let old_depth = (flow.filled[i] - original.heights[i]).max(0.0);
-                let low = after.filled[i] - old_depth;
-                let lift = (low - grid.heights[i]).max(0.0);
-                if lift > 1e-8 {
-                    corrected += 1;
-                    max_lift = max_lift.max(lift);
-                }
-                grid.heights[i] = grid.heights[i].max(low);
-            }
+            let (corrected, max_lift) =
+                super::preserve_depression_depth(grid, &original, &flow.filled);
             println!(
                 "drainage constraint corrected {corrected} points, maximum lift {max_lift:.2}m"
             );

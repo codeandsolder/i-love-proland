@@ -4,10 +4,6 @@ use super::{Grid, hash, smooth};
 
 fn unit(key: u64) -> f64 {
     // Upper 24 bits fit exactly in f64 after narrowing to u32.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "shifted key occupies exactly 24 bits"
-    )]
     let bits = (hash(key) >> 40) as u32;
     f64::from(bits) / 16_777_216.0
 }
@@ -56,7 +52,7 @@ fn wave(seed: u64, point: [f64; 2], transverse: [f64; 2]) -> f64 {
     }
 }
 
-pub(super) fn apply(grid: &mut Grid, seed: u64, amplitude: f64) {
+pub fn apply(grid: &mut Grid, seed: u64, amplitude: f64) {
     let mut residual = vec![0.0; grid.heights.len()];
     for (i, &height) in grid.heights.iter().enumerate() {
         let (x, y) = grid.coordinates(i);
