@@ -19,16 +19,19 @@ a CPU-side visibility simulation.
   general KSP/Parallax affine placements including nonuniform scale and tilt.
   The impostor shader evaluates source-local azimuth/elevation through the
   inverse quaternion and projects conservative view-dependent half-extents.
-- Construct each unique immutable `TreeMesh` once (cloning shares its
-  underlying GPU buffers), and construct a single `GpuCompactor` with an
-  ordered `MeshLods` (first material index count per tier), plus a final
-  impostor index count of 6. Upload the combined `AtlasImage` and source
-  albedo views (compressed or uncompressed). Create
-  `TreeRenderer::new(device, compactor, sources, &atlas, config)` with
+- Construct one device-scoped `CompactionPipeline` and one
+  `TreePipelines` per compatible render-target configuration. All
+  families share these actual compute/render pipelines, bind layouts,
+  samplers, placeholder texture and quad index buffer. Construct each
+  unique immutable `TreeMesh` once (cloning shares GPU buffers).
+  Upload the combined `AtlasImage` and source albedo views, then create
+  `TreeRenderer::new(&pipelines, capacity, lods, sources, &atlas)` with
   `sources: Vec<Vec<TreeMaterial>>`, one material vector per mesh tier.
   All tiers must have nonempty source materials and their first index
-  count must match the corresponding compactor metadata.
-- Before each render pass, call `renderer.reserve(device, candidate_count)`
+  count must match the corresponding compactor metadata. The family owns an independent
+  compactor, material uniforms, source texture bindings and indirect counts;
+  immutable resource sharing never merges family populations.
+- Before each render pass, call `renderer.reserve(candidate_count)`
   if needed, then `renderer.encode(queue, encoder, candidates, view)`.
   The renderer owns its compactor and resizes just candidate/visible buffers
   and per-tier dynamic bind groups; all immutable mesh/material and pipeline

@@ -129,7 +129,10 @@ pass without per-bin prefix scans, extra dispatches or per-object CPU
 work. Padding is never drawn. Empty frames reset all indirect counts
 before returning.
 
-Use distinct compactors or a higher-level pool for different material
+Construct one `CompactionPipeline::new(device)` and pass its reference
+to each `GpuCompactor::new(&pipeline, capacity, lods, impostor_count)`.
+The pipeline and its device/layout are shared, while mutable buffers are
+independent. Use distinct compactors for different material
 batches. For moving aircraft, prefetch canonical cells ahead of the craft
 and maintain the near physics bubble separately from camera-local visual
 projection.
