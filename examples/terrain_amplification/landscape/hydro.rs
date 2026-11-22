@@ -1,5 +1,7 @@
 //! Regional water features extracted from the generated spill surface and
 //! connected drainage network. This is a geometric preview, not fluid dynamics.
+pub(super) mod weathering;
+
 use super::{Grid, Rivers, lerp};
 use std::{fmt::Write, fs, io, path::Path};
 

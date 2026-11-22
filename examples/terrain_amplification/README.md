@@ -97,3 +97,38 @@ The final preview is not the game shader or a physical water simulation:
 the finer material detail does not alter the terrain silhouette, and
 low-altitude geometry, spherical addressing, and GPU implementation
 remain separate experiments.
+
+## Fluvial weathering experiment
+
+With the same native map, biome and DEM inputs, select `weathered` as
+the final positional mode. It preserves the preferred gentle-natural
+regional terrain and its drainage receiver graph. The preview now uses
+a deterministic local channel field, rather than merely painting a
+river coverage mask on the ground.
+
+The field derives longitudinal water stages from filled drainage
+heights and rainfall-weighted upstream area, smooths the centerline on
+low-gradient reaches, and adds bounded channel-width-dependent
+meanders with phase integrated along the graph. Metric cross sections
+cut the bed below the water stage, grade banks into terraces, and use
+bend-dependent scour and accreted point bars, with broader alluvial
+weathering in flat valleys. Local solid-ground adjustments are limited
+to -42/+6 m relative to the original field. Wet sediment, gravel,
+riparian vegetation color, shallows, and reflective water use these
+same geometry/material queries.
+
+The CPU preview lazily samples the local field at 16 subdivisions
+per 62.5 m cell (3.90625 m), or 32 for the close-up (1.953125 m).
+Coarse ray skipping uses the +6 m upper envelope; fine candidates
+are intersected with ordered cell traversal and bilinear surface
+intersection, including cases where a ray enters and leaves within
+one patch. Each fine cell samples both bed and free surface. The old
+regional field remains unchanged outside the finite channel support.
+Only visible candidates are refined, with no new persistent asset.
+
+The two reference views per region are `*-weathered.ppm` at 1280×720
+using the previous aircraft camera and `*-river-close.ppm` at 960×540
+using a deterministic low-altitude diagnostic camera near a river.
+This is geomorphic profile synthesis, not time-integrated sediment
+transport or fluid dynamics; the local field has not yet been wired
+into KSP physics, the production GPU renderer, or global spherical LOD.

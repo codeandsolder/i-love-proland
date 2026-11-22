@@ -190,22 +190,7 @@ pub(super) fn shade(
     let geologic = matches!(style, Style::Geologic { .. });
     let mut albedo: V3 = std::array::from_fn(|i| sample.blend(|j| surface.colors[j][i]));
     if geologic {
-        let (v, _) = field(p, [230.0, 185.0, 170.0], 201);
-        let (small, _) = field(p, [76.0, 92.0, 68.0], 207);
-        let local_slope = bump[2].clamp(0.0, 1.0);
-        // Green valleys break into vegetation and exposed soils;
-        // talus / bedrock transitions depend on the local normal.
-        let snow = smooth(((albedo[0].min(albedo[1]).min(albedo[2]) - 0.5) / 0.25).clamp(0.0, 1.0));
-        let exposed =
-            smooth(((1.0 - local_slope - 0.075 + 0.12 * v) / 0.4).clamp(0.0, 1.0)) * (1.0 - snow);
-        let green = smooth(((albedo[1] - albedo[0] + 0.01) / 0.09).clamp(0.0, 1.0));
-        let patch = smooth(((v + 0.3) / 0.75).clamp(0.0, 1.0));
-        let variation = 1.0 + 0.14 * v + 0.08 * small;
-        for (i, c) in albedo.iter_mut().enumerate() {
-            let soil = lerp(*c, [0.40, 0.34, 0.24][i], green * patch * 0.22);
-            let stone = [0.48, 0.455, 0.42][i] * variation;
-            *c = lerp(soil, stone, exposed * 0.36);
-        }
+        albedo = geologic_albedo(p, bump, albedo);
     }
     let shade = visibility(grid, p);
     let sun = dot(bump, normalize(SUN)).max(0.0) * shade;
@@ -225,6 +210,136 @@ pub(super) fn shade(
         let land = linear(albedo[i]) * illumination * tint;
         let wet = linear([0.095, 0.34, 0.42][i]) * (0.8 + 0.2 * shade);
         srgb(lerp(lerp(land, wet, water), linear(HORIZON[i]), fog))
+    })
+}
+
+fn geologic_albedo(p: V3, bump: V3, mut albedo: V3) -> V3 {
+    let (v, _) = field(p, [230.0, 185.0, 170.0], 201);
+    let (small, _) = field(p, [76.0, 92.0, 68.0], 207);
+    let local_slope = bump[2].clamp(0.0, 1.0);
+    // Green valleys break into vegetation and exposed soils;
+    // talus / bedrock transitions depend on the local normal.
+    let snow = smooth(((albedo[0].min(albedo[1]).min(albedo[2]) - 0.5) / 0.25).clamp(0.0, 1.0));
+    let exposed =
+        smooth(((1.0 - local_slope - 0.075 + 0.12 * v) / 0.4).clamp(0.0, 1.0)) * (1.0 - snow);
+    let green = smooth(((albedo[1] - albedo[0] + 0.01) / 0.09).clamp(0.0, 1.0));
+    let patch = smooth(((v + 0.3) / 0.75).clamp(0.0, 1.0));
+    let variation = 1.0 + 0.14 * v + 0.08 * small;
+    for (i, c) in albedo.iter_mut().enumerate() {
+        let soil = lerp(*c, [0.40, 0.34, 0.24][i], green * patch * 0.22);
+        let stone = [0.48, 0.455, 0.42][i] * variation;
+        *c = lerp(soil, stone, exposed * 0.36);
+    }
+    albedo
+}
+
+use super::Weathered;
+
+pub(super) fn shade_weathered(
+    grid: &Grid,
+    surface: &Surface,
+    sample: &Sample,
+    p: V3,
+    ray: V3,
+    distance: f64,
+    pixel_angle: f64,
+    atlas: &RockAtlas,
+    weather: Weathered,
+    fine_normal: Option<V3>,
+) -> V3 {
+    let coarse = normal(grid, sample);
+    let mask = weather.bank.max(weather.gravel).max(weather.floodplain);
+    let blend = smooth((mask * 4.0).clamp(0.0, 1.0));
+    let n = fine_normal.map_or(coarse, |n| {
+        normalize(std::array::from_fn(|i| lerp(coarse[i], n[i], blend)))
+    });
+    let footprint = distance * pixel_angle / (-dot(n, ray)).abs().max(0.24);
+    let rock = smooth((((1.0 - n[2]) - 0.035) / 0.27).clamp(0.0, 1.0));
+    let (bump, tint) = atlas.sample(p, n, footprint, rock.max(weather.gravel * 0.75));
+    let mut albedo = geologic_albedo(
+        p,
+        bump,
+        std::array::from_fn(|i| sample.blend(|j| surface.colors[j][i])),
+    );
+    let (v, _) = field(p, [105.0, 85.0, 47.0], 0x414c4c55);
+    let (grain, _) = field(p, [21.0, 17.0, 13.0], 0x534544);
+    // Spatially coherent riparian vegetation clumps and sorted gravel.
+    // Fade each small-scale band before it becomes smaller than a pixel.
+    let fine_band = 1.0 - smooth(((footprint / 4.0 - 0.25) / 0.75).clamp(0.0, 1.0));
+    let mid_band = 1.0 - smooth(((footprint / 16.0 - 0.25) / 0.75).clamp(0.0, 1.0));
+    let (fine, _) = field(p, [4.1, 3.2, 2.8], 0x47524156);
+    let (clumps, _) = field(p, [12.0, 17.0, 9.0], 0x52495041);
+    let sorted = fine * fine_band * 0.25 + clumps * mid_band * 0.75;
+    let flat = smooth(((n[2] - 0.72) / 0.28).clamp(0.0, 1.0));
+    let patch = smooth(((v + 0.22) / 0.85).clamp(0.0, 1.0));
+    let grain_mask = smooth(((grain + 0.15) / 0.75).clamp(0.0, 1.0));
+    let gravel = (0.32 * weather.gravel * patch
+        + 1.1 * weather.point_bar
+        + 0.12 * smooth((weather.deposit / 2.5).min(1.0)))
+        * flat;
+    let bank = weather.bank * (0.13 + 0.24 * grain_mask) + weather.scour * 0.29;
+    let flood = weather.floodplain
+        * flat
+        * (0.12 + 0.60 * smooth((v + 0.4 + 0.32 * sorted).clamp(0.0, 1.0)));
+    for (i, c) in albedo.iter_mut().enumerate() {
+        let sediment = [0.50, 0.465, 0.385][i] * (1.0 + 0.23 * grain + 0.29 * sorted);
+        let damp = [0.25, 0.245, 0.20][i] * (1.0 + 0.19 * v);
+        let riparian = [0.18, 0.30, 0.115][i] * (1.0 + 0.25 * v + 0.18 * grain + 0.30 * sorted);
+        *c = lerp(
+            lerp(
+                lerp(*c, riparian, flood.clamp(0.0, 1.0)),
+                sediment,
+                gravel.clamp(0.0, 1.0),
+            ),
+            damp,
+            bank.clamp(0.0, 1.0),
+        );
+    }
+    let sun = normalize(SUN);
+    let shade = visibility(grid, p);
+    let ambient =
+        0.12 + 0.21 * bump[2].max(0.0) + 0.23 * dot(bump, normalize([0.76, -0.41, 0.5])).max(0.0);
+    let illumination = ambient + 1.05 * dot(bump, sun).max(0.0) * shade;
+    let fog = 1.0 - (-distance / 128_000.0).exp();
+    let standing = weather.water.is_some();
+    let water_color = if standing {
+        // A water surface reflects the sky at grazing angles and transmits
+        // the submerged sediment at normal incidence. Depth controls
+        // attenuation; do not illuminate water like a blue terrain texture.
+        let band = 1.0 - smooth(((footprint / 12.0 - 0.25) / 0.75).clamp(0.0, 1.0));
+        let (_, g) = field(p, [12.0, 8.0, 30.0], 0x57415645);
+        let (_, g2) = field(p, [4.0, 5.7, 18.0], 0x57415646);
+        let wn = normalize([
+            -0.54 * band * g[0] - 0.16 * fine_band * g2[0],
+            -0.54 * band * g[1] - 0.16 * fine_band * g2[1],
+            1.0,
+        ]);
+        let fresnel = 0.025 + 0.975 * (1.0 - (-dot(wn, ray)).clamp(0.0, 1.0)).powi(5);
+        let reflect = std::array::from_fn(|i| ray[i] - 2.0 * dot(wn, ray) * wn[i]);
+        let reflected = sky(reflect);
+        let sparkle = dot(normalize(std::array::from_fn(|i| sun[i] - ray[i])), wn)
+            .max(0.0)
+            .powi(96)
+            * shade;
+        let depth = weather.depth;
+        std::array::from_fn(|i| {
+            let bed = linear([0.47, 0.435, 0.335][i] * (1.0 + 0.22 * sorted));
+            let transmission =
+                (-depth / ([1.7, 3.8, 3.0][i] * (-dot(wn, ray)).abs().max(0.25))).exp();
+            let transmitted = lerp(linear([0.09, 0.245, 0.225][i]), bed, transmission);
+            lerp(
+                transmitted * (0.45 + 0.55 * shade),
+                linear(reflected[i]),
+                fresnel,
+            ) + 0.14 * sparkle
+        })
+    } else {
+        [0.0; 3]
+    };
+    std::array::from_fn(|i| {
+        let land = linear(albedo[i]) * illumination * tint;
+        let radiance = if standing { water_color[i] } else { land };
+        srgb(lerp(radiance, linear(HORIZON[i]), fog))
     })
 }
 

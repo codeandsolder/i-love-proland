@@ -1,9 +1,14 @@
 //! Small deterministic reference renderer for evaluating relief from a cockpit
 //! instead of relying exclusively on overhead hillshades. Not the game renderer.
+mod channel_mesh;
 mod rock;
 mod shading;
 
-use super::{Grid, Surface, lerp, light, rgb};
+use super::{
+    Grid, Surface,
+    hydro::weathering::{ChannelField, Weathered},
+    lerp, light, rgb,
+};
 use std::{fs, io, path::Path};
 
 type V3 = [f64; 3];
@@ -175,6 +180,171 @@ fn trace(
         distance += (gap / speed).clamp(0.5, 400.0);
     }
     None
+}
+
+fn weather_at(
+    grid: &Grid,
+    surface: &Surface,
+    channels: &ChannelField,
+    sample: &Sample,
+    p: [f64; 2],
+) -> Weathered {
+    let base = sample.blend(|i| grid.heights[i]);
+    let standing = sample.blend(|i| grid.heights[i].max(surface.water_level[i]).max(0.0));
+    if standing > base + 0.02 {
+        return Weathered {
+            bed: base,
+            water: Some(standing),
+            depth: standing - base,
+            ..Weathered::default()
+        };
+    }
+    channels.at(p, base)
+}
+
+// Far above the terrain use the conservative coarse slope bound and
+// the guaranteed +6 m upper envelope; near the surface use cell traversal.
+fn trace_weathered(
+    grid: &Grid,
+    surface: &Surface,
+    mesh: &mut channel_mesh::ChannelMesh<'_>,
+    eye: V3,
+    ray: V3,
+    bound: f64,
+) -> Option<channel_mesh::Hit> {
+    let horizontal = ray[0].hypot(ray[1]);
+    let speed = ray[2].abs() + bound * horizontal;
+    let mut distance = 0.0_f64;
+    while distance < 95_000.0 {
+        let x = ray[0].mul_add(distance, eye[0]);
+        let y = ray[1].mul_add(distance, eye[1]);
+        let sample = Sample::at(grid, x, y)?;
+        let gap = ray[2].mul_add(distance, eye[2]) - sample.elevation(grid, surface);
+        if gap <= ChannelField::MAX_RAISE + 2.0 {
+            return mesh.trace(eye, ray, distance, 95_000.0);
+        }
+        distance += ((gap - ChannelField::MAX_RAISE) / speed).min(400.0);
+    }
+    None
+}
+
+fn render_weathered(
+    grid: &Grid,
+    surface: &Surface,
+    camera: &Camera,
+    channels: &ChannelField,
+    atlas: &rock::RockAtlas,
+    path: &Path,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
+    let bound = max_slope(grid, surface);
+    let subdiv = if width <= 960 { 32 } else { 16 };
+    let mut mesh = channel_mesh::ChannelMesh::new(grid, surface, channels, subdiv);
+    let pixel_angle = 1.52 / f64::from(width);
+    let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
+    for y in 0..height {
+        for x in 0..width {
+            let u = (f64::from(x) + 0.5) * pixel_angle - 0.76;
+            let v = (f64::from(height) * 0.5 - f64::from(y) - 0.5) * pixel_angle;
+            let ray = normalize(std::array::from_fn(|i| {
+                camera.forward[i] + camera.right[i] * u + camera.up[i] * v
+            }));
+            let color = if let Some(hit) =
+                trace_weathered(grid, surface, &mut mesh, camera.eye, ray, bound)
+            {
+                let p = std::array::from_fn(|i| ray[i].mul_add(hit.distance, camera.eye[i]));
+                shading::shade_weathered(
+                    grid,
+                    surface,
+                    &hit.sample,
+                    p,
+                    ray,
+                    hit.distance,
+                    pixel_angle,
+                    atlas,
+                    hit.weather,
+                    hit.normal,
+                )
+            } else {
+                shading::sky(ray)
+            };
+            bytes.extend(color.map(rgb));
+        }
+    }
+    println!(
+        "weathered fine cells: {} ({}x{} subcells)",
+        mesh.cells(),
+        subdiv,
+        subdiv
+    );
+    fs::write(path, bytes)
+}
+
+pub(super) fn compare_weathering(
+    grid: &Grid,
+    surface: &Surface,
+    camera: &Camera,
+    source: &Grid,
+    channels: &ChannelField,
+    path: &Path,
+    label: &str,
+) -> io::Result<()> {
+    let atlas = rock::RockAtlas::new(source);
+    render_weathered(
+        grid,
+        surface,
+        camera,
+        channels,
+        &atlas,
+        &path.join(format!("{label}-weathered.ppm")),
+        1280,
+        720,
+    )?;
+    if let Some((center, direction)) = channels.viewpoint(
+        [camera.eye[0], camera.eye[1]],
+        f64::from(grid.cells) * grid.spacing,
+    ) {
+        let norm = direction[0].hypot(direction[1]);
+        if norm > 0.0 {
+            let tangent = direction.map(|v| v / norm);
+            let eye_xy = [
+                center[0] - tangent[0] * 380.0 + tangent[1] * 220.0,
+                center[1] - tangent[1] * 380.0 - tangent[0] * 220.0,
+            ];
+            if let (Some(eye_sample), Some(target_sample)) = (
+                Sample::at(grid, eye_xy[0], eye_xy[1]),
+                Sample::at(grid, center[0], center[1]),
+            ) {
+                let eye = [
+                    eye_xy[0],
+                    eye_xy[1],
+                    eye_sample.elevation(grid, surface) + 320.0,
+                ];
+                let target = [center[0], center[1], target_sample.elevation(grid, surface)];
+                let forward = normalize(sub(target, eye));
+                let right = normalize(cross(forward, [0.0, 0.0, 1.0]));
+                let up = cross(right, forward);
+                let close = Camera {
+                    eye,
+                    forward,
+                    right,
+                    up,
+                };
+                render_weathered(
+                    grid,
+                    surface,
+                    &close,
+                    channels,
+                    &atlas,
+                    &path.join(format!("{label}-river-close.ppm")),
+                    960,
+                    540,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn render(
