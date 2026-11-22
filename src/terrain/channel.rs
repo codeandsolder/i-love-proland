@@ -104,24 +104,13 @@ impl Weathered {
 #[derive(Debug)]
 pub struct ChannelField {
     reaches: Vec<Reach>,
-    buckets: Vec<Bucket>,
+    buckets: Vec<Vec<usize>>,
+    widths: MinWidthPyramid,
     side: usize,
 }
 
-#[derive(Clone, Debug)]
-struct Bucket {
-    indices: Vec<usize>,
-    minimum_width: f64,
-}
-
-impl Default for Bucket {
-    fn default() -> Self {
-        Self {
-            indices: Vec::new(),
-            minimum_width: f64::INFINITY,
-        }
-    }
-}
+mod width_pyramid;
+use width_pyramid::MinWidthPyramid;
 
 struct Profile {
     radius: f64,
@@ -163,12 +152,9 @@ impl ChannelField {
         )]
         #[expect(clippy::cast_sign_loss, reason = "positive regional grid extent")]
         let side = (extent / BUCKET).ceil() as usize + 1;
-        let mut result = Self {
-            reaches,
-            buckets: vec![Bucket::default(); side * side],
-            side,
-        };
-        for (i, reach) in result.reaches.iter().enumerate() {
+        let mut buckets = vec![Vec::new(); side * side];
+        let mut widths = vec![f64::INFINITY; side * side];
+        for (i, reach) in reaches.iter().enumerate() {
             let radius = reach.a.width.max(reach.b.width) * 0.6;
             let bank = 24.0_f64.mul_add(reach.valley, 0.48_f64.mul_add(radius, 10.0));
             let terrace = 100.0_f64.mul_add(
@@ -177,19 +163,23 @@ impl ChannelField {
             );
             let margin = 1.8_f64.mul_add(bank, radius + terrace + 20.0);
             let [xmin, ymin] =
-                std::array::from_fn(|c| result.bin(reach.a.xy[c].min(reach.b.xy[c]) - margin));
+                std::array::from_fn(|c| Self::bin(side, reach.a.xy[c].min(reach.b.xy[c]) - margin));
             let [xmax, ymax] =
-                std::array::from_fn(|c| result.bin(reach.a.xy[c].max(reach.b.xy[c]) + margin));
+                std::array::from_fn(|c| Self::bin(side, reach.a.xy[c].max(reach.b.xy[c]) + margin));
             for y in ymin..=ymax {
                 for x in xmin..=xmax {
-                    let bucket = &mut result.buckets[y * side + x];
-                    bucket.indices.push(i);
-                    bucket.minimum_width =
-                        bucket.minimum_width.min(reach.a.width.min(reach.b.width));
+                    let index = y * side + x;
+                    buckets[index].push(i);
+                    widths[index] = widths[index].min(reach.a.width.min(reach.b.width));
                 }
             }
         }
-        Ok(result)
+        Ok(Self {
+            reaches,
+            buckets,
+            widths: MinWidthPyramid::new(side, widths),
+            side,
+        })
     }
 
     /// Return the original directed segments, in deterministic graph order.
@@ -197,31 +187,26 @@ impl ChannelField {
     pub fn reaches(&self) -> &[Reach] {
         &self.reaches
     }
-    fn bin(&self, p: f64) -> usize {
+    fn bin(side: usize, p: f64) -> usize {
         #[expect(clippy::cast_possible_truncation, reason = "bounded regional bin")]
         #[expect(clippy::cast_sign_loss, reason = "nonnegative bin")]
         let i = (p / BUCKET).max(0.0).floor() as usize;
-        i.min(self.side - 1)
+        i.min(side - 1)
     }
 
     fn candidates(&self, p: [f64; 2]) -> &[usize] {
-        let [x, y] = p.map(|v| self.bin(v));
-        &self.buckets[y * self.side + x].indices
+        let [x, y] = p.map(|v| Self::bin(self.side, v));
+        &self.buckets[y * self.side + x]
     }
 
     /// Conservative minimum nominal width of candidate reaches over a
     /// chart rectangle. This uses the same support bins as point sampling.
     /// No per-candidate distance test or allocation is needed.
     pub(super) fn minimum_width(&self, min: [f64; 2], max: [f64; 2]) -> Option<f64> {
-        let [xmin, ymin] = min.map(|v| self.bin(v));
-        let [xmax, ymax] = max.map(|v| self.bin(v));
-        let mut width = f64::INFINITY;
-        for y in ymin..=ymax {
-            for bucket in &self.buckets[y * self.side + xmin..=y * self.side + xmax] {
-                width = width.min(bucket.minimum_width);
-            }
-        }
-        width.is_finite().then_some(width)
+        self.widths.minimum(
+            min.map(|v| Self::bin(self.side, v)),
+            max.map(|v| Self::bin(self.side, v)),
+        )
     }
 
     fn projection(reach: Reach, p: [f64; 2]) -> (f64, f64) {
