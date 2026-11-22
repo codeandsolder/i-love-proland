@@ -3,7 +3,9 @@
 //! external conversion tools without adding runtime dependencies to the library.
 
 use i_love_proland::atlas_bake::{BakeSurface, bake_scene};
-use i_love_proland::gpu::{GpuCompactor, GpuView, MeshLod, MeshLods, PackedInstance, RenderPose};
+use i_love_proland::gpu::{
+    GpuCompactor, GpuView, MeshLod, MeshLods, PackedInstance, RenderPose, VisualLod, classify_cpu,
+};
 use i_love_proland::impostor::{
     AtlasImage, AtlasTexture, TreeCamera, TreeMaterial, TreeMesh, TreeRenderConfig, TreeRenderer,
     TreeVertex,
@@ -328,7 +330,6 @@ fn background_pipeline(device: &wgpu::Device, fragment_entry: &str) -> wgpu::Ren
 #[derive(Clone, Copy)]
 struct ForestPass<'a> {
     queue: &'a wgpu::Queue,
-    compactor: &'a GpuCompactor,
     renderer: &'a TreeRenderer,
     candidates: &'a [PackedInstance],
     view: GpuView,
@@ -342,9 +343,8 @@ fn render_frame(
     scene: &ForestPass<'_>,
 ) -> Result<(), Box<dyn Error>> {
     scene
-        .compactor
+        .renderer
         .encode(scene.queue, encoder, scene.candidates, scene.view)?;
-    scene.renderer.encode_mesh_draws(encoder);
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("i-love-proland real forest GPU draw"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -607,16 +607,6 @@ fn validate_source_billboards(
         uv,
     });
     let card = TreeMesh::new(device, &vertices, &[0, 1, 2, 2, 1, 3])?;
-    let compactor = GpuCompactor::new(
-        device,
-        1,
-        MeshLods::new(vec![MeshLod {
-            start_m: 0.0,
-            index_count: card.index_count(),
-            prefer_mesh: false,
-        }])?,
-        6,
-    )?;
     let candidates = [PackedInstance {
         position_radius: [0.0, 0.4, 8.0, 1.7],
         rotation: [
@@ -632,9 +622,19 @@ fn validate_source_billboards(
     }];
     let (camera, view) = pitched_view(0.0)?;
     let render = |billboard| -> Result<usize, Box<dyn Error>> {
+        let compactor = GpuCompactor::new(
+            device,
+            1,
+            MeshLods::new(vec![MeshLod {
+                start_m: 0.0,
+                index_count: card.index_count(),
+                prefer_mesh: false,
+            }])?,
+            6,
+        )?;
         let renderer = TreeRenderer::new(
             device,
-            &compactor,
+            compactor,
             vec![vec![TreeMaterial {
                 mesh: card.clone(),
                 source_view: white,
@@ -657,7 +657,6 @@ fn validate_source_billboards(
             &mut encoder,
             &ForestPass {
                 candidates: &candidates,
-                compactor: &compactor,
                 renderer: &renderer,
                 view,
                 ..*scene
@@ -731,49 +730,51 @@ struct SourceViews<'a> {
 /// Share two immutable source meshes across every tier; keep their cutoffs.
 fn make_source_renderer(
     device: &wgpu::Device,
-    compactor: &GpuCompactor,
+    compactor: GpuCompactor,
     trunk_mesh: &TreeMesh,
     leaf_mesh: &TreeMesh,
     atlas_texture: &AtlasTexture,
     views: &SourceViews<'_>,
 ) -> Result<TreeRenderer, Box<dyn Error>> {
+    let materials = compactor
+        .mesh_lods()
+        .tiers()
+        .iter()
+        .map(|_| {
+            vec![
+                TreeMaterial {
+                    mesh: trunk_mesh.clone(),
+                    source_view: views.bark,
+                    alpha_cutoff: 0.0,
+                    billboard: None,
+                    wind: None,
+                },
+                TreeMaterial {
+                    mesh: leaf_mesh.clone(),
+                    source_view: views.foliage,
+                    alpha_cutoff: 0.45,
+                    billboard: None,
+                    wind: Some(i_love_proland::impostor::MeshWind {
+                        parameters: i_love_proland::wind::WindParameters {
+                            spatial_scale: 0.08,
+                            height_start: 0.0,
+                            height_exponent: 1.62,
+                            speed: 2.1,
+                            intensity: 0.7,
+                        },
+                        map: views.wind,
+                        source_center_y: 1.0,
+                        source_radius: 1.0,
+                    }),
+                },
+            ]
+        })
+        .collect();
+    let count = compactor.mesh_lods().tiers().len();
     let renderer = TreeRenderer::new(
         device,
         compactor,
-        compactor
-            .mesh_lods()
-            .tiers()
-            .iter()
-            .map(|_| {
-                vec![
-                    TreeMaterial {
-                        mesh: trunk_mesh.clone(),
-                        source_view: views.bark,
-                        alpha_cutoff: 0.0,
-                        billboard: None,
-                        wind: None,
-                    },
-                    TreeMaterial {
-                        mesh: leaf_mesh.clone(),
-                        source_view: views.foliage,
-                        alpha_cutoff: 0.45,
-                        billboard: None,
-                        wind: Some(i_love_proland::impostor::MeshWind {
-                            parameters: i_love_proland::wind::WindParameters {
-                                spatial_scale: 0.08,
-                                height_start: 0.0,
-                                height_exponent: 1.62,
-                                speed: 2.1,
-                                intensity: 0.7,
-                            },
-                            map: views.wind,
-                            source_center_y: 1.0,
-                            source_radius: 1.0,
-                        }),
-                    },
-                ]
-            })
-            .collect(),
+        materials,
         atlas_texture,
         TreeRenderConfig {
             color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -781,10 +782,7 @@ fn make_source_renderer(
             sample_count: 1,
         },
     )?;
-    assert_eq!(
-        renderer.material_count(),
-        2 * compactor.mesh_lods().tiers().len()
-    );
+    assert_eq!(renderer.material_count(), 2 * count);
     Ok(renderer)
 }
 
@@ -853,6 +851,116 @@ fn capture_initial_forest(
     Ok(greens)
 }
 
+/// Exercise every ordinary mesh tier and the impostor bin before/after
+/// capacity growth. Nonoverlapping screen positions avoid depth-tie noise.
+fn validate_capacity_growth(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut TreeRenderer,
+    targets: &FrameTargets,
+    background: &wgpu::RenderPipeline,
+    view: GpuView,
+    required: usize,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = [
+        [-15.0, -3.0, 30.0, 8.0],
+        [0.0, -3.0, 65.0, 8.0],
+        [65.0, -3.0, 130.0, 8.0],
+        [-650.0, -3.0, 800.0, 8.0],
+    ]
+    .map(|position_radius| PackedInstance {
+        position_radius,
+        rotation: [0.0, 0.0, 0.0, 1.0],
+        axis_radii: [8.0, 8.0, 8.0, 1.0],
+        object_id: [1; 4],
+        metadata: [2; 4],
+        tint: [1.0; 4],
+    });
+    let lods = renderer.compactor().mesh_lods();
+    for (tier, object) in fixture[..3].iter().enumerate() {
+        assert_eq!(
+            classify_cpu(object, view, lods),
+            VisualLod::Mesh(tier.min(lods.tiers().len() - 1))
+        );
+    }
+    assert_eq!(classify_cpu(&fixture[3], view, lods), VisualLod::Impostor);
+    let subset_capture = |renderer: &TreeRenderer, candidates: &[PackedInstance]| {
+        let scene = ForestPass {
+            queue,
+            renderer,
+            candidates,
+            view,
+            color: &targets.color_view,
+            depth: &targets.depth_view,
+            background,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        render_frame(&mut encoder, &scene)?;
+        capture(device, queue, encoder, &targets.color)
+    };
+    let initial_count = renderer.compactor().capacity();
+    let empty = subset_capture(renderer, &[])?;
+    let before = subset_capture(renderer, &fixture)?;
+    assert_ne!(empty, before, "fixture must render visible geometry");
+    let bin = renderer.compactor().bin(0).ok_or("missing first bin")?;
+    let previous_indirect = bin.indirect.clone();
+    let previous_visible = bin.instances.buffer.clone();
+    let growth_started = Instant::now();
+    assert!(renderer.reserve(device, u32::try_from(required)?)?);
+    let growth_ms = growth_started.elapsed().as_secs_f64() * 1000.0;
+    let bin = renderer
+        .compactor()
+        .bin(0)
+        .ok_or("missing grown first bin")?;
+    assert_eq!(&previous_indirect, bin.indirect);
+    assert_ne!(&previous_visible, bin.instances.buffer);
+    assert!(!renderer.reserve(device, 1)?);
+    assert!(renderer.reserve(device, u32::MAX).is_err());
+    let after = subset_capture(renderer, &fixture)?;
+    assert_eq!(
+        before, after,
+        "capacity growth changed the same submitted scene"
+    );
+    println!(
+        "FOREST_RESERVE_PASS initial={initial_count} capacity={} growth_ms={growth_ms:.3} pixel_identical=true",
+        renderer.compactor().capacity()
+    );
+    Ok(())
+}
+
+fn bake_reference_atlas(
+    trunk_vertices: &[TreeVertex],
+    trunk_indices: &[u32],
+    leaf_vertices: &[TreeVertex],
+    leaf_indices: &[u32],
+    bark: &SourceImage,
+    source: &SourceImage,
+) -> Result<(AtlasImage, f64), Box<dyn Error>> {
+    let start = Instant::now();
+    let atlas = bake_scene(
+        &[
+            BakeSurface {
+                vertices: trunk_vertices,
+                indices: trunk_indices,
+                source: bark,
+                alpha_cutoff: 0.0,
+                billboard: None,
+            },
+            BakeSurface {
+                vertices: leaf_vertices,
+                indices: leaf_indices,
+                source,
+                alpha_cutoff: 0.45,
+                billboard: None,
+            },
+        ],
+        64,
+        2,
+    )?;
+    let atlas_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok((atlas, atlas_ms))
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let prefix = args.next().ok_or(
@@ -871,42 +979,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|index| index - 20)
         .collect::<Vec<_>>();
     let bark = SourceImage::white();
-    let start = Instant::now();
-    let atlas = bake_scene(
-        &[
-            BakeSurface {
-                vertices: trunk_vertices,
-                indices: trunk_indices,
-                source: &bark,
-                alpha_cutoff: 0.0,
-                billboard: None,
-            },
-            BakeSurface {
-                vertices: leaf_vertices,
-                indices: &leaf_indices,
-                source: &source,
-                alpha_cutoff: 0.45,
-                billboard: None,
-            },
-        ],
-        64,
-        2,
+    let (atlas, atlas_ms) = bake_reference_atlas(
+        trunk_vertices,
+        trunk_indices,
+        leaf_vertices,
+        &leaf_indices,
+        &bark,
+        &source,
     )?;
-    let atlas_ms = start.elapsed().as_secs_f64() * 1000.0;
     write_atlas_preview(&format!("{prefix}-atlas.ppm"), &atlas)?;
 
     let (candidates, generation_ms) = generate_forest()?;
     let (device, queue) = create_device()?;
     let trunk_mesh = TreeMesh::new(&device, trunk_vertices, trunk_indices)?;
     let leaf_mesh = TreeMesh::new(&device, leaf_vertices, &leaf_indices)?;
-    let compactor = example_compactor(&device, candidates.len(), trunk_mesh.index_count())?;
+    let compactor =
+        example_compactor(&device, candidates.len().min(256), trunk_mesh.index_count())?;
     let atlas_texture = atlas.upload(&device, &queue)?;
     let bark_texture = bark.upload(&device, &queue)?;
     let source_texture = source.upload(&device, &queue)?;
     let wind_texture = wind_fixture()?.upload(&device, &queue)?;
-    let renderer = make_source_renderer(
+    let mut renderer = make_source_renderer(
         &device,
-        &compactor,
+        compactor,
         &trunk_mesh,
         &leaf_mesh,
         &atlas_texture,
@@ -922,9 +1017,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let color = &targets.color;
     let background = background_pipeline(&device, "fs_main");
     let overhead_background = background_pipeline(&device, "fs_overhead");
+    validate_capacity_growth(
+        &device,
+        &queue,
+        &mut renderer,
+        &targets,
+        &background,
+        view,
+        candidates.len(),
+    )?;
     let scene = ForestPass {
         queue: &queue,
-        compactor: &compactor,
         renderer: &renderer,
         candidates: &candidates,
         view,

@@ -470,6 +470,7 @@ pub struct GpuCompactor {
     indirect: wgpu::Buffer,
     bin_stride: u64,
     uniforms: wgpu::Buffer,
+    thresholds: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::ComputePipeline,
     templates: Vec<IndexedDraw>,
@@ -546,6 +547,55 @@ fn compaction_sizes(
     Ok((bytes, bin_stride, visible_bytes))
 }
 
+fn create_instance_buffer(device: &wgpu::Device, name: &str, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(name),
+        size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_compaction_bind(
+    device: &wgpu::Device,
+    pipeline: &wgpu::ComputePipeline,
+    input: &wgpu::Buffer,
+    visible: &wgpu::Buffer,
+    indirect: &wgpu::Buffer,
+    thresholds: &wgpu::Buffer,
+    uniforms: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    let layout = pipeline.get_bind_group_layout(0);
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("i-love-proland GPU buffers"),
+        layout: &layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: input.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: visible.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: indirect.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: thresholds.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: uniforms.as_entire_binding(),
+            },
+        ],
+    })
+}
+
 impl GpuCompactor {
     /// # Errors
     /// Rejects capacity, tier count, storage or workgroup requirements
@@ -558,18 +608,9 @@ impl GpuCompactor {
     ) -> Result<Self> {
         let (bytes, bin_stride, visible_bytes) =
             compaction_sizes(device, capacity, &mesh_lods, impostor_index_count)?;
-        let create_instance_buffer = |name, size| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(name),
-                size,
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            })
-        };
-        let input = create_instance_buffer("i-love-proland candidate input", bytes);
-        let visible = create_instance_buffer("i-love-proland compacted LOD bins", visible_bytes);
+        let input = create_instance_buffer(device, "i-love-proland candidate input", bytes);
+        let visible =
+            create_instance_buffer(device, "i-love-proland compacted LOD bins", visible_bytes);
         let templates = mesh_lods
             .tiers
             .iter()
@@ -613,33 +654,15 @@ impl GpuCompactor {
             mapped_at_creation: false,
         });
         let pipeline = create_compaction_pipeline(device);
-        let layout = pipeline.get_bind_group_layout(0);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("i-love-proland GPU buffers"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: visible.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: indirect.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: thresholds.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: uniforms.as_entire_binding(),
-                },
-            ],
-        });
+        let bind_group = create_compaction_bind(
+            device,
+            &pipeline,
+            &input,
+            &visible,
+            &indirect,
+            &thresholds,
+            &uniforms,
+        );
         Ok(Self {
             capacity,
             mesh_lods,
@@ -648,10 +671,51 @@ impl GpuCompactor {
             indirect,
             bin_stride,
             uniforms,
+            thresholds,
             bind_group,
             pipeline,
             templates,
         })
+    }
+
+    /// Only the two capacity-dependent buffers and their compute binding
+    /// change. The caller must refresh render-side compacted-bin bindings.
+    pub(crate) fn reserve(&mut self, device: &wgpu::Device, required: u32) -> Result<bool> {
+        if required <= self.capacity {
+            return Ok(false);
+        }
+        let impostor_count = self.templates[self.mesh_lods.impostor_bin()].index_count;
+        let rounded = required.checked_next_power_of_two().unwrap_or(required);
+        let (capacity, (bytes, bin_stride, visible_bytes)) =
+            match compaction_sizes(device, rounded, &self.mesh_lods, impostor_count) {
+                Ok(sizes) => (rounded, sizes),
+                Err(_) => (
+                    required,
+                    compaction_sizes(device, required, &self.mesh_lods, impostor_count)?,
+                ),
+            };
+        let input = create_instance_buffer(device, "i-love-proland candidate input", bytes);
+        let visible =
+            create_instance_buffer(device, "i-love-proland compacted LOD bins", visible_bytes);
+        let bind_group = create_compaction_bind(
+            device,
+            &self.pipeline,
+            &input,
+            &visible,
+            &self.indirect,
+            &self.thresholds,
+            &self.uniforms,
+        );
+        self.input = input;
+        self.visible = visible;
+        self.bind_group = bind_group;
+        self.bin_stride = bin_stride;
+        self.capacity = capacity;
+        Ok(true)
+    }
+
+    pub(crate) const fn indirect(&self) -> &wgpu::Buffer {
+        &self.indirect
     }
 
     #[must_use]

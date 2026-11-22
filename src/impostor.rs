@@ -1,7 +1,7 @@
 //! Actual instanced source-mesh and multi-angle impostor rendering.
 //! Consumes compacted GPU buffers without reading back their contents.
 
-use crate::gpu::{CompactedBin, GpuCompactor, IndexedDraw};
+use crate::gpu::{CompactedBin, GpuCompactor, GpuView, IndexedDraw, PackedInstance};
 use crate::{
     Error, Result,
     atlas_bake::to_byte,
@@ -419,6 +419,7 @@ struct MeshDraw {
     bind: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     indirect: wgpu::Buffer,
+    tier: usize,
     source_indirect_offset: u64,
     cutoff: f32,
     wind: Option<MaterialWind>,
@@ -433,7 +434,9 @@ pub struct TreeRenderer {
     mesh_draws: Vec<MeshDraw>,
     impostor_bind: wgpu::BindGroup,
     impostor_uniforms: wgpu::Buffer,
-    source_indirect: wgpu::Buffer,
+    instance_layout: wgpu::BindGroupLayout,
+    instance_bindings: Vec<wgpu::BindGroup>,
+    compactor: GpuCompactor,
     impostor_indirect_offset: u64,
     quad_indices: wgpu::Buffer,
     alpha_to_coverage: bool,
@@ -518,16 +521,6 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 count: None,
             },
             BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::VERTEX,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
                 binding: 2,
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Texture {
@@ -573,6 +566,44 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+fn instance_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("i-love-proland shared tier instance layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+fn instance_bindings(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    compactor: &GpuCompactor,
+) -> Result<Vec<wgpu::BindGroup>> {
+    (0..compactor.bin_count())
+        .map(|tier| {
+            let bin = compactor
+                .bin(tier)
+                .ok_or(Error::InvalidConfiguration("missing instance bin"))?;
+            Ok(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("i-love-proland shared tier instances"),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(bin.instances),
+                }],
+            }))
+        })
+        .collect()
+}
+
 struct MaterialBindings<'a> {
     atlas: &'a AtlasTexture,
     atlas_sampler: &'a wgpu::Sampler,
@@ -584,7 +615,6 @@ struct MaterialBindings<'a> {
 fn make_draw_bind(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
-    instances: wgpu::BufferBinding<'_>,
     uniforms: &wgpu::Buffer,
     materials: &MaterialBindings<'_>,
 ) -> wgpu::BindGroup {
@@ -595,10 +625,6 @@ fn make_draw_bind(
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: uniforms.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Buffer(instances),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -647,7 +673,7 @@ fn new_uniform(device: &wgpu::Device) -> wgpu::Buffer {
 
 fn build_mesh_draw(
     device: &wgpu::Device,
-    bin: &CompactedBin<'_>,
+    tier: (usize, &CompactedBin<'_>),
     source: TreeMaterial<'_>,
     layout: &wgpu::BindGroupLayout,
     atlas: &AtlasTexture,
@@ -658,7 +684,6 @@ fn build_mesh_draw(
     let bind = make_draw_bind(
         device,
         layout,
-        bin.instances.clone(),
         &uniforms,
         &MaterialBindings {
             atlas,
@@ -687,7 +712,8 @@ fn build_mesh_draw(
         bind,
         uniforms,
         indirect,
-        source_indirect_offset: bin.indirect_offset,
+        tier: tier.0,
+        source_indirect_offset: tier.1.indirect_offset,
         cutoff: source.alpha_cutoff,
         billboard: source.billboard,
         wind: source.wind.map(|wind| MaterialWind {
@@ -700,7 +726,6 @@ fn build_mesh_draw(
 
 fn make_impostor_bind(
     device: &wgpu::Device,
-    bin: &CompactedBin<'_>,
     layout: &wgpu::BindGroupLayout,
     uniforms: &wgpu::Buffer,
     atlas: &AtlasTexture,
@@ -727,7 +752,6 @@ fn make_impostor_bind(
     make_draw_bind(
         device,
         layout,
-        bin.instances.clone(),
         uniforms,
         &MaterialBindings {
             atlas,
@@ -794,12 +818,12 @@ impl TreeRenderer {
     /// compactor mesh/impostor arguments.
     pub fn new(
         device: &wgpu::Device,
-        compactor: &GpuCompactor,
+        compactor: GpuCompactor,
         sources: Vec<Vec<TreeMaterial<'_>>>,
         atlas: &AtlasTexture,
         config: TreeRenderConfig,
     ) -> Result<Self> {
-        validate_material_tiers(compactor, &sources, config)?;
+        validate_material_tiers(&compactor, &sources, config)?;
         let impostor_bin = compactor
             .bin(compactor.mesh_lods().impostor_bin())
             .ok_or(Error::InvalidConfiguration("missing impostor bin"))?;
@@ -816,9 +840,11 @@ impl TreeRenderer {
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
         let layout = render_layout(device);
+        let instance_layout = instance_layout(device);
+        let instance_bindings = instance_bindings(device, &instance_layout, &compactor)?;
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("i-love-proland tree render pipeline layout"),
-            bind_group_layouts: &[Some(&layout)],
+            bind_group_layouts: &[Some(&layout), Some(&instance_layout)],
             immediate_size: 0,
         });
         let mut mesh_draws = Vec::new();
@@ -829,7 +855,7 @@ impl TreeRenderer {
             mesh_draws.extend(materials.into_iter().map(|source| {
                 build_mesh_draw(
                     device,
-                    &bin,
+                    (tier, &bin),
                     source,
                     &layout,
                     atlas,
@@ -841,7 +867,6 @@ impl TreeRenderer {
         let impostor_uniforms = new_uniform(device);
         let impostor_bind = make_impostor_bind(
             device,
-            &impostor_bin,
             &layout,
             &impostor_uniforms,
             atlas,
@@ -880,11 +905,35 @@ impl TreeRenderer {
             mesh_draws,
             impostor_bind,
             impostor_uniforms,
-            source_indirect: impostor_bin.indirect.clone(),
+            instance_layout,
+            instance_bindings,
             impostor_indirect_offset: impostor_bin.indirect_offset,
+            compactor,
             quad_indices,
             alpha_to_coverage: config.sample_count > 1,
         })
+    }
+
+    /// Read-only access to classification metadata and compacted bins.
+    #[must_use]
+    pub const fn compactor(&self) -> &GpuCompactor {
+        &self.compactor
+    }
+
+    /// Grow instance storage while preserving all source geometry, textures,
+    /// pipelines, camera uniforms and indirect records. Call before encoding
+    /// the next frame; that frame uploads fresh candidates.
+    ///
+    /// # Errors
+    /// Rejects a requested capacity beyond the device limits.
+    pub fn reserve(&mut self, device: &wgpu::Device, required: u32) -> Result<bool> {
+        if self.compactor.reserve(device, required)? {
+            self.instance_bindings =
+                instance_bindings(device, &self.instance_layout, &self.compactor)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Upload one camera matrix, keeping original alpha cutoffs per material.
@@ -929,19 +978,29 @@ impl TreeRenderer {
         queue.write_buffer(&self.impostor_uniforms, 0, bytemuck::bytes_of(&uniform));
     }
 
-    /// Copy the GPU-computed tier instance count into each material's indirect
-    /// draw arguments, preserving its original index count. This must happen
-    /// after compaction and before drawing, in the same encoder.
-    pub fn encode_mesh_draws(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// Classify the submitted candidates, then copy each GPU-computed tier
+    /// count into its material indirect arguments in the same encoder.
+    ///
+    /// # Errors
+    /// Rejects candidate batches exceeding the reserved capacity.
+    pub fn encode(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        candidates: &[PackedInstance],
+        view: GpuView,
+    ) -> Result<()> {
+        self.compactor.encode(queue, encoder, candidates, view)?;
         for material in &self.mesh_draws {
             encoder.copy_buffer_to_buffer(
-                &self.source_indirect,
+                self.compactor.indirect(),
                 material.source_indirect_offset + 4,
                 &material.indirect,
                 4,
                 4,
             );
         }
+        Ok(())
     }
 
     /// Draw every mesh tier's materials with its compacted instance set,
@@ -950,14 +1009,20 @@ impl TreeRenderer {
         pass.set_pipeline(&self.mesh_pipeline);
         for material in &self.mesh_draws {
             pass.set_bind_group(0, &material.bind, &[]);
+            pass.set_bind_group(1, &self.instance_bindings[material.tier], &[]);
             pass.set_vertex_buffer(0, material.mesh.vertex.slice(..));
             pass.set_index_buffer(material.mesh.index.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed_indirect(&material.indirect, 0);
         }
         pass.set_pipeline(&self.impostor_pipeline);
         pass.set_bind_group(0, &self.impostor_bind, &[]);
+        pass.set_bind_group(
+            1,
+            &self.instance_bindings[self.instance_bindings.len() - 1],
+            &[],
+        );
         pass.set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed_indirect(&self.source_indirect, self.impostor_indirect_offset);
+        pass.draw_indexed_indirect(self.compactor.indirect(), self.impostor_indirect_offset);
     }
 
     #[must_use]
@@ -1016,8 +1081,8 @@ mod tests {
         for (view, layer) in bytes.chunks_exact(layer_bytes).enumerate() {
             let mut offset = 0;
             for level in 0..levels {
-                let size = (side >> level).pow(2) as usize;
-                let pixels = &layer[offset..offset + size * 4];
+                let pixel_count = (side >> level).pow(2) as usize;
+                let pixels = &layer[offset..offset + pixel_count * 4];
                 let mut mean = 0.0;
                 for pixel in pixels.as_chunks::<4>().0 {
                     let alpha = f64::from(pixel[3]) / 255.0;
@@ -1029,7 +1094,7 @@ mod tests {
                 }
                 mean /= f64::from((side >> level).pow(2));
                 assert!((mean - 1.0 / f64::from(side)).abs() <= 0.5 / 255.0 + 1e-9);
-                offset += size * 4;
+                offset += pixel_count * 4;
             }
         }
     }

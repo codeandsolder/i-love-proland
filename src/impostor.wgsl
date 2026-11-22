@@ -29,7 +29,7 @@ struct RenderUniform {
 }
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
-@group(0) @binding(1) var<storage, read> objects: array<Instance>;
+@group(1) @binding(0) var<storage, read> objects: array<Instance>;
 @group(0) @binding(2) var atlas_texture: texture_2d_array<f32>;
 @group(0) @binding(3) var atlas_sampler: sampler;
 @group(0) @binding(4) var source_texture: texture_2d<f32>;
