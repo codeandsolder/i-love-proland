@@ -955,6 +955,18 @@ fn bake_reference_atlas(
     Ok((atlas, atlas_ms))
 }
 
+fn forest_pipelines(device: &wgpu::Device) -> Result<TreePipelines, Box<dyn Error>> {
+    Ok(TreePipelines::new(
+        &CompactionPipeline::new(device),
+        TreeRenderConfig {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            depth_format: wgpu::TextureFormat::Depth24Plus,
+            depth_compare: wgpu::CompareFunction::Less,
+            sample_count: 1,
+        },
+    )?)
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let prefix = args.next().ok_or(
@@ -987,15 +999,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (device, queue) = create_device()?;
     let trunk_mesh = TreeMesh::new(&device, trunk_vertices, trunk_indices)?;
     let leaf_mesh = TreeMesh::new(&device, leaf_vertices, &leaf_indices)?;
-    let pipelines = TreePipelines::new(
-        &CompactionPipeline::new(&device),
-        TreeRenderConfig {
-            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            depth_format: wgpu::TextureFormat::Depth24Plus,
-            depth_compare: wgpu::CompareFunction::Less,
-            sample_count: 1,
-        },
-    )?;
+    let pipelines = forest_pipelines(&device)?;
     let lods = example_lods(trunk_mesh.index_count())?;
     let atlas_texture = atlas.upload(&device, &queue)?;
     let bark_texture = bark.upload(&device, &queue)?;
