@@ -198,6 +198,56 @@ fn check_presentation(
     Ok(())
 }
 
+fn check_prediction(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    terrain: &TerrainGpu,
+    initial: &[RigidBody],
+    sphere: &[Sphere],
+    expected: Option<u64>,
+) -> Result<()> {
+    let mut predictor = PhysicsGpu::new(
+        device,
+        terrain,
+        0,
+        PhysicsConfig {
+            stop_at_contact: true,
+            ..CONFIG
+        },
+        initial,
+        sphere,
+    )?;
+    let mut prediction_commands = encoder(device);
+    predictor.encode(
+        device,
+        &mut prediction_commands,
+        terrain,
+        StepBatch {
+            start_tick: 0,
+            steps: 960,
+            hz: CONFIG.hz,
+        },
+    )?;
+    let predicted = predictor.snapshot(device, &mut prediction_commands);
+    queue.submit([prediction_commands.finish()]);
+    let mut pending = predicted.begin();
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let predicted = pending
+        .try_take()?
+        .ok_or_else(|| io::Error::other("prediction unfinished"))?;
+    assert_eq!(predicted[0].metadata[2], 3);
+    assert_eq!(predicted[0].first_contact_tick(), expected);
+    assert_eq!(
+        predicted[0].first_contact_tick(),
+        Some(predicted[0].completed_tick())
+    );
+    println!(
+        "GPU_PHYSICS predicted_first_contact={:?}",
+        predicted[0].first_contact_tick()
+    );
+    Ok(())
+}
+
 pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = slope_region(0.0)?;
     let mut terrain = TerrainGpu::new(device, &region, 65, 1, 0, 0.0)?;
@@ -219,45 +269,14 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     }];
     let initial = [body([32.0, 32.0, 103.0], [0.0; 3], 1)];
     let (a, _) = simulate(device, queue, &terrain, &initial, &sphere, 64)?;
-    let mut predictor = PhysicsGpu::new(
+    check_prediction(
         device,
+        queue,
         &terrain,
-        0,
-        PhysicsConfig {
-            stop_at_contact: true,
-            ..CONFIG
-        },
         &initial,
         &sphere,
+        a[0].first_contact_tick(),
     )?;
-    let mut prediction_commands = encoder(device);
-    predictor.encode(
-        device,
-        &mut prediction_commands,
-        &terrain,
-        StepBatch {
-            start_tick: 0,
-            steps: 960,
-            hz: CONFIG.hz,
-        },
-    )?;
-    let predicted = predictor.snapshot(device, &mut prediction_commands);
-    queue.submit([prediction_commands.finish()]);
-    let mut pending = predicted.begin();
-    device.poll(wgpu::PollType::wait_indefinitely())?;
-    let predicted = pending
-        .try_take()?
-        .ok_or_else(|| io::Error::other("prediction unfinished"))?;
-    assert_eq!(predicted[0].metadata[2], 3);
-    assert_eq!(predicted[0].first_contact_tick(), a[0].first_contact_tick());
-    assert_eq!(
-        predicted[0].first_contact_tick(),
-        Some(predicted[0].completed_tick())
-    );
-    println!(
-        "GPU_PHYSICS predicted_first_contact={:?}",
-        predicted[0].first_contact_tick()
-    );
     let (b, _) = simulate(device, queue, &terrain, &initial, &sphere, 7)?;
     assert_eq!(
         bytemuck::cast_slice::<_, u8>(&a),
@@ -310,6 +329,10 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     assert_eq!(stopped[1].completed_tick(), 0);
     let many = vec![lander; 128];
     simulate(device, queue, &terrain, &many, &feet, 128)?;
+    check_slope(device, queue, &sphere)
+}
+
+fn check_slope(device: &wgpu::Device, queue: &wgpu::Queue, sphere: &[Sphere]) -> Result<()> {
     let region = slope_region(0.1)?;
     let mut sloped = TerrainGpu::new(device, &region, 65, 1, 0, 0.0)?;
     let mut commands = encoder(device);
@@ -326,10 +349,15 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let mut rolling = body([32.0, 32.0, 106.0], [0.0; 3], 1);
     rolling.clock = [u32::MAX - 100, 15, 0, 0];
     let start = rolling.completed_tick();
-    let (result, _) = simulate(device, queue, &sloped, &[rolling], &sphere, 128)?;
+    let (result, _) = simulate(device, queue, &sloped, &[rolling], sphere, 128)?;
     let result = result[0];
     assert_eq!(result.completed_tick(), start + 1440);
     assert_eq!(result.metadata[2], 0);
+    assert!(
+        result
+            .first_contact_tick()
+            .is_some_and(|tick| tick > start && tick <= result.completed_tick())
+    );
     let distance =
         0.1_f32.mul_add(-result.position[0], result.position[2] - 100.0) / 1.01_f32.sqrt();
     assert!(
