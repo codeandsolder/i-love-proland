@@ -4,11 +4,12 @@
 
 use i_love_proland::atlas_bake::{BakeSurface, bake_scene};
 use i_love_proland::gpu::{
-    GpuCompactor, GpuView, MeshLod, MeshLods, PackedInstance, RenderPose, VisualLod, classify_cpu,
+    CompactionPipeline, GpuView, MeshLod, MeshLods, PackedInstance, RenderPose, VisualLod,
+    classify_cpu,
 };
 use i_love_proland::impostor::{
-    AtlasImage, AtlasTexture, TreeCamera, TreeMaterial, TreeMesh, TreeRenderConfig, TreeRenderer,
-    TreeVertex,
+    AtlasImage, AtlasTexture, TreeCamera, TreeMaterial, TreeMesh, TreePipelines, TreeRenderConfig,
+    TreeRenderer, TreeVertex,
 };
 use i_love_proland::material::SourceImage;
 use i_love_proland::{Distribution, Domain, Generator, GeneratorConfig, Layer, TileKey, Variant};
@@ -622,19 +623,15 @@ fn validate_source_billboards(
     }];
     let (camera, view) = pitched_view(0.0)?;
     let render = |billboard| -> Result<usize, Box<dyn Error>> {
-        let compactor = GpuCompactor::new(
-            device,
-            1,
-            MeshLods::new(vec![MeshLod {
-                start_m: 0.0,
-                index_count: card.index_count(),
-                prefer_mesh: false,
-            }])?,
-            6,
-        )?;
+        let lods = MeshLods::new(vec![MeshLod {
+            start_m: 0.0,
+            index_count: card.index_count(),
+            prefer_mesh: false,
+        }])?;
         let renderer = TreeRenderer::new(
-            device,
-            compactor,
+            scene.renderer.pipelines(),
+            1,
+            lods,
             vec![vec![TreeMaterial {
                 mesh: card.clone(),
                 source_view: white,
@@ -643,11 +640,6 @@ fn validate_source_billboards(
                 billboard,
             }]],
             atlas,
-            TreeRenderConfig {
-                color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                depth_format: wgpu::TextureFormat::Depth24Plus,
-                sample_count: 1,
-            },
         )?;
         renderer.set_camera(scene.queue, camera);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -729,15 +721,15 @@ struct SourceViews<'a> {
 
 /// Share two immutable source meshes across every tier; keep their cutoffs.
 fn make_source_renderer(
-    device: &wgpu::Device,
-    compactor: GpuCompactor,
+    pipelines: &TreePipelines,
+    capacity: u32,
+    lods: MeshLods,
     trunk_mesh: &TreeMesh,
     leaf_mesh: &TreeMesh,
     atlas_texture: &AtlasTexture,
     views: &SourceViews<'_>,
 ) -> Result<TreeRenderer, Box<dyn Error>> {
-    let materials = compactor
-        .mesh_lods()
+    let materials = lods
         .tiers()
         .iter()
         .map(|_| {
@@ -770,18 +762,8 @@ fn make_source_renderer(
             ]
         })
         .collect();
-    let count = compactor.mesh_lods().tiers().len();
-    let renderer = TreeRenderer::new(
-        device,
-        compactor,
-        materials,
-        atlas_texture,
-        TreeRenderConfig {
-            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            depth_format: wgpu::TextureFormat::Depth24Plus,
-            sample_count: 1,
-        },
-    )?;
+    let count = lods.tiers().len();
+    let renderer = TreeRenderer::new(pipelines, capacity, lods, materials, atlas_texture)?;
     assert_eq!(renderer.material_count(), 2 * count);
     Ok(renderer)
 }
@@ -799,11 +781,7 @@ fn validate_green_forest(image: &[u8]) -> Result<usize, Box<dyn Error>> {
     Ok(greens)
 }
 
-fn example_compactor(
-    device: &wgpu::Device,
-    count: usize,
-    index_count: u32,
-) -> Result<GpuCompactor, Box<dyn Error>> {
+fn example_lods(index_count: u32) -> Result<MeshLods, Box<dyn Error>> {
     let starts = if std::env::var_os("PROLAND_SINGLE_MESH_TIER").is_some() {
         vec![0.0]
     } else {
@@ -819,7 +797,7 @@ fn example_compactor(
             })
             .collect(),
     )?;
-    Ok(GpuCompactor::new(device, u32::try_from(count)?, lods, 6)?)
+    Ok(lods)
 }
 
 fn validate_and_benchmark(
@@ -906,7 +884,7 @@ fn validate_capacity_growth(
     let previous_indirect = bin.indirect.clone();
     let previous_visible = bin.indices.buffer.clone();
     let growth_started = Instant::now();
-    assert!(renderer.reserve(device, u32::try_from(required)?)?);
+    assert!(renderer.reserve(u32::try_from(required)?)?);
     let growth_ms = growth_started.elapsed().as_secs_f64() * 1000.0;
     let bin = renderer
         .compactor()
@@ -914,8 +892,8 @@ fn validate_capacity_growth(
         .ok_or("missing grown first bin")?;
     assert_eq!(&previous_indirect, bin.indirect);
     assert_ne!(&previous_visible, bin.indices.buffer);
-    assert!(!renderer.reserve(device, 1)?);
-    assert!(renderer.reserve(device, u32::MAX).is_err());
+    assert!(!renderer.reserve(1)?);
+    assert!(renderer.reserve(u32::MAX).is_err());
     let after = subset_capture(renderer, &fixture)?;
     assert_eq!(
         before, after,
@@ -993,15 +971,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (device, queue) = create_device()?;
     let trunk_mesh = TreeMesh::new(&device, trunk_vertices, trunk_indices)?;
     let leaf_mesh = TreeMesh::new(&device, leaf_vertices, &leaf_indices)?;
-    let compactor =
-        example_compactor(&device, candidates.len().min(256), trunk_mesh.index_count())?;
+    let pipelines = TreePipelines::new(
+        &CompactionPipeline::new(&device),
+        TreeRenderConfig {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            depth_format: wgpu::TextureFormat::Depth24Plus,
+            sample_count: 1,
+        },
+    )?;
+    let lods = example_lods(trunk_mesh.index_count())?;
     let atlas_texture = atlas.upload(&device, &queue)?;
     let bark_texture = bark.upload(&device, &queue)?;
     let source_texture = source.upload(&device, &queue)?;
     let wind_texture = wind_fixture()?.upload(&device, &queue)?;
     let mut renderer = make_source_renderer(
-        &device,
-        compactor,
+        &pipelines,
+        u32::try_from(candidates.len().min(256))?,
+        lods,
         &trunk_mesh,
         &leaf_mesh,
         &atlas_texture,

@@ -475,7 +475,7 @@ pub struct GpuCompactor {
     uniforms: wgpu::Buffer,
     thresholds: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    pipeline: wgpu::ComputePipeline,
+    pipeline: CompactionPipeline,
     templates: Vec<IndexedDraw>,
 }
 
@@ -497,19 +497,42 @@ fn aligned_bin_stride(capacity: u32, alignment: u64) -> Option<u64> {
         .checked_mul(INDEX_BYTES)
 }
 
-fn create_compaction_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("i-love-proland visibility + LOD compaction WGSL"),
-        source: wgpu::ShaderSource::Wgsl(WGSL_COMPACTION.into()),
-    });
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("i-love-proland GPU compaction"),
-        layout: None,
-        module: &shader,
-        entry_point: Some("classify_and_compact"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
-        cache: None,
-    })
+/// Device-scoped immutable classification pipeline shared by any number
+/// of independently sized compactors and material families.
+#[derive(Clone)]
+pub struct CompactionPipeline {
+    device: wgpu::Device,
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+impl CompactionPipeline {
+    #[must_use]
+    pub fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("i-love-proland visibility + LOD compaction WGSL"),
+            source: wgpu::ShaderSource::Wgsl(WGSL_COMPACTION.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("i-love-proland GPU compaction"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("classify_and_compact"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let layout = pipeline.get_bind_group_layout(0);
+        Self {
+            device: device.clone(),
+            pipeline,
+            layout,
+        }
+    }
+
+    #[must_use]
+    pub const fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
 }
 
 fn compaction_sizes(
@@ -563,17 +586,16 @@ fn create_instance_buffer(device: &wgpu::Device, name: &str, size: u64) -> wgpu:
 
 fn create_compaction_bind(
     device: &wgpu::Device,
-    pipeline: &wgpu::ComputePipeline,
+    layout: &wgpu::BindGroupLayout,
     input: &wgpu::Buffer,
     visible: &wgpu::Buffer,
     indirect: &wgpu::Buffer,
     thresholds: &wgpu::Buffer,
     uniforms: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
-    let layout = pipeline.get_bind_group_layout(0);
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("i-love-proland GPU buffers"),
-        layout: &layout,
+        layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -604,11 +626,12 @@ impl GpuCompactor {
     /// Rejects capacity, tier count, storage or workgroup requirements
     /// exceeding device limits, and a zero impostor index count.
     pub fn new(
-        device: &wgpu::Device,
+        pipeline: &CompactionPipeline,
         capacity: u32,
         mesh_lods: MeshLods,
         impostor_index_count: u32,
     ) -> Result<Self> {
+        let device = pipeline.device();
         let (bytes, bin_stride, visible_bytes) =
             compaction_sizes(device, capacity, &mesh_lods, impostor_index_count)?;
         let input = create_instance_buffer(device, "i-love-proland candidate input", bytes);
@@ -659,10 +682,9 @@ impl GpuCompactor {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let pipeline = create_compaction_pipeline(device);
         let bind_group = create_compaction_bind(
             device,
-            &pipeline,
+            &pipeline.layout,
             &input,
             &visible,
             &indirect,
@@ -679,17 +701,18 @@ impl GpuCompactor {
             uniforms,
             thresholds,
             bind_group,
-            pipeline,
+            pipeline: pipeline.clone(),
             templates,
         })
     }
 
     /// Only the two capacity-dependent buffers and their compute binding
     /// change. The caller must refresh render-side compacted-bin bindings.
-    pub(crate) fn reserve(&mut self, device: &wgpu::Device, required: u32) -> Result<bool> {
+    pub(crate) fn reserve(&mut self, required: u32) -> Result<bool> {
         if required <= self.capacity {
             return Ok(false);
         }
+        let device = self.pipeline.device();
         let impostor_count = self.templates[self.mesh_lods.impostor_bin()].index_count;
         let rounded = required.checked_next_power_of_two().unwrap_or(required);
         let (capacity, (bytes, bin_stride, visible_bytes)) =
@@ -708,7 +731,7 @@ impl GpuCompactor {
         );
         let bind_group = create_compaction_bind(
             device,
-            &self.pipeline,
+            &self.pipeline.layout,
             &input,
             &visible,
             &self.indirect,
@@ -818,7 +841,7 @@ impl GpuCompactor {
             label: Some("i-love-proland compact and classify visible instances"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(&self.pipeline.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(count.div_ceil(WORKGROUP_SIZE), 1, 1);
         Ok(())

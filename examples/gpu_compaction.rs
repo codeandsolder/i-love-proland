@@ -3,8 +3,8 @@
 //! This is an end-to-end latency probe, not a shader-only timestamp benchmark.
 
 use i_love_proland::gpu::{
-    GpuCompactor, GpuView, IndexedDraw, MeshLod, MeshLods, PackedInstance, RenderPose, VisualLod,
-    classify_cpu,
+    CompactionPipeline, GpuCompactor, GpuView, IndexedDraw, MeshLod, MeshLods, PackedInstance,
+    RenderPose, VisualLod, classify_cpu,
 };
 use i_love_proland::{Distribution, Domain, Generator, GeneratorConfig, Layer, TileKey, Variant};
 use std::collections::{BTreeMap, BTreeSet};
@@ -295,7 +295,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     ])?;
     let (expected, canopy) = reference(&candidates, view, &lods);
     let (device, queue) = device()?;
-    let compactor = GpuCompactor::new(&device, u32::try_from(candidates.len())?, lods, 6)?;
+    let pipeline = CompactionPipeline::new(&device);
+    let compactor = GpuCompactor::new(&pipeline, u32::try_from(candidates.len())?, lods, 6)?;
 
     let (draws, first_gpu_ms) =
         gpu_parity(&device, &queue, &compactor, &candidates, view, &expected)?;
@@ -334,7 +335,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let preferred = MeshLods::new(preferred)?;
     let authored_view = view.with_explicit_population();
     let (authored_reference, _) = reference(&candidates, authored_view, &preferred);
-    let authored = GpuCompactor::new(&device, u32::try_from(candidates.len())?, preferred, 6)?;
+    let authored = GpuCompactor::new(&pipeline, u32::try_from(candidates.len())?, preferred, 6)?;
     let (authored_draws, _) = gpu_parity(
         &device,
         &queue,

@@ -134,7 +134,8 @@ camera-relative floats, `gpu::PackedInstance::from_instance` produces a fixed
 96-byte shader record. It retains all four object-ID words, two model-ID words
 and two layer-ID words through GPU filtering.
 
-`gpu::GpuCompactor` accepts an arbitrary candidate batch and a camera
+Construct one device-scoped `gpu::CompactionPipeline` for multiple
+compactors; a `gpu::GpuCompactor` accepts an arbitrary candidate batch and a camera
 frustum, then dispatches a WGSL compute pass that culls bounding spheres,
 chooses mesh vs impostor by **projected canopy diameter in pixels**, and
 selects the authored distance tier within the mesh class. The ordered

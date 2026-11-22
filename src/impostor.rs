@@ -1,7 +1,9 @@
 //! Actual instanced source-mesh and multi-angle impostor rendering.
 //! Consumes compacted GPU buffers without reading back their contents.
 
-use crate::gpu::{CompactedBin, GpuCompactor, GpuView, IndexedDraw, PackedInstance};
+use crate::gpu::{
+    CompactedBin, CompactionPipeline, GpuCompactor, GpuView, IndexedDraw, MeshLods, PackedInstance,
+};
 use crate::{
     Error, Result,
     atlas_bake::to_byte,
@@ -429,17 +431,13 @@ struct MeshDraw {
 /// Every authored mesh tier shares one GPU-visible instance list across its
 /// material draws, and the family emits one composite impostor draw.
 pub struct TreeRenderer {
-    mesh_pipeline: wgpu::RenderPipeline,
-    impostor_pipeline: wgpu::RenderPipeline,
+    pipelines: TreePipelines,
     mesh_draws: Vec<MeshDraw>,
     impostor_bind: wgpu::BindGroup,
     impostor_uniforms: wgpu::Buffer,
-    instance_layout: wgpu::BindGroupLayout,
     instance_bindings: Vec<wgpu::BindGroup>,
     compactor: GpuCompactor,
     impostor_indirect_offset: u64,
-    quad_indices: wgpu::Buffer,
-    alpha_to_coverage: bool,
 }
 
 fn render_pipeline(
@@ -730,53 +728,121 @@ fn build_mesh_draw(
     }
 }
 
-fn make_impostor_bind(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    uniforms: &wgpu::Buffer,
-    atlas: &AtlasTexture,
-    atlas_sampler: &wgpu::Sampler,
-    source_sampler: &wgpu::Sampler,
-) -> wgpu::BindGroup {
-    // The impostor shader uses only the composite atlas, while the common
-    // render layout still requires a valid source-albedo binding.
-    let placeholder = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("i-love-proland unused impostor source texture"),
-        size: wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let source_view = placeholder.create_view(&wgpu::TextureViewDescriptor::default());
-    make_draw_bind(
-        device,
-        layout,
-        uniforms,
-        &MaterialBindings {
-            atlas,
+/// Immutable device and render-target-specific state.
+///
+/// Clones share the
+/// actual GPU pipelines, layouts, samplers and billboard index buffer.
+/// Each physical family retains its own material and instance bindings.
+#[derive(Clone)]
+pub struct TreePipelines {
+    compaction: CompactionPipeline,
+    config: TreeRenderConfig,
+    mesh: wgpu::RenderPipeline,
+    impostor: wgpu::RenderPipeline,
+    material_layout: wgpu::BindGroupLayout,
+    instance_layout: wgpu::BindGroupLayout,
+    atlas_sampler: wgpu::Sampler,
+    source_sampler: wgpu::Sampler,
+    placeholder: wgpu::TextureView,
+    quad_indices: wgpu::Buffer,
+}
+
+impl TreePipelines {
+    /// Compile once for every compatible render-target configuration.
+    ///
+    /// # Errors
+    /// Rejects an invalid multisample count.
+    pub fn new(compaction: &CompactionPipeline, config: TreeRenderConfig) -> Result<Self> {
+        if config.sample_count == 0 || !config.sample_count.is_power_of_two() {
+            return Err(Error::InvalidConfiguration("invalid tree sample count"));
+        }
+        let device = compaction.device();
+        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("i-love-proland angular view trilinear sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let source_sampler = make_source_sampler(device);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("i-love-proland mesh and 32-angle impostor shader"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+        let material_layout = render_layout(device);
+        let instance_layout = instance_layout(device);
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("i-love-proland tree render pipeline layout"),
+            bind_group_layouts: &[Some(&material_layout), Some(&instance_layout)],
+            immediate_size: 0,
+        });
+        let vertex_layout = [Some(wgpu::VertexBufferLayout {
+            array_stride: core::mem::size_of::<TreeVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
+        })];
+        let mesh = render_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            PassKind::Mesh,
+            &vertex_layout,
+            config,
+        );
+        let impostor = render_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            PassKind::Impostor,
+            &[],
+            config,
+        );
+        let quad_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("i-love-proland billboard quad 6 indices"),
+            contents: bytemuck::cast_slice(&[0_u32, 1, 2, 2, 1, 3]),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let placeholder = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("i-love-proland unused impostor source texture"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        Ok(Self {
+            compaction: compaction.clone(),
+            config,
+            mesh,
+            impostor,
+            material_layout,
+            instance_layout,
             atlas_sampler,
-            source_view: &source_view,
             source_sampler,
-            wind_view: &source_view,
-        },
-    )
+            placeholder,
+            quad_indices,
+        })
+    }
+
+    #[must_use]
+    pub const fn device(&self) -> &wgpu::Device {
+        self.compaction.device()
+    }
 }
 
 fn validate_material_tiers(
     compactor: &GpuCompactor,
     sources: &[Vec<TreeMaterial<'_>>],
-    config: TreeRenderConfig,
 ) -> Result<()> {
     if sources.len() != compactor.mesh_lods().tiers().len()
-        || config.sample_count == 0
-        || !config.sample_count.is_power_of_two()
         || sources.iter().any(|tier| {
             tier.is_empty()
                 || tier
@@ -784,9 +850,7 @@ fn validate_material_tiers(
                     .any(|s| !s.alpha_cutoff.is_finite() || !(0.0..=1.0).contains(&s.alpha_cutoff))
         })
     {
-        return Err(Error::InvalidConfiguration(
-            "invalid forest material tiers or sample count",
-        ));
+        return Err(Error::InvalidConfiguration("invalid forest material tiers"));
     }
     for source in sources.iter().flatten() {
         if let Some(wind) = &source.wind {
@@ -815,44 +879,25 @@ fn validate_material_tiers(
 }
 
 impl TreeRenderer {
-    /// Compile ordered authored mesh tiers and one shared middle impostor pass.
-    /// Each tier's first mesh provides its base indirect index count. All
-    /// material draws within a tier share that tier's compacted instances.
+    /// Bind a physical family to a shared immutable pipeline bundle.
+    /// All materials within a tier share that tier's compacted instances.
     ///
     /// # Errors
-    /// Rejects empty/invalid materials, invalid sample count and incompatible
-    /// compactor mesh/impostor arguments.
+    /// Rejects invalid materials, capacity or incompatible tier indexes.
     pub fn new(
-        device: &wgpu::Device,
-        compactor: GpuCompactor,
+        pipelines: &TreePipelines,
+        capacity: u32,
+        lods: MeshLods,
         sources: Vec<Vec<TreeMaterial<'_>>>,
         atlas: &AtlasTexture,
-        config: TreeRenderConfig,
     ) -> Result<Self> {
-        validate_material_tiers(&compactor, &sources, config)?;
+        let device = pipelines.device();
+        let compactor = GpuCompactor::new(&pipelines.compaction, capacity, lods, 6)?;
+        validate_material_tiers(&compactor, &sources)?;
         let impostor_bin = compactor
             .bin(compactor.mesh_lods().impostor_bin())
             .ok_or(Error::InvalidConfiguration("missing impostor bin"))?;
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("i-love-proland angular view trilinear sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
-        let source_sampler = make_source_sampler(device);
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("i-love-proland mesh and 32-angle impostor shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
-        let layout = render_layout(device);
-        let instance_layout = instance_layout(device);
-        let instance_bindings = instance_bindings(device, &instance_layout, &compactor)?;
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("i-love-proland tree render pipeline layout"),
-            bind_group_layouts: &[Some(&layout), Some(&instance_layout)],
-            immediate_size: 0,
-        });
+        let instance_bindings = instance_bindings(device, &pipelines.instance_layout, &compactor)?;
         let mut mesh_draws = Vec::new();
         for (tier, materials) in sources.into_iter().enumerate() {
             let bin = compactor
@@ -863,61 +908,41 @@ impl TreeRenderer {
                     device,
                     (tier, &bin),
                     source,
-                    &layout,
+                    &pipelines.material_layout,
                     atlas,
-                    &sampler,
-                    &source_sampler,
+                    &pipelines.atlas_sampler,
+                    &pipelines.source_sampler,
                 )
             }));
         }
         let impostor_uniforms = new_uniform(device);
-        let impostor_bind = make_impostor_bind(
+        let impostor_bind = make_draw_bind(
             device,
-            &layout,
+            &pipelines.material_layout,
             &impostor_uniforms,
-            atlas,
-            &sampler,
-            &source_sampler,
+            &MaterialBindings {
+                atlas,
+                atlas_sampler: &pipelines.atlas_sampler,
+                source_view: &pipelines.placeholder,
+                source_sampler: &pipelines.source_sampler,
+                wind_view: &pipelines.placeholder,
+            },
         );
-        let vertex_layout = [Some(wgpu::VertexBufferLayout {
-            array_stride: core::mem::size_of::<TreeVertex>() as u64,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
-        })];
-        let mesh_pipeline = render_pipeline(
-            device,
-            &pipeline_layout,
-            &shader,
-            PassKind::Mesh,
-            &vertex_layout,
-            config,
-        );
-        let impostor_pipeline = render_pipeline(
-            device,
-            &pipeline_layout,
-            &shader,
-            PassKind::Impostor,
-            &[],
-            config,
-        );
-        let quad_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("i-love-proland billboard quad 6 indices"),
-            contents: bytemuck::cast_slice(&[0_u32, 1, 2, 2, 1, 3]),
-            usage: wgpu::BufferUsages::INDEX,
-        });
         Ok(Self {
-            mesh_pipeline,
-            impostor_pipeline,
+            pipelines: pipelines.clone(),
             mesh_draws,
             impostor_bind,
             impostor_uniforms,
-            instance_layout,
             instance_bindings,
             impostor_indirect_offset: impostor_bin.indirect_offset,
             compactor,
-            quad_indices,
-            alpha_to_coverage: config.sample_count > 1,
         })
+    }
+
+    /// The shared immutable state; other compatible families can use it.
+    #[must_use]
+    pub const fn pipelines(&self) -> &TreePipelines {
+        &self.pipelines
     }
 
     /// Read-only access to classification metadata and compacted bins.
@@ -932,10 +957,13 @@ impl TreeRenderer {
     ///
     /// # Errors
     /// Rejects a requested capacity beyond the device limits.
-    pub fn reserve(&mut self, device: &wgpu::Device, required: u32) -> Result<bool> {
-        if self.compactor.reserve(device, required)? {
-            self.instance_bindings =
-                instance_bindings(device, &self.instance_layout, &self.compactor)?;
+    pub fn reserve(&mut self, required: u32) -> Result<bool> {
+        if self.compactor.reserve(required)? {
+            self.instance_bindings = instance_bindings(
+                self.pipelines.device(),
+                &self.pipelines.instance_layout,
+                &self.compactor,
+            )?;
             Ok(true)
         } else {
             Ok(false)
@@ -946,7 +974,12 @@ impl TreeRenderer {
     pub fn set_camera(&self, queue: &wgpu::Queue, camera: TreeCamera) {
         let mut uniform = DrawUniform {
             projection: camera.projection,
-            material: [0.0, f32::from(u8::from(self.alpha_to_coverage)), 0.0, 0.0],
+            material: [
+                0.0,
+                f32::from(u8::from(self.pipelines.config.sample_count > 1)),
+                0.0,
+                0.0,
+            ],
             wind_parameters: [0.0; 4],
             wind_source: [0.0; 4],
             field_axes: [[0.0; 4]; 3],
@@ -1012,7 +1045,7 @@ impl TreeRenderer {
     /// Draw every mesh tier's materials with its compacted instance set,
     /// then emit precisely one composite middle-distance impostor draw.
     pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        pass.set_pipeline(&self.mesh_pipeline);
+        pass.set_pipeline(&self.pipelines.mesh);
         for material in &self.mesh_draws {
             pass.set_bind_group(0, &material.bind, &[]);
             pass.set_bind_group(1, &self.instance_bindings[material.tier], &[]);
@@ -1020,14 +1053,17 @@ impl TreeRenderer {
             pass.set_index_buffer(material.mesh.index.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed_indirect(&material.indirect, 0);
         }
-        pass.set_pipeline(&self.impostor_pipeline);
+        pass.set_pipeline(&self.pipelines.impostor);
         pass.set_bind_group(0, &self.impostor_bind, &[]);
         pass.set_bind_group(
             1,
             &self.instance_bindings[self.instance_bindings.len() - 1],
             &[],
         );
-        pass.set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_index_buffer(
+            self.pipelines.quad_indices.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
         pass.draw_indexed_indirect(self.compactor.indirect(), self.impostor_indirect_offset);
     }
 
