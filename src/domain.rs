@@ -49,12 +49,12 @@ pub struct TileKey {
 }
 
 impl TileKey {
-    #[must_use]
+    #[must_use = "Use the returned address to locate the planar cell"]
     pub const fn planar(x: i64, y: i64) -> Self {
         Self { face: None, x, y }
     }
 
-    #[must_use]
+    #[must_use = "Use the returned address to locate the spherical cell"]
     pub const fn spherical(face: CubeFace, x: i64, y: i64) -> Self {
         Self {
             face: Some(face),
@@ -63,17 +63,17 @@ impl TileKey {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the face to interpret a spherical cell address"]
     pub const fn face(self) -> Option<CubeFace> {
         self.face
     }
 
-    #[must_use]
+    #[must_use = "Use the column to locate the cell"]
     pub const fn x(self) -> i64 {
         self.x
     }
 
-    #[must_use]
+    #[must_use = "Use the row to locate the cell"]
     pub const fn y(self) -> i64 {
         self.y
     }
@@ -139,7 +139,7 @@ impl Domain {
         Ok(())
     }
 
-    #[must_use]
+    #[must_use = "Use the computed tile count or handle incompatible tile dimensions"]
     pub const fn tiles_per_face(self, cells_per_tile: u32) -> Option<u32> {
         match self {
             Self::Spherical { face_cells, .. }
@@ -185,7 +185,7 @@ impl SurfaceCell {
     /// Upper bound of the physical area density under the cell's cube-map
     /// parameterization. This is an exact Jacobian supremum, not a centre
     /// approximation, so thinning produces uniform spherical intensity.
-    #[must_use]
+    #[must_use = "Use the conservative area bound when sizing candidate populations"]
     pub fn upper_area_m2(self) -> f64 {
         match self.domain {
             Domain::Planar { cell_size_m } => cell_size_m * cell_size_m,

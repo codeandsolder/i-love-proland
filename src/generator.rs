@@ -80,7 +80,7 @@ impl Layer {
         })
     }
 
-    #[must_use]
+    #[must_use = "Use the variants when selecting a source object"]
     pub fn variants(&self) -> &[Variant] {
         &self.variants
     }
@@ -159,12 +159,12 @@ impl Generator {
         Ok(Self { domain, config })
     }
 
-    #[must_use]
+    #[must_use = "Use the domain to interpret generated cell coordinates"]
     pub const fn domain(self) -> Domain {
         self.domain
     }
 
-    #[must_use]
+    #[must_use = "Use the generator configuration when reproducing a population"]
     pub const fn config(self) -> GeneratorConfig {
         self.config
     }

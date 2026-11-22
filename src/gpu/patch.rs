@@ -10,18 +10,18 @@ pub struct CandidatePatch {
     candidate: PackedInstance,
 }
 impl CandidatePatch {
-    #[must_use]
+    #[must_use = "Submit the returned patch to update the intended candidate slot"]
     pub const fn new(slot: u32, candidate: PackedInstance) -> Self {
         Self {
             slot: [slot, 0, 0, 0],
             candidate,
         }
     }
-    #[must_use]
+    #[must_use = "Use the destination slot to address the candidate buffer"]
     pub const fn slot(&self) -> u32 {
         self.slot[0]
     }
-    #[must_use]
+    #[must_use = "Use the replacement candidate data when applying the patch"]
     pub const fn candidate(&self) -> &PackedInstance {
         &self.candidate
     }
