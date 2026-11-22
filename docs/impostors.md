@@ -10,7 +10,7 @@ a CPU-side visibility simulation.
   tint and source UV). Positions are normalized to a unit sphere around the
   object center. Textures are `SourceImage` records containing row-major
   sRGB RGBA8 bytes decoded by the host from its own PNG/DDS pipeline.
-  A distinct renderer/compactor is used per source material/index buffer.
+  A renderer owns its compactor for an entire material family.
 - `PackedInstance::position_radius.xyz` is the **camera-relative sphere
   center**, with a conservative maximum-axis radius in the fourth component.
   `rotation` carries the full normalized source quaternion in XYZW order;
@@ -24,16 +24,17 @@ a CPU-side visibility simulation.
   ordered `MeshLods` (first material index count per tier), plus a final
   impostor index count of 6. Upload the combined `AtlasImage` and source
   albedo views (compressed or uncompressed). Create
-  `TreeRenderer::new(device, &compactor, sources, &atlas, config)` with
+  `TreeRenderer::new(device, compactor, sources, &atlas, config)` with
   `sources: Vec<Vec<TreeMaterial>>`, one material vector per mesh tier.
   All tiers must have nonempty source materials and their first index
   count must match the corresponding compactor metadata.
-- Before each render pass, call `compactor.encode(queue, encoder, ...)`,
-  then `renderer.encode_mesh_draws(encoder)` in the **same encoder**.
+- Before each render pass, call `renderer.reserve(device, candidate_count)`
+  if needed, then `renderer.encode(queue, encoder, candidates, view)`.
+  The renderer owns its compactor and resizes just candidate/visible buffers
+  and per-tier dynamic bind groups; all immutable mesh/material and pipeline
+  resources survive capacity changes.
   Each material receives the count from its own compacted tier, keeping
-  its source index count. The renderer owns shared handles to its input
-  bin buffers, avoiding accidentally drawing against a different
-  compactor's storage. Call `renderer.set_camera(queue, camera)` before
+  its source index count. One compacted instance binding is shared by all materials in a tier. Call `renderer.set_camera(queue, camera)` before
   submission; inside the pass `renderer.draw(pass)` emits every tier's
   source materials and **one** composite 32-view impostor. One compute
   dispatch classifies all candidate objects regardless of mesh-tier or
