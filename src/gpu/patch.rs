@@ -203,7 +203,7 @@ impl GpuCompactor {
             }
             self.patch_storage
                 .as_ref()
-                .expect("patch storage allocated")
+                .ok_or(Error::InvalidConfiguration("missing GPU patch storage"))?
                 .encode(&self.pipeline.patches, queue, encoder, patches, n);
         }
         self.count = count;
