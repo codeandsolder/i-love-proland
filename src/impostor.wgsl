@@ -7,16 +7,6 @@ const HALF_PI: f32 = 1.5707963267948966;
 const AZIMUTH_VIEWS: f32 = 8.0;
 const ELEVATION_VIEWS: f32 = 4.0;
 
-struct Instance {
-    position_radius: vec4<f32>,
-    rotation: vec4<f32>,
-    axis_radii: vec4<f32>,
-    object_id: vec4<u32>,
-    metadata: vec4<u32>,
-    tint: vec4<f32>,
-    handoff_anchor_rank: vec4<f32>,
-}
-
 struct RenderUniform {
     projection: mat4x4<f32>,
     material: vec4<f32>, // source alpha cutoff, 1 for multisample alpha-to-coverage
@@ -31,7 +21,7 @@ struct RenderUniform {
 }
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
-@group(1) @binding(0) var<storage, read> objects: array<Instance>;
+@group(1) @binding(0) var<storage, read> objects: array<PackedInstance>;
 @group(1) @binding(1) var<storage, read> visible_indices: array<u32>;
 @group(0) @binding(2) var atlas_texture: texture_2d_array<f32>;
 @group(0) @binding(3) var atlas_sampler: sampler;

@@ -2,7 +2,8 @@
 //! Consumes compacted GPU buffers without reading back their contents.
 
 use crate::gpu::{
-    CompactedBin, CompactionPipeline, GpuCompactor, GpuView, IndexedDraw, MeshLods, PackedInstance,
+    CandidatePatch, CompactedBin, CompactionPipeline, GpuCompactor, GpuView, IndexedDraw, MeshLods,
+    PackedInstance,
 };
 use crate::{
     Error, Result,
@@ -16,7 +17,10 @@ use wgpu::util::DeviceExt;
 pub const AZIMUTH_VIEWS: u32 = 8;
 pub const ELEVATION_VIEWS: u32 = 4;
 
-const SHADER: &str = include_str!("impostor.wgsl");
+const SHADER: &str = concat!(
+    include_str!("gpu_instance.wgsl"),
+    include_str!("impostor.wgsl")
+);
 
 /// Source geometry normalized to a unit-radius sphere at the object center.
 #[repr(C)]
@@ -987,6 +991,22 @@ impl TreeRenderer {
         } else {
             Ok(false)
         }
+    }
+
+    /// Patch changed dense resident slots without reallocating any render
+    /// binding. Submit this encoder before preparing another frame.
+    ///
+    /// # Errors
+    /// Rejects invalid sparse updates or counts beyond current capacity.
+    pub fn patch_candidates(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        count: u32,
+        patches: &[CandidatePatch],
+    ) -> Result<()> {
+        self.compactor
+            .patch_candidates(queue, encoder, count, patches)
     }
 
     /// Upload one camera matrix, keeping original alpha cutoffs per material.

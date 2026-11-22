@@ -116,7 +116,7 @@ phase if a particular external workflow requires a canonical order.
 The compactor processes one compatible physical source family. A tier can
 have multiple material draws; copy its GPU-computed count to each material
 draw while keeping the material-specific index count. Separate source
-families should use their own compactors. Call `set_candidates(queue, candidates)` whenever the camera-relative input
+families should use their own compactors. Call `set_candidates(queue, candidates)` whenever the population input
 batch changes; it grows automatically and stores the new active count.
 An empty replacement clears the active population. Call `encode(queue,
 encoder, view)` once per compactor per submission, and consume the bins
@@ -206,3 +206,20 @@ distance handoff, without reuploading the population. The forest example's
 480m overhead eye uses the same resident input; wind, billboard and
 capacity-growth checks pass. Measured full upload+classify/sync 3.016ms,
 resident classify/sync 0.844ms.
+
+
+## Sparse candidate replacement
+
+Keep a dense slot range `[0, count)` and use `CandidatePatch` to replace
+individual records through `patch_candidates(queue, encoder, count, patches)`.
+Patches must be sorted by slot and unique; all newly exposed slots must be
+initialized. A shrink can use an empty patch list. Growth beyond capacity
+uses `set_candidates` instead, which replaces the backing buffer and resets
+patch storage. The patch dispatch must precede classification and drawing
+in the same submitted encoder. Do not encode another candidate update
+before submitting this encoder. Each patch occupies 128 bytes; use full
+replacement whenever the patch payload would exceed the full input size.
+The caller owns canonical ID-to-slot mapping; slot order is not semantic.
+
+The GPU example checks actual storage bytes and classified IDs across
+replacement, shrink, zero count and regrowth on AMD Vulkan.
