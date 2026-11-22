@@ -56,7 +56,7 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
         if distance > camera.handoff_range.x {
             let t = (distance - camera.handoff_range.x) / (camera.handoff_range.y - camera.handoff_range.x);
-            let fraction = t * t * (3.0 - 2.0 * t);
+            let fraction = t * t * fma(-2.0, t, 3.0);
             if instance.handoff_anchor_rank.w < fraction {
                 return;
             }

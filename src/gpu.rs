@@ -15,8 +15,9 @@ const INSTANCE_BYTES: u64 = core::mem::size_of::<PackedInstance>() as u64;
 const INDEX_BYTES: u64 = 4;
 const WORKGROUP_SIZE: u32 = 64;
 
-/// An explicit, stable, shader-compatible instance layout. Positions
-/// are relative to a caller-owned, stable local origin. The camera eye
+/// Stable shader-compatible instance layout.
+///
+/// Positions are relative to a caller-owned, stable local origin. The camera eye
 /// uses the same frame; subtraction happens before vertex transforms or
 /// classification. Large planetary coordinates stay in the caller's
 /// precise domain until local projection.
@@ -553,7 +554,7 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods
         }
         if distance > begin {
             let t = (distance - begin) / (end - begin);
-            let fraction = t * t * (3.0 - 2.0 * t);
+            let fraction = t * t * 2.0_f32.mul_add(-t, 3.0);
             if object.handoff_anchor_rank[3] < fraction {
                 return VisualLod::TerrainCanopy;
             }
