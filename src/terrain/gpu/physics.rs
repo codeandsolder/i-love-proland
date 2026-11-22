@@ -209,6 +209,12 @@ impl PhysicsGpu {
         &self.bodies
     }
 
+    /// Share immutable compound sphere data with diagnostics and rendering.
+    #[must_use = "Bind the exact collider data without uploading a second copy"]
+    pub const fn colliders(&self) -> &wgpu::Buffer {
+        &self.spheres
+    }
+
     /// Encode a fixed-step batch without synchronizing with the host.
     /// The pinned terrain address must still occupy its slot. Submit command
     /// encoders in the order they were recorded; do not reuse the pinned slot
