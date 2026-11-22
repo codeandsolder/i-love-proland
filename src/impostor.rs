@@ -544,7 +544,7 @@ fn render_pipeline(
             "i-love-proland instanced source trees",
             "mesh_vs",
             "mesh_fs",
-            false,
+            config.sample_count > 1,
         ),
         PassKind::Impostor => (
             "i-love-proland instanced textured impostors",
@@ -766,7 +766,8 @@ fn make_source_sampler(device: &wgpu::Device) -> wgpu::Sampler {
         address_mode_v: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: 8,
         ..Default::default()
     })
 }

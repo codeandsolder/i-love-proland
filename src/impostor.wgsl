@@ -144,10 +144,20 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
 @fragment
 fn mesh_fs(input: MeshOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(source_texture, source_sampler, input.uv);
-    if (texel.a * input.color.a < camera.material.x) {
-        discard;
+    let alpha = texel.a * input.color.a;
+    // Smooth only the threshold contour, in units of its screen-space
+    // derivative. Fully opaque authored materials remain fully opaque.
+    let width = max(fwidth(alpha), 1.0/255.0);
+    var coverage = 1.0;
+    if camera.material.x > 0.0 {
+        if camera.material.y > 0.5 {
+            coverage = clamp((alpha-camera.material.x)/width+0.5,0.0,1.0);
+        } else {
+            coverage = select(0.0,1.0,alpha>=camera.material.x);
+        }
     }
-    return vec4<f32>(texel.rgb * input.color.rgb * foliage_light(input.normal,input.up), 1.0);
+    if coverage <= 0.0 {discard;}
+    return vec4<f32>(texel.rgb * input.color.rgb * foliage_light(input.normal,input.up), coverage);
 }
 
 struct ImpostorOutput {
