@@ -884,10 +884,9 @@ fn export_region(
         }
     }
     println!(
-        "regional direction query: {:.3}s for {} samples, checksum {:.3}",
+        "regional direction query: {:.3}s for {} samples, checksum {sum:.3}",
         now.elapsed().as_secs_f64(),
-        grid.heights.len(),
-        sum
+        grid.heights.len()
     );
     let mut file = io::BufWriter::new(fs::File::create(path)?);
     region.write(&mut file)?;

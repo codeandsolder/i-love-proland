@@ -107,10 +107,9 @@ impl Atlas {
         let rms =
             (residual.iter().map(|h| h * h).sum::<f64>() / f64::from(CELLS + 1).powi(2)).sqrt();
         println!(
-            "DEM atlas: {} bytes, {} patches, residual RMS {:.1}m",
+            "DEM atlas: {} bytes, {} patches, residual RMS {rms:.1}m",
             bytes.len(),
-            patches.len(),
-            rms
+            patches.len()
         );
         Ok(Self {
             source,

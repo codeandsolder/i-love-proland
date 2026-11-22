@@ -281,10 +281,8 @@ fn render_weathered(
         }
     }
     println!(
-        "weathered fine cells: {} ({}x{} subcells)",
-        mesh.cells(),
-        subdiv,
-        subdiv
+        "weathered fine cells: {} ({subdiv}x{subdiv} subcells)",
+        mesh.cells()
     );
     fs::write(path, bytes)
 }
