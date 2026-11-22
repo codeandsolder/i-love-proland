@@ -11,13 +11,15 @@ use wgpu::util::DeviceExt;
 
 pub const WGSL_COMPACTION: &str = include_str!("compact.wgsl");
 
-const INSTANCE_BYTES: u64 = 96;
+const INSTANCE_BYTES: u64 = core::mem::size_of::<PackedInstance>() as u64;
 const INDEX_BYTES: u64 = 4;
 const WORKGROUP_SIZE: u32 = 64;
 
-/// An explicit, stable, shader-compatible 96-byte instance layout. All
-/// positions are camera-relative; large planetary coordinates remain in the
-/// caller's precise domain until the final render projection.
+/// An explicit, stable, shader-compatible instance layout. Positions
+/// are relative to a caller-owned, stable local origin. The camera eye
+/// uses the same frame; subtraction happens before vertex transforms or
+/// classification. Large planetary coordinates stay in the caller's
+/// precise domain until local projection.
 ///
 /// Identifiers and variants survive the GPU pipeline without rehashing.
 #[repr(C)]
@@ -34,6 +36,9 @@ pub struct PackedInstance {
     /// Independent per-object RGBA tint in linear source color space.
     /// The material's vertex tint is baked into its source mesh/atlas.
     pub tint: [f32; 4],
+    /// Physical placement anchor XYZ and a stable, independent uniform
+    /// rank in [0,1). Used only by the distance-based canopy handoff.
+    pub handoff_anchor_rank: [f32; 4],
 }
 
 /// A visual pose computed from whichever terrain LOD is being displayed.
@@ -42,7 +47,7 @@ pub struct PackedInstance {
 /// axis radii are the corresponding physical XYZ scale factors in metres.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderPose {
-    pub camera_relative_position: [f32; 3],
+    pub local_position: [f32; 3],
     pub rotation_xyzw: [f32; 4],
     pub axis_radii_m: [f32; 3],
 }
@@ -58,7 +63,7 @@ impl RenderPose {
         let half = yaw_turns * core::f64::consts::PI;
         let (sin, cos) = half.sin_cos();
         Self {
-            camera_relative_position: position,
+            local_position: position,
             rotation_xyzw: [0.0, sin as f32, 0.0, cos as f32],
             axis_radii_m: [radius; 3],
         }
@@ -71,7 +76,7 @@ impl PackedInstance {
     /// # Errors
     /// Returns an error on non-finite projection or invalid radius/scale.
     pub fn from_instance(instance: &Instance, pose: RenderPose) -> Result<Self> {
-        if !pose.camera_relative_position.iter().all(|v| v.is_finite())
+        if !pose.local_position.iter().all(|v| v.is_finite())
             || !pose.axis_radii_m.iter().all(|v| v.is_finite() && *v > 0.0)
             || !pose.rotation_xyzw.iter().all(|v| v.is_finite())
         {
@@ -106,9 +111,9 @@ impl PackedInstance {
         )]
         let words = Self {
             position_radius: [
-                pose.camera_relative_position[0],
-                pose.camera_relative_position[1],
-                pose.camera_relative_position[2],
+                pose.local_position[0],
+                pose.local_position[1],
+                pose.local_position[2],
                 radius,
             ],
             rotation: pose.rotation_xyzw,
@@ -131,6 +136,12 @@ impl PackedInstance {
                 (layer >> 32) as u32,
             ],
             tint: [1.0; 4],
+            handoff_anchor_rank: [
+                pose.local_position[0],
+                pose.local_position[1],
+                pose.local_position[2],
+                0.0,
+            ],
         };
         Ok(words)
     }
@@ -153,6 +164,21 @@ impl PackedInstance {
             ));
         }
         self.tint = tint;
+        Ok(self)
+    }
+
+    /// Set the physical anchor and caller-derived, identity-stable
+    /// handoff rank. The rank is independent of visual slot and camera.
+    ///
+    /// # Errors
+    /// Rejects nonfinite anchors and ranks outside [0,1).
+    pub fn with_handoff_anchor(mut self, anchor: [f32; 3], rank: f32) -> Result<Self> {
+        if !anchor.iter().all(|v| v.is_finite()) || !(0.0..1.0).contains(&rank) {
+            return Err(Error::InvalidConfiguration(
+                "invalid GPU canopy anchor or rank",
+            ));
+        }
+        self.handoff_anchor_rank = [anchor[0], anchor[1], anchor[2], rank];
         Ok(self)
     }
 
@@ -185,6 +211,8 @@ pub struct GpuView {
     source_center: [f32; 3],
     displacement_bound: f32,
     explicit_population: bool,
+    eye: [f32; 3],
+    handoff_range: [f32; 2],
 }
 
 impl GpuView {
@@ -239,6 +267,8 @@ impl GpuView {
             source_center: [0.0; 3],
             displacement_bound: 0.0,
             explicit_population: false,
+            eye: [0.0; 3],
+            handoff_range: [0.0; 2],
         })
     }
 
@@ -347,6 +377,36 @@ impl GpuView {
         self
     }
 
+    /// Set the camera eye in the resident candidate frame. Frustum,
+    /// source-anchor distance and projection remain camera-relative.
+    ///
+    /// # Errors
+    /// Rejects nonfinite camera coordinates.
+    pub fn with_eye(mut self, eye: [f32; 3]) -> Result<Self> {
+        if !eye.iter().all(|x| x.is_finite()) {
+            return Err(Error::InvalidConfiguration("nonfinite GPU camera eye"));
+        }
+        self.eye = eye;
+        Ok(self)
+    }
+
+    /// Select the complementary source population in the final distance
+    /// band, using each record's physical anchor and stable rank. Farther
+    /// objects belong to aggregate coverage, regardless of projected size.
+    ///
+    /// # Errors
+    /// Rejects nonfinite, negative or non-increasing range endpoints.
+    pub fn with_distance_handoff(mut self, begin: f32, end: f32) -> Result<Self> {
+        if !begin.is_finite() || !end.is_finite() || begin < 0.0 || end <= begin {
+            return Err(Error::InvalidConfiguration(
+                "invalid GPU distance handoff range",
+            ));
+        }
+        self.handoff_range = [begin, end];
+        self.explicit_population = true;
+        Ok(self)
+    }
+
     /// Disable frustum plane rejection while keeping correct size-based LOD.
     /// Suitable for tests or when the host has already done tile-level culling.
     ///
@@ -375,6 +435,8 @@ struct GpuUniform {
     forward: [f32; 4],
     source_center: [f32; 4],
     planes: [[f32; 4]; 6],
+    eye: [f32; 4],
+    handoff_range: [f32; 4],
 }
 
 /// GPU-indexed indirect drawing arguments. The instance count is an atomic
@@ -459,7 +521,7 @@ pub enum VisualLod {
 }
 
 /// Rotate a scaled source-center offset by the physical world quaternion.
-fn source_anchor(object: &PackedInstance, view: GpuView) -> [f32; 3] {
+fn source_anchor(object: &PackedInstance, view: GpuView, position: [f32; 3]) -> [f32; 3] {
     let v = core::array::from_fn(|i| view.source_center[i] * object.axis_radii[i]);
     let q = [object.rotation[0], object.rotation[1], object.rotation[2]];
     let cross = |a: [f32; 3], b: [f32; 3]| {
@@ -471,9 +533,7 @@ fn source_anchor(object: &PackedInstance, view: GpuView) -> [f32; 3] {
     };
     let t = cross(q, v).map(|x| x * 2.0);
     let u = cross(q, t);
-    core::array::from_fn(|i| {
-        object.position_radius[i] - (object.rotation[3].mul_add(t[i], v[i]) + u[i])
-    })
+    core::array::from_fn(|i| position[i] - (object.rotation[3].mul_add(t[i], v[i]) + u[i]))
 }
 
 /// Reference classifier for parity testing with the WGSL shader.
@@ -483,7 +543,22 @@ fn source_anchor(object: &PackedInstance, view: GpuView) -> [f32; 3] {
 /// LOD only, never canonical object identity.
 #[must_use]
 pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods) -> VisualLod {
-    let pos = &object.position_radius[..3];
+    let pos: [f32; 3] = core::array::from_fn(|i| object.position_radius[i] - view.eye[i]);
+    if view.handoff_range[1] > view.handoff_range[0] {
+        let [begin, end] = view.handoff_range;
+        let delta: [f32; 3] = core::array::from_fn(|i| object.handoff_anchor_rank[i] - view.eye[i]);
+        let distance = delta.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if distance >= end {
+            return VisualLod::TerrainCanopy;
+        }
+        if distance > begin {
+            let t = (distance - begin) / (end - begin);
+            let fraction = t * t * (3.0 - 2.0 * t);
+            if object.handoff_anchor_rank[3] < fraction {
+                return VisualLod::TerrainCanopy;
+            }
+        }
+    }
     let radius = object.position_radius[3];
     let visibility_radius =
         (radius + view.displacement_bound).max(radius * core::f32::consts::SQRT_2);
@@ -511,7 +586,7 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods
     if !view.explicit_population && projected_crown < view.impostor_threshold_px * safe_depth {
         return VisualLod::TerrainCanopy;
     }
-    let anchor = source_anchor(object, view);
+    let anchor = source_anchor(object, view, pos);
     let distance_squared = anchor.iter().map(|x| x * x).sum();
     let tier = mesh_lods.tier_for_distance_squared(distance_squared);
     if mesh_lods.tiers[tier].prefer_mesh || projected_crown >= view.mesh_threshold_px * safe_depth {
@@ -924,6 +999,8 @@ impl GpuCompactor {
                 0.0,
             ],
             planes: view.planes,
+            eye: [view.eye[0], view.eye[1], view.eye[2], 0.0],
+            handoff_range: [view.handoff_range[0], view.handoff_range[1], 0.0, 0.0],
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniform));
         queue.write_buffer(&self.indirect, 0, bytemuck::cast_slice(&self.templates));
@@ -1009,6 +1086,7 @@ mod tests {
             axis_radii: [1., 1., 1., 1.],
             object_id: [0; 4],
             metadata: [0; 4],
+            handoff_anchor_rank: [0.0; 4],
             tint: [1.; 4],
         };
         assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Impostor);
@@ -1020,9 +1098,65 @@ mod tests {
     }
 
     #[test]
+    fn resident_frame_camera_and_handoff_classify_independently() {
+        let lods = MeshLods::new(vec![MeshLod {
+            start_m: 0.0,
+            index_count: 3,
+            prefer_mesh: false,
+        }])
+        .unwrap();
+        let object = PackedInstance {
+            position_radius: [10_005.0, 20_002.0, 30_095.0, 3.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            axis_radii: [3.0, 3.0, 3.0, 1.0],
+            object_id: [42, 0, 0, 0],
+            metadata: [0; 4],
+            tint: [1.0; 4],
+            handoff_anchor_rank: [10_000.0, 20_000.0, 30_095.0, 0.5],
+        };
+        let view = GpuView::unculled(540.0, 32.0, 1.0)
+            .unwrap()
+            .with_distance_handoff(90.0, 100.0)
+            .unwrap();
+        let near = view.with_eye([10_000.0, 20_000.0, 30_006.0]).unwrap();
+        let middle = view.with_eye([10_000.0, 20_000.0, 30_000.0]).unwrap();
+        let far = view.with_eye([10_000.0, 20_000.0, 29_994.0]).unwrap();
+        assert_ne!(classify_cpu(&object, near, &lods), VisualLod::TerrainCanopy);
+        assert_ne!(
+            classify_cpu(&object, middle, &lods),
+            VisualLod::TerrainCanopy
+        );
+        assert_eq!(classify_cpu(&object, far, &lods), VisualLod::TerrainCanopy);
+        let low_rank = object
+            .with_handoff_anchor([10_000.0, 20_000.0, 30_095.0], 0.49)
+            .unwrap();
+        assert_eq!(
+            classify_cpu(&low_rank, middle, &lods),
+            VisualLod::TerrainCanopy
+        );
+        let relative = PackedInstance {
+            position_radius: [5.0, 2.0, 89.0, 3.0],
+            ..object
+        };
+        assert_eq!(
+            classify_cpu(&object, near, &lods),
+            classify_cpu(
+                &relative,
+                GpuView::unculled(540.0, 32.0, 1.0)
+                    .unwrap()
+                    .with_explicit_population(),
+                &lods
+            )
+        );
+        assert!(view.with_eye([f32::NAN, 0.0, 0.0]).is_err());
+        assert!(view.with_distance_handoff(10.0, 10.0).is_err());
+        assert!(object.with_handoff_anchor([0.0; 3], 1.0).is_err());
+    }
+
+    #[test]
     fn gpu_layout_and_identity_roundtrip() {
-        assert_eq!(core::mem::size_of::<PackedInstance>(), 96);
-        assert_eq!(core::mem::size_of::<GpuUniform>(), 160);
+        assert_eq!(core::mem::size_of::<PackedInstance>(), 112);
+        assert_eq!(core::mem::size_of::<GpuUniform>(), 192);
         assert_eq!(core::mem::size_of::<IndexedDraw>(), 20);
         let g = Generator::new(
             Domain::Planar { cell_size_m: 10.0 },
@@ -1088,7 +1222,7 @@ mod tests {
         let w = (1.0 - xyz.iter().map(|v| v * v).sum::<f32>()).sqrt();
         let q = [xyz[0], xyz[1], xyz[2], w];
         let pose = RenderPose {
-            camera_relative_position: [-14.0, 20.0, 88.0],
+            local_position: [-14.0, 20.0, 88.0],
             rotation_xyzw: q,
             axis_radii_m: [3.0, 7.0, 2.0],
         };
@@ -1098,7 +1232,7 @@ mod tests {
         assert_eq!(packed.position_radius, [-14.0, 20.0, 88.0, 7.0]);
         assert_eq!(packed.stable_id(), original.candidate.id);
         assert_eq!(packed.variant_id(), original.variant_id);
-        assert_eq!(core::mem::size_of::<PackedInstance>(), 96);
+        assert_eq!(core::mem::size_of::<PackedInstance>(), 112);
         let mut invalid = pose;
         invalid.rotation_xyzw[3] = 2.0;
         assert!(PackedInstance::from_instance(&original, invalid).is_err());
@@ -1125,6 +1259,7 @@ mod tests {
             axis_radii: [radius, radius, radius, 0.0],
             object_id: [0; 4],
             metadata: [0; 4],
+            handoff_anchor_rank: [0.0; 4],
             tint: [1.0; 4],
         };
         assert_eq!(
@@ -1225,6 +1360,7 @@ mod tests {
             axis_radii: [3.0, 5.0, 13.0, 0.0],
             object_id: [1; 4],
             metadata: [2; 4],
+            handoff_anchor_rank: [0.0; 4],
             tint: [1.0; 4],
         };
         assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Mesh(0));
@@ -1256,6 +1392,7 @@ mod tests {
             axis_radii: [radius, radius, radius, 1.0],
             object_id: [1; 4],
             metadata: [0; 4],
+            handoff_anchor_rank: [0.0; 4],
             tint: [1.0; 4],
         };
         assert_eq!(
@@ -1314,6 +1451,7 @@ mod tests {
             axis_radii: [1.0, 1.0, 1.0, 0.0],
             object_id: [1; 4],
             metadata: [2; 4],
+            handoff_anchor_rank: [0.0; 4],
             tint: [1.0; 4],
         };
         assert_eq!(

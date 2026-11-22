@@ -288,6 +288,7 @@ pub struct TreeCamera {
     projection: [[f32; 4]; 4],
     forward: [f32; 3],
     wind: Option<WindFrame>,
+    eye: [f32; 3],
 }
 
 impl TreeCamera {
@@ -305,7 +306,21 @@ impl TreeCamera {
             projection,
             forward,
             wind: None,
+            eye: [0.0; 3],
         })
+    }
+
+    /// Set the camera eye in the resident local frame. Match the
+    /// classification view's eye; the clip projection stays relative.
+    ///
+    /// # Errors
+    /// Rejects nonfinite eye coordinates.
+    pub fn with_eye(mut self, eye: [f32; 3]) -> Result<Self> {
+        if !eye.iter().all(|x| x.is_finite()) {
+            return Err(Error::InvalidConfiguration("nonfinite tree camera eye"));
+        }
+        self.eye = eye;
+        Ok(self)
     }
 
     /// Attach stable wind coordinates and elapsed animation time.
@@ -360,6 +375,7 @@ struct DrawUniform {
     field_phase: [f32; 4],
     camera_forward: [f32; 4],
     billboard_source: [f32; 4],
+    eye: [f32; 4],
 }
 
 /// Render targets and material alpha-cutoff semantics.
@@ -990,6 +1006,7 @@ impl TreeRenderer {
             field_phase: [0.0; 4],
             camera_forward: [camera.forward[0], camera.forward[1], camera.forward[2], 0.0],
             billboard_source: [0.0; 4],
+            eye: [camera.eye[0], camera.eye[1], camera.eye[2], 0.0],
         };
         for material in &self.mesh_draws {
             uniform.material[0] = material.cutoff;

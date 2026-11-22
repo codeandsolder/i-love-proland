@@ -131,7 +131,7 @@ The CPU generator still owns object existence, stable 128-bit IDs, habitat
 decisions, model variants and saved-world changes. After the host projects
 those objects onto the current terrain LOD and converts their positions to
 camera-relative floats, `gpu::PackedInstance::from_instance` produces a fixed
-96-byte shader record. It retains all four object-ID words, two model-ID words
+112-byte shader record. It retains all four object-ID words, two model-ID words
 and two layer-ID words through GPU filtering.
 
 Construct one device-scoped `gpu::CompactionPipeline` for multiple

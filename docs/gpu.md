@@ -13,7 +13,7 @@ default crate has **zero runtime dependencies**.
 3. Project these exact objects onto the currently visible terrain LOD.
    Accurate physics height can use a different terrain source; neither
    influences canonical object ID, variant, or saved changes.
-4. Rebase positions to the active camera and build 96-byte
+4. Project positions into a stable local frame and build 112-byte
    `gpu::PackedInstance` records. The record stores the full source orientation quaternion and
    physical per-axis XYZ radii. A conservative sphere radius (the
    maximum axis radius) is derived for GPU visibility and LOD.
@@ -107,7 +107,7 @@ does not generate the aggregate field or alter canonical existence.
 
 GPU atomics allocate contiguous output slots in **nondeterministic order**.
 Every output is a frame-local u32 candidate slot. The vertex shader uses
-that slot to read the original immutable 96-byte candidate record, so ID,
+that slot to read the original immutable 112-byte candidate record, so ID,
 variant and attributes are not duplicated or modified. Render slot order
 is irrelevant to game state and saved worlds. The index buffer is not a
 stable indexable database. Sort by IDs outside the GPU draw
@@ -131,12 +131,12 @@ Let B be the number of mesh tiers plus one impostor bin, C the candidate
 capacity, A the device storage buffer offset alignment and
 S = align_up(C, A/gcd(A,4)) * 4 the byte stride across output index bins.
 The allocation is bounded by the actual GPU storage buffer and dispatch
-limits: one C*96-byte input, one B*S-byte candidate-index output buffer, B*20-byte
+limits: one C*112-byte input, one B*S-byte candidate-index output buffer, B*20-byte
 indirect records, N*8-byte immutable squared mesh boundaries and preferences and a
 160-byte camera uniform. The shader uses four storage bindings
 (input, output, indirect, thresholds) and one uniform. Slots inside a
 bin never overlap another bin, even when all candidates select one tier.
-Using u32 indices rather than copying 96-byte records reduces per-bin
+Using u32 indices rather than copying 112-byte records reduces per-bin
 logical storage and writes by 24×. The fixed worst-case per-bin allocation trades memory for a single
 pass without per-bin prefix scans, extra dispatches or per-object CPU
 work. Padding is never drawn. Empty frames reset all indirect counts
