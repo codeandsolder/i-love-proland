@@ -1,7 +1,6 @@
 // Independent presentation time samples two immutable GPU physics states.
 // Absolute ticks are two u32 words. Subtract before converting to float,
 // preserving fine interpolation even after years of simulation time.
-struct Pose { position:vec4<f32>, rotation:vec4<f32> }
 struct Query { time:vec2<u32>, fraction:f32, count:u32 }
 @group(0) @binding(0) var<storage,read> older:array<Body>;
 @group(0) @binding(1) var<storage,read> newer:array<Body>;

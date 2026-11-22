@@ -12,6 +12,9 @@ pub use readback::{PendingReadback, RecordedReadback};
 pub mod physics;
 use wgpu::util::DeviceExt;
 
+/// Shared GPU terrain sample ABI for downstream storage-buffer consumers.
+pub const SAMPLE_WGSL: &str = include_str!("gpu/sample.wgsl");
+
 pub const WGSL: &str = concat!(
     include_str!("gpu/sample.wgsl"),
     include_str!("gpu/field.wgsl")

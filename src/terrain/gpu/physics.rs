@@ -273,4 +273,4 @@ impl PhysicsGpu {
 }
 
 mod presentation;
-pub use presentation::{PresentationHistory, PresentationTime, RenderPose};
+pub use presentation::{POSE_WGSL, PresentationHistory, PresentationTime, RenderPose};

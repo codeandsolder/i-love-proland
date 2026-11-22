@@ -4,6 +4,9 @@ use crate::terrain::gpu::{Kernel, RecordedReadback, invalid};
 use std::io;
 use wgpu::util::DeviceExt;
 
+/// Shared presentation-pose storage ABI for dependent render pipelines.
+pub const POSE_WGSL: &str = include_str!("pose.wgsl");
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RenderPose {
@@ -74,7 +77,11 @@ impl PresentationHistory {
         let pipeline = Kernel::new(
             device,
             "interpolate presentation poses",
-            concat!(include_str!("body.wgsl"), include_str!("presentation.wgsl")),
+            concat!(
+                include_str!("body.wgsl"),
+                include_str!("pose.wgsl"),
+                include_str!("presentation.wgsl")
+            ),
             "interpolate",
         );
         Ok(Self {
