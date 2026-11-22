@@ -62,7 +62,7 @@ pub struct RenderPose {
 
 impl RenderPose {
     /// Upright source pose, with one physical radius and yaw in full turns.
-    #[must_use]
+    #[must_use = "Use the returned pose when packing the canonical instance"]
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a canonical f64 yaw is projected to f32 only for GPU visual orientation"
@@ -190,7 +190,7 @@ impl PackedInstance {
         Ok(self)
     }
 
-    #[must_use]
+    #[must_use = "Use the canonical identity to associate edits and candidates"]
     pub const fn stable_id(self) -> u128 {
         (self.object_id[0] as u128)
             | ((self.object_id[1] as u128) << 32)
@@ -198,7 +198,7 @@ impl PackedInstance {
             | ((self.object_id[3] as u128) << 96)
     }
 
-    #[must_use]
+    #[must_use = "Use the source variant identity to select its material and geometry"]
     pub fn variant_id(self) -> u64 {
         u64::from(self.metadata[0]) | (u64::from(self.metadata[1]) << 32)
     }
@@ -379,7 +379,7 @@ impl GpuView {
     /// Keep every frustum-visible candidate in a mesh or impostor bin,
     /// even if its projected diameter is below the usual canopy cutoff.
     /// This avoids introducing a second, inconsistent visibility threshold.
-    #[must_use]
+    #[must_use = "Use the returned view; this builder does not change the original"]
     pub const fn with_explicit_population(mut self) -> Self {
         self.explicit_population = true;
         self
@@ -500,12 +500,12 @@ impl MeshLods {
         Ok(Self { tiers })
     }
 
-    #[must_use]
+    #[must_use = "Use the authored tiers when selecting a visual mesh"]
     pub fn tiers(&self) -> &[MeshLod] {
         &self.tiers
     }
 
-    #[must_use]
+    #[must_use = "Use the impostor bin index when drawing compacted instances"]
     pub const fn impostor_bin(&self) -> usize {
         self.tiers.len()
     }
@@ -549,7 +549,7 @@ fn source_anchor(object: &PackedInstance, view: GpuView, position: [f32; 3]) -> 
 /// Both paths use the same f32 inputs and cross-multiplied pixel thresholds;
 /// GPU math can still differ slightly near boundaries, affecting visual
 /// LOD only, never canonical object identity.
-#[must_use]
+#[must_use = "Use the returned classification to select the visible representation"]
 pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods) -> VisualLod {
     let pos: [f32; 3] = core::array::from_fn(|i| object.position_radius[i] - view.eye[i]);
     if view.handoff_range[1] > view.handoff_range[0] {
@@ -666,7 +666,7 @@ pub struct CompactionPipeline {
 }
 
 impl CompactionPipeline {
-    #[must_use]
+    #[must_use = "Retain the compactor to dispatch visibility and LOD computation"]
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("i-love-proland visibility + LOD compaction WGSL"),
@@ -689,7 +689,7 @@ impl CompactionPipeline {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the owning device to allocate compatible GPU resources"]
     pub const fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -913,24 +913,24 @@ impl GpuCompactor {
         &self.indirect
     }
 
-    #[must_use]
+    #[must_use = "Use the capacity when sizing or validating candidate uploads"]
     pub const fn capacity(&self) -> u32 {
         self.capacity
     }
 
-    #[must_use]
+    #[must_use = "Use the compactor LOD configuration when dispatching and drawing"]
     pub const fn mesh_lods(&self) -> &MeshLods {
         &self.mesh_lods
     }
 
-    #[must_use]
+    #[must_use = "Use the number of bins to enumerate compacted draws"]
     pub const fn bin_count(&self) -> usize {
         self.templates.len()
     }
 
     /// Bind or copy the exact capacity-sized index slice and the
     /// corresponding indirect record. Mesh bins precede the impostor bin.
-    #[must_use]
+    #[must_use = "Use the selected bin to draw or handle an invalid index"]
     pub fn bin(&self, index: usize) -> Option<CompactedBin<'_>> {
         let template = self.templates.get(index)?;
         let index = u64::try_from(index).ok()?;
@@ -972,7 +972,7 @@ impl GpuCompactor {
     }
 
     /// Number of input records available for subsequent classifications.
-    #[must_use]
+    #[must_use = "Use the current candidate count to bound compaction and uploads"]
     pub const fn candidate_count(&self) -> u32 {
         self.count
     }

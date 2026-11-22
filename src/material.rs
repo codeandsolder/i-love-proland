@@ -41,7 +41,7 @@ impl SourceImage {
         })
     }
 
-    #[must_use]
+    #[must_use = "Use the returned fallback texture when constructing a material"]
     pub fn white() -> Self {
         Self {
             width: 1,
@@ -50,15 +50,15 @@ impl SourceImage {
         }
     }
 
-    #[must_use]
+    #[must_use = "Use the texture width when allocating or uploading its texels"]
     pub fn width(&self) -> u32 {
         u32::from(self.width)
     }
-    #[must_use]
+    #[must_use = "Use the texture height when allocating or uploading its texels"]
     pub fn height(&self) -> u32 {
         u32::from(self.height)
     }
-    #[must_use]
+    #[must_use = "Use the returned texels when uploading the material texture"]
     pub fn rgba(&self) -> &[u8] {
         &self.rgba
     }
@@ -163,7 +163,7 @@ pub(crate) fn srgb_to_linear(v: u8) -> f32 {
     }
 }
 
-#[must_use]
+#[must_use = "Use the converted channel value when encoding sRGB texels"]
 pub(crate) fn linear_to_srgb(value: f32) -> f32 {
     let c = value.clamp(0.0, 1.0);
     if c <= 0.003_130_8 {
@@ -182,7 +182,7 @@ pub struct SourceTexture {
 impl SourceTexture {
     /// Reusable texture view for the renderer. Hosts can instead supply an
     /// existing BC1/BC3/BC7 source view without an RGBA GPU re-upload.
-    #[must_use]
+    #[must_use = "Use the returned GPU view in the material binding"]
     pub const fn view(&self) -> &wgpu::TextureView {
         &self.view
     }
