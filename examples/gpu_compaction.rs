@@ -153,7 +153,7 @@ fn gpu_parity(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("i-love-proland correctness and readback"),
     });
-    compactor.encode(queue, &mut encoder, candidates, view)?;
+    compactor.encode(queue, &mut encoder, view)?;
     let args = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("indexed draw readback"),
         size: u64::try_from(bins)? * 20,
@@ -251,21 +251,50 @@ fn gpu_parity(
 fn benchmark(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    compactor: &GpuCompactor,
-    candidates: &[PackedInstance],
+    compactor: &mut GpuCompactor,
+    candidates: Option<&[PackedInstance]>,
     view: GpuView,
 ) -> Result<f64, Box<dyn Error>> {
     const REPETITIONS: u32 = 30;
     let start = Instant::now();
     for _ in 0..REPETITIONS {
+        if let Some(candidates) = candidates {
+            compactor.set_candidates(queue, candidates)?;
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("i-love-proland end-to-end GPU latency probe"),
         });
-        compactor.encode(queue, &mut encoder, candidates, view)?;
+        compactor.encode(queue, &mut encoder, view)?;
         queue.submit(Some(encoder.finish()));
         device.poll(wgpu::PollType::wait_indefinitely())?;
     }
     Ok(start.elapsed().as_secs_f64() * 1000.0 / f64::from(REPETITIONS))
+}
+
+fn validate_replacement(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    compactor: &mut GpuCompactor,
+    candidates: &[PackedInstance],
+    view: GpuView,
+) -> Result<(), Box<dyn Error>> {
+    // Shrinking changes the submitted count, never the already allocated capacity.
+    let subset = &candidates[..37];
+    let (subset_expected, _) = reference(subset, view, compactor.mesh_lods());
+    assert!(!compactor.set_candidates(queue, subset)?);
+    assert_eq!(compactor.candidate_count(), 37);
+    gpu_parity(device, queue, compactor, subset, view, &subset_expected)?;
+    // Empty frames must reset every indirect bin, including late mesh tiers.
+    let empty = vec![BTreeMap::new(); compactor.bin_count()];
+    assert!(!compactor.set_candidates(queue, &[])?);
+    let (cleared, _) = gpu_parity(device, queue, compactor, &[], view, &empty)?;
+    assert!(cleared.iter().all(|draw| draw.instance_count == 0));
+
+    // Restore the full batch in the already grown storage.
+    let (expected, _) = reference(candidates, view, compactor.mesh_lods());
+    assert!(!compactor.set_candidates(queue, candidates)?);
+    gpu_parity(device, queue, compactor, candidates, view, &expected)?;
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -296,8 +325,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (expected, canopy) = reference(&candidates, view, &lods);
     let (device, queue) = device()?;
     let pipeline = CompactionPipeline::new(&device);
-    let compactor = GpuCompactor::new(&pipeline, u32::try_from(candidates.len())?, lods, 6)?;
+    let mut compactor = GpuCompactor::new(&pipeline, u32::try_from(candidates.len())?, lods, 6)?;
 
+    assert!(!compactor.set_candidates(&queue, &candidates)?);
     let (draws, first_gpu_ms) =
         gpu_parity(&device, &queue, &compactor, &candidates, view, &expected)?;
     assert!(draws.iter().all(|draw| draw.instance_count > 0));
@@ -335,7 +365,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let preferred = MeshLods::new(preferred)?;
     let authored_view = view.with_explicit_population();
     let (authored_reference, _) = reference(&candidates, authored_view, &preferred);
-    let authored = GpuCompactor::new(&pipeline, u32::try_from(candidates.len())?, preferred, 6)?;
+    let mut authored =
+        GpuCompactor::new(&pipeline, u32::try_from(candidates.len())?, preferred, 6)?;
+    assert!(!authored.set_candidates(&queue, &candidates)?);
     let (authored_draws, _) = gpu_parity(
         &device,
         &queue,
@@ -352,11 +384,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|d| d.instance_count)
             .collect::<Vec<_>>()
     );
-    let frame_ms = benchmark(&device, &queue, &compactor, &candidates, view)?;
-    // Empty frames must reset every indirect bin, including late mesh tiers.
-    let empty = vec![BTreeMap::new(); compactor.bin_count()];
-    let (cleared, _) = gpu_parity(&device, &queue, &compactor, &[], view, &empty)?;
-    assert!(cleared.iter().all(|draw| draw.instance_count == 0));
+    let frame_ms = benchmark(&device, &queue, &mut compactor, Some(&candidates), view)?;
+    let resident_ms = benchmark(&device, &queue, &mut compactor, None, view)?;
+    println!("GPU_RESIDENT_INPUT upload_ms={frame_ms:.4} resident_ms={resident_ms:.4}");
+    validate_replacement(&device, &queue, &mut compactor, &candidates, view)?;
 
     let generated = candidates.len();
     let counts = |draws: &[IndexedDraw]| draws.iter().map(|d| d.instance_count).collect::<Vec<_>>();

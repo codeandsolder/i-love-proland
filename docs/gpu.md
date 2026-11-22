@@ -109,8 +109,14 @@ phase if a particular external workflow requires a canonical order.
 The compactor processes one compatible physical source family. A tier can
 have multiple material draws; copy its GPU-computed count to each material
 draw while keeping the material-specific index count. Separate source
-families should use their own compactors. Call `encode` once per compactor
-per submission and consume those bins in later passes in that submission.
+families should use their own compactors. Call `set_candidates(queue, candidates)` whenever the camera-relative input
+batch changes; it grows automatically and stores the new active count.
+An empty replacement clears the active population. Call `encode(queue,
+encoder, view)` once per compactor per submission, and consume the bins
+in later passes in that submission. Candidate bytes stay resident across
+arbitrary changes to classification/view uniforms, avoiding repeated
+uploads. Replacing candidates and encoding two distinct frames into a
+single unsubmitted encoder is not supported (queue writes precede it).
 
 ### Resource bounds
 

@@ -467,6 +467,7 @@ pub struct CompactedBin<'a> {
 /// bin is intentionally unspecified.
 pub struct GpuCompactor {
     capacity: u32,
+    count: u32,
     mesh_lods: MeshLods,
     input: wgpu::Buffer,
     visible: wgpu::Buffer,
@@ -693,6 +694,7 @@ impl GpuCompactor {
         );
         Ok(Self {
             capacity,
+            count: 0,
             mesh_lods,
             input,
             visible,
@@ -708,7 +710,7 @@ impl GpuCompactor {
 
     /// Only the two capacity-dependent buffers and their compute binding
     /// change. The caller must refresh render-side compacted-bin bindings.
-    pub(crate) fn reserve(&mut self, required: u32) -> Result<bool> {
+    fn reserve(&mut self, required: u32) -> Result<bool> {
         if required <= self.capacity {
             return Ok(false);
         }
@@ -788,25 +790,44 @@ impl GpuCompactor {
         })
     }
 
-    /// Write candidates and reset every indexed indirect record, then
-    /// record one classification/compaction compute pass.
+    /// Replace the resident candidate batch, growing storage if necessary.
+    /// A smaller or empty batch cannot expose stale records.
     ///
     /// # Errors
-    /// Rejects candidate batches exceeding the fixed instance capacity.
+    /// Rejects candidate batches beyond the device storage/dispatch limits.
+    pub fn set_candidates(
+        &mut self,
+        queue: &wgpu::Queue,
+        candidates: &[PackedInstance],
+    ) -> Result<bool> {
+        let count = u32::try_from(candidates.len())
+            .map_err(|_| Error::InvalidConfiguration("too many GPU instances"))?;
+        let grew = self.reserve(count)?;
+        if count != 0 {
+            queue.write_buffer(&self.input, 0, bytemuck::cast_slice(candidates));
+        }
+        self.count = count;
+        Ok(grew)
+    }
+
+    /// Number of input records available for subsequent classifications.
+    #[must_use]
+    pub const fn candidate_count(&self) -> u32 {
+        self.count
+    }
+
+    /// Reset indexed indirect records and classify the resident candidates.
+    /// Any number of separately submitted frames can reuse the same input.
+    ///
+    /// # Errors
+    /// Rejects a GPU LOD layout that cannot fit the shader uniform ABI.
     pub fn encode(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        candidates: &[PackedInstance],
         view: GpuView,
     ) -> Result<()> {
-        let count = u32::try_from(candidates.len())
-            .map_err(|_| Error::InvalidConfiguration("too many GPU instances"))?;
-        if count > self.capacity {
-            return Err(Error::InvalidConfiguration(
-                "GPU instance input exceeds buffer capacity",
-            ));
-        }
+        let count = self.count;
         let uniform = GpuUniform {
             counts: [
                 count,
@@ -836,7 +857,6 @@ impl GpuCompactor {
         if count == 0 {
             return Ok(());
         }
-        queue.write_buffer(&self.input, 0, bytemuck::cast_slice(candidates));
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("i-love-proland compact and classify visible instances"),
             timestamp_writes: None,

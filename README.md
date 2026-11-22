@@ -135,7 +135,7 @@ camera-relative floats, `gpu::PackedInstance::from_instance` produces a fixed
 and two layer-ID words through GPU filtering.
 
 Construct one device-scoped `gpu::CompactionPipeline` for multiple
-compactors; a `gpu::GpuCompactor` accepts an arbitrary candidate batch and a camera
+compactors; a `gpu::GpuCompactor` retains a candidate batch until replaced, and accepts and a camera
 frustum, then dispatches a WGSL compute pass that culls bounding spheres,
 chooses mesh vs impostor by **projected canopy diameter in pixels**, and
 selects the authored distance tier within the mesh class. The ordered

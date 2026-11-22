@@ -328,10 +328,9 @@ fn background_pipeline(device: &wgpu::Device, fragment_entry: &str) -> wgpu::Ren
     })
 }
 
-#[derive(Clone, Copy)]
 struct ForestPass<'a> {
     queue: &'a wgpu::Queue,
-    renderer: &'a TreeRenderer,
+    renderer: &'a mut TreeRenderer,
     candidates: &'a [PackedInstance],
     view: GpuView,
     color: &'a wgpu::TextureView,
@@ -343,9 +342,7 @@ fn render_frame(
     encoder: &mut wgpu::CommandEncoder,
     scene: &ForestPass<'_>,
 ) -> Result<(), Box<dyn Error>> {
-    scene
-        .renderer
-        .encode(scene.queue, encoder, scene.candidates, scene.view)?;
+    scene.renderer.encode(scene.queue, encoder, scene.view)?;
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("i-love-proland real forest GPU draw"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -510,7 +507,7 @@ fn make_frame_targets(device: &wgpu::Device) -> FrameTargets {
 
 fn render_overhead(
     device: &wgpu::Device,
-    scene: &ForestPass<'_>,
+    scene: &mut ForestPass<'_>,
     low_camera: TreeCamera,
     background: &wgpu::RenderPipeline,
     color: &wgpu::Texture,
@@ -523,6 +520,7 @@ fn render_overhead(
     }
     let (overhead_camera, overhead_view) = pitched_view(core::f32::consts::FRAC_PI_2)?;
     scene.renderer.set_camera(scene.queue, overhead_camera);
+    scene.renderer.set_candidates(scene.queue, &overhead)?;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("fully overhead forest atlas test"),
     });
@@ -532,12 +530,18 @@ fn render_overhead(
             candidates: &overhead,
             view: overhead_view,
             background,
-            ..*scene
+            queue: scene.queue,
+            renderer: &mut *scene.renderer,
+            color: scene.color,
+            depth: scene.depth,
         },
     )?;
     let pixels = capture(device, scene.queue, encoder, color)?;
     write_ppm(&format!("{prefix}-overhead.ppm"), WIDTH, HEIGHT, &pixels)?;
     scene.renderer.set_camera(scene.queue, low_camera);
+    scene
+        .renderer
+        .set_candidates(scene.queue, scene.candidates)?;
     Ok(())
 }
 
@@ -628,7 +632,7 @@ fn validate_source_billboards(
             index_count: card.index_count(),
             prefer_mesh: false,
         }])?;
-        let renderer = TreeRenderer::new(
+        let mut renderer = TreeRenderer::new(
             scene.renderer.pipelines(),
             1,
             lods,
@@ -642,6 +646,7 @@ fn validate_source_billboards(
             atlas,
         )?;
         renderer.set_camera(scene.queue, camera);
+        renderer.set_candidates(scene.queue, &candidates)?;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("authored source card regression"),
         });
@@ -649,9 +654,12 @@ fn validate_source_billboards(
             &mut encoder,
             &ForestPass {
                 candidates: &candidates,
-                renderer: &renderer,
+                renderer: &mut renderer,
                 view,
-                ..*scene
+                queue: scene.queue,
+                color: scene.color,
+                depth: scene.depth,
+                background: scene.background,
             },
         )?;
         let pixels = capture(device, scene.queue, encoder, &targets.color)?;
@@ -838,7 +846,7 @@ fn validate_capacity_growth(
     targets: &FrameTargets,
     background: &wgpu::RenderPipeline,
     view: GpuView,
-    required: usize,
+    full_candidates: &[PackedInstance],
 ) -> Result<(), Box<dyn Error>> {
     let fixture = [
         [-15.0, -3.0, 30.0, 8.0],
@@ -862,7 +870,8 @@ fn validate_capacity_growth(
         );
     }
     assert_eq!(classify_cpu(&fixture[3], view, lods), VisualLod::Impostor);
-    let subset_capture = |renderer: &TreeRenderer, candidates: &[PackedInstance]| {
+    let subset_capture = |renderer: &mut TreeRenderer, candidates: &[PackedInstance]| {
+        renderer.set_candidates(queue, candidates)?;
         let scene = ForestPass {
             queue,
             renderer,
@@ -884,7 +893,7 @@ fn validate_capacity_growth(
     let previous_indirect = bin.indirect.clone();
     let previous_visible = bin.indices.buffer.clone();
     let growth_started = Instant::now();
-    assert!(renderer.reserve(u32::try_from(required)?)?);
+    assert!(renderer.set_candidates(queue, full_candidates)?);
     let growth_ms = growth_started.elapsed().as_secs_f64() * 1000.0;
     let bin = renderer
         .compactor()
@@ -892,17 +901,17 @@ fn validate_capacity_growth(
         .ok_or("missing grown first bin")?;
     assert_eq!(&previous_indirect, bin.indirect);
     assert_ne!(&previous_visible, bin.indices.buffer);
-    assert!(!renderer.reserve(1)?);
-    assert!(renderer.reserve(u32::MAX).is_err());
     let after = subset_capture(renderer, &fixture)?;
     assert_eq!(
         before, after,
         "capacity growth changed the same submitted scene"
     );
     println!(
-        "FOREST_RESERVE_PASS initial={initial_count} capacity={} growth_ms={growth_ms:.3} pixel_identical=true",
+        "FOREST_RESERVE_PASS initial={initial_count} capacity={} growth_upload_ms={growth_ms:.3} pixel_identical=true",
         renderer.compactor().capacity()
     );
+    // The next render uses the complete resident batch without reupload.
+    assert!(!renderer.set_candidates(queue, full_candidates)?);
     Ok(())
 }
 
@@ -1010,11 +1019,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         &targets,
         &background,
         view,
-        candidates.len(),
+        &candidates,
     )?;
-    let scene = ForestPass {
+    let mut scene = ForestPass {
         queue: &queue,
-        renderer: &renderer,
+        renderer: &mut renderer,
         candidates: &candidates,
         view,
         color: &targets.color_view,
@@ -1025,7 +1034,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     render_overhead(
         &device,
-        &scene,
+        &mut scene,
         low_camera,
         &overhead_background,
         color,
