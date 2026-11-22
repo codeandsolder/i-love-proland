@@ -901,7 +901,6 @@ fn validate_capacity_growth(
         .ok_or("missing grown first bin")?;
     assert_eq!(&previous_indirect, bin.indirect);
     assert_ne!(&previous_visible, bin.indices.buffer);
-    assert!(!renderer.set_candidates(queue, &fixture)?);
     let after = subset_capture(renderer, &fixture)?;
     assert_eq!(
         before, after,
@@ -911,6 +910,8 @@ fn validate_capacity_growth(
         "FOREST_RESERVE_PASS initial={initial_count} capacity={} growth_upload_ms={growth_ms:.3} pixel_identical=true",
         renderer.compactor().capacity()
     );
+    // The next render uses the complete resident batch without reupload.
+    assert!(!renderer.set_candidates(queue, full_candidates)?);
     Ok(())
 }
 
@@ -1020,7 +1021,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         view,
         &candidates,
     )?;
-    renderer.set_candidates(&queue, &candidates)?;
     let mut scene = ForestPass {
         queue: &queue,
         renderer: &mut renderer,
