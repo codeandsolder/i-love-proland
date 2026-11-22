@@ -2,16 +2,6 @@
 // One invocation owns each independent body. Fixed dt, arbitrary batch size.
 // Coordinates are tile-relative west/north/up metres. No world-sized f32
 // coordinates, no CPU collision contacts, no water collision surface.
-struct TerrainSample { bed:f32, water:f32, rgba:u32, kind:u32 }
-struct Body {
-    position:vec4<f32>, // xyz, inverse mass
-    rotation:vec4<f32>, // xyzw
-    velocity:vec4<f32>, // xyz, friction
-    angular:vec4<f32>, // xyz, restitution
-    inverse_inertia:vec4<f32>, // principal body-axis inverse inertia
-    metadata:vec4<u32>, // first sphere, sphere count, status, reserved
-    clock:vec4<u32>, // low/high words of completed absolute tick
-}
 struct Config {
     side:u32, slot:u32, count:u32, steps:u32,
     spacing:f32, dt:f32, gravity:f32, slop:f32,

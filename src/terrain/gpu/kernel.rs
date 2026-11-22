@@ -15,7 +15,7 @@ impl Kernel {
             layout: None,
             module: &shader,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
         let layout = pipeline.get_bind_group_layout(0);

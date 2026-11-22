@@ -109,15 +109,15 @@ mod tests {
         );
         let triangles: Vec<_> = grid.triangles().collect();
         assert_eq!(triangles, [[0, 1, 3], [0, 3, 2]]);
-        let [a, b, c] = triangles[0].map(|i| vertices[i as usize]);
-        let u = std::array::from_fn::<_, 3, _>(|i| b[i] - a[i]);
-        let v = std::array::from_fn::<_, 3, _>(|i| c[i] - a[i]);
+        let [origin, second, third] = triangles[0].map(|i| vertices[i as usize]);
+        let edge_a = std::array::from_fn::<_, 3, _>(|i| second[i] - origin[i]);
+        let edge_b = std::array::from_fn::<_, 3, _>(|i| third[i] - origin[i]);
         let normal = [
-            u[1].mul_add(v[2], -u[2] * v[1]),
-            u[2].mul_add(v[0], -u[0] * v[2]),
-            u[0].mul_add(v[1], -u[1] * v[0]),
+            edge_a[1].mul_add(edge_b[2], -edge_a[2] * edge_b[1]),
+            edge_a[2].mul_add(edge_b[0], -edge_a[0] * edge_b[2]),
+            edge_a[0].mul_add(edge_b[1], -edge_a[1] * edge_b[0]),
         ];
-        assert!(normal.iter().zip(a).map(|(n, r)| n * r).sum::<f64>() > 0.0);
+        assert!(normal.iter().zip(origin).map(|(n, r)| n * r).sum::<f64>() > 0.0);
         Ok(())
     }
 }

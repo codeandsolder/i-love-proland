@@ -132,11 +132,9 @@ impl SimulationClock {
             .start_tick
             .checked_add(u64::from(batch.steps))
             .ok_or_else(|| io::Error::other("batch overflow"))?;
-        if batch.hz != self.hz
-            || batch.steps == 0
-            || batch.start_tick != self.submitted
-            || end > self.target_tick()
-        {
+        let contiguous = batch.start_tick == self.submitted;
+        let compatible = batch.hz == self.hz && batch.steps > 0;
+        if !contiguous || !compatible || end > self.target_tick() {
             return Err(io::Error::other("invalid simulation submission"));
         }
         self.submitted = end;

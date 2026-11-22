@@ -74,7 +74,7 @@ impl PresentationHistory {
         let pipeline = Kernel::new(
             device,
             "interpolate presentation poses",
-            include_str!("presentation.wgsl"),
+            concat!(include_str!("body.wgsl"), include_str!("presentation.wgsl")),
             "interpolate",
         );
         Ok(Self {

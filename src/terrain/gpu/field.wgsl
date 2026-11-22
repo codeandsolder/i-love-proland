@@ -10,13 +10,12 @@ struct Reach {
     bend_valley: vec4<f32>,
 }
 struct Job { origin: vec2<u32>, spacing: u32, slot: u32 }
-struct Sample { bed: f32, water: f32, rgb: u32, kind: u32 }
 @group(0) @binding(0) var<uniform> config: Config;
 @group(0) @binding(1) var<storage,read> controls: array<vec2<u32>>;
 @group(0) @binding(2) var<storage,read> reaches: array<Reach>;
 @group(0) @binding(3) var<storage,read> bins: array<u32>;
 @group(0) @binding(4) var<storage,read> jobs: array<Job>;
-@group(0) @binding(5) var<storage,read_write> output: array<Sample>;
+@group(0) @binding(5) var<storage,read_write> output: array<TerrainSample>;
 
 fn smooth_unit(t:f32)->f32 {let q=clamp(t,0.0,1.0);return q*q*(3.0-2.0*q);}
 fn mix_hash(v:u32)->u32 {
@@ -84,14 +83,14 @@ fn relief(p:vec2<f32>,g:vec2<f32>)->f32 {
     let ribs=noise((p+transverse*18.0)/17.0,config.seed^73u)-noise((p-transverse*18.0)/17.0,config.seed^73u);
     return smooth_unit(slope/0.5)*(broad*7.0+(ridge-0.5)*3.0+small*0.65+ribs*0.4)*config.detail;
 }
-fn evaluate(p:vec2<f32>)->Sample{
+fn evaluate(p:vec2<f32>)->TerrainSample{
     let control=evaluate_controls(p);
     var bed=control.x;
     var water=bed;
     var kind=0u;
     var color=color_at(p);
     if control.y>bed+0.02 {
-        return Sample(bed,control.y,pack4x8unorm(vec4<f32>(color,1.0)),1u);
+        return TerrainSample(bed,control.y,pack4x8unorm(vec4<f32>(color,1.0)),1u);
     }
     let delta=config.spacing_m*0.5;
     let g=vec2<f32>(
@@ -100,7 +99,7 @@ fn evaluate(p:vec2<f32>)->Sample{
     )/(2.0*delta);
     bed+=relief(p,g)*smooth_unit(bed/30.0);
     water=bed;
-    if bed<=0.0 {return Sample(bed,0.0,pack4x8unorm(vec4<f32>(color,1.0)),1u);}
+    if bed<=0.0 {return TerrainSample(bed,0.0,pack4x8unorm(vec4<f32>(color,1.0)),1u);}
     let bin=min(vec2<u32>(p/250.0),vec2<u32>(config.bin_side-1u));
     let bucket=bin.y*config.bin_side+bin.x;
     let begin=bins[bucket];let end=bins[bucket+1u];
@@ -108,7 +107,7 @@ fn evaluate(p:vec2<f32>)->Sample{
     for(var i=begin;i<end;i+=1u){
         nearest=min(nearest,projection(reaches[bins[i]],p).x);
     }
-    if nearest>=670.0*670.0 {return Sample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);}
+    if nearest>=670.0*670.0 {return TerrainSample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);}
     let cross=sqrt(nearest);
     var center=vec2<f32>(0.0);var tangent=vec2<f32>(0.0);
     var sum=0.0;var stage=0.0;var width=0.0;var valley=0.0;var bend=0.0;
@@ -127,7 +126,7 @@ fn evaluate(p:vec2<f32>)->Sample{
         valley+=weight*r.bend_valley.z;
         bend+=weight*mix(r.bend_valley.x,r.bend_valley.y,t);
     }
-    if sum<=0.0 {return Sample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);}
+    if sum<=0.0 {return TerrainSample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);}
     stage/=sum;valley/=sum;center/=sum;
     var radius=width/(2.0*sum);
     tangent/=max(length(tangent),1e-9);
@@ -138,7 +137,7 @@ fn evaluate(p:vec2<f32>)->Sample{
     radius*=1.0-0.27*inner+0.13*outer+0.06*sediment;
     let bank=(10.0+0.48*radius+24.0*valley)*(1.0+0.8*inner-0.3*outer);
     let terrace=25.0+radius*(0.6+2.0*valley)+100.0*valley;
-    if cross>=radius+bank+terrace {return Sample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);}
+    if cross>=radius+bank+terrace {return TerrainSample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);}
     let depth=(0.65+0.068*radius)*(1.0+0.35*outer-0.35*inner);
     let rise=(2.0+0.08*radius)*(1.0+0.65*outer-0.45*inner);
     let u=cross/radius;
@@ -163,7 +162,7 @@ fn evaluate(p:vec2<f32>)->Sample{
     color=mix(color,vec3<f32>(0.25,0.245,0.20),clamp(damp*(0.22+0.28*outer),0.0,1.0));
     water=bed;
     if cross<=radius && stage>bed+0.02 && stage<=base+6.0 {water=stage;kind=2u;}
-    return Sample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);
+    return TerrainSample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);
 }
 
 @compute @workgroup_size(64)

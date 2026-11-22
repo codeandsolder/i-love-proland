@@ -6,7 +6,11 @@ pub use clock::{SimulationClock, StepBatch};
 use std::io;
 use wgpu::util::DeviceExt;
 
-pub const STEP_WGSL: &str = include_str!("physics/step.wgsl");
+pub const STEP_WGSL: &str = concat!(
+    include_str!("sample.wgsl"),
+    include_str!("physics/body.wgsl"),
+    include_str!("physics/step.wgsl")
+);
 
 /// A compound collider element: center relative to the body's COM, radius.
 #[repr(C)]
@@ -95,6 +99,7 @@ struct StepConfig {
 }
 
 /// One batch of independent rigid bodies over a pinned terrain slot.
+///
 /// State stays on the GPU between submissions. The CPU owns only scheduling
 /// metadata and optional snapshots. Vessel-vessel contacts and joints are
 /// intentionally outside this first terrain-contact solver.

@@ -1,5 +1,7 @@
-//! GPU-generated regional terrain. Render/scatter consumers can bind the
-//! resident sample buffer directly; colliders request asynchronous snapshots.
+//! GPU-generated regional terrain.
+//!
+//! Render/scatter consumers can bind the resident sample buffer directly;
+//! diagnostic consumers can request asynchronous snapshots.
 //! The chart lattice is integer-addressed (1/16 m), not camera-relative.
 use super::Region;
 use std::io;
@@ -10,7 +12,10 @@ pub use readback::{PendingReadback, RecordedReadback};
 pub mod physics;
 use wgpu::util::DeviceExt;
 
-pub const WGSL: &str = include_str!("gpu/field.wgsl");
+pub const WGSL: &str = concat!(
+    include_str!("gpu/sample.wgsl"),
+    include_str!("gpu/field.wgsl")
+);
 const TICKS_PER_METRE: f64 = 16.0;
 
 fn invalid(message: &'static str) -> io::Error {
