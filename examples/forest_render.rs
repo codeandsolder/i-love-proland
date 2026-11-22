@@ -982,6 +982,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         TreeRenderConfig {
             color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
             depth_format: wgpu::TextureFormat::Depth24Plus,
+            depth_compare: wgpu::CompareFunction::Less,
             sample_count: 1,
         },
     )?;

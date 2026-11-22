@@ -387,6 +387,8 @@ struct DrawUniform {
 pub struct TreeRenderConfig {
     pub color_format: wgpu::TextureFormat,
     pub depth_format: wgpu::TextureFormat,
+    /// Match the caller-owned camera projection and depth clear value.
+    pub depth_compare: wgpu::CompareFunction,
     pub sample_count: u32,
 }
 
@@ -499,7 +501,7 @@ fn render_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: config.depth_format,
             depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_compare: Some(config.depth_compare),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
