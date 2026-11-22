@@ -67,6 +67,60 @@ impl Polygon {
     }
 }
 
+/// Two pieces of an indexed triangle clipped at its shoreline. The
+/// original winding is retained, including four-vertex partial polygons.
+pub struct ShorelinePartition {
+    wet: Polygon,
+    dry: Polygon,
+}
+
+impl ShorelinePartition {
+    /// Append the wet triangle indices.
+    pub fn append_wet(&self, out: &mut Vec<u32>) {
+        self.wet.triangulate(out);
+    }
+    /// Append the dry triangle indices.
+    pub fn append_dry(&self, out: &mut Vec<u32>) {
+        self.dry.triangulate(out);
+    }
+}
+
+/// Partition a triangle into wet and dry polygons.
+///
+/// The crossing callback
+/// receives local triangle corner indices (wet, dry) and returns a shared
+/// vertex ID. The caller determines the field and interpolation policy.
+///
+/// # Errors
+/// Propagates errors from the crossing callback.
+pub fn partition_triangle<E>(
+    ids: [u32; 3],
+    flags: [bool; 3],
+    mut crossing: impl FnMut(usize, usize) -> Result<u32, E>,
+) -> Result<ShorelinePartition, E> {
+    let mut wet = Polygon::default();
+    let mut dry = Polygon::default();
+    for (current, id) in ids.into_iter().enumerate() {
+        let previous = (current + 2) % 3;
+        let current_wet = flags[current];
+        if current_wet != flags[previous] {
+            let id = if current_wet {
+                crossing(current, previous)?
+            } else {
+                crossing(previous, current)?
+            };
+            wet.push(id);
+            dry.push(id);
+        }
+        if current_wet {
+            wet.push(id);
+        } else {
+            dry.push(id);
+        }
+    }
+    Ok(ShorelinePartition { wet, dry })
+}
+
 fn vertex(region: &Region, point: [f64; 2]) -> io::Result<ChannelVertex> {
     let sample = region
         .sample_chart(point)
@@ -123,37 +177,15 @@ impl Builder<'_> {
     }
 
     fn triangle(&mut self, triangle: [usize; 3]) -> io::Result<()> {
-        let mut wet = Polygon::default();
-        let mut dry = Polygon::default();
-        for (index, &current) in triangle.iter().enumerate() {
-            let previous = triangle[(index + 2) % 3];
-            let current_wet = self.nodes[current].wet();
-            let previous_wet = self.nodes[previous].wet();
-            if current_wet != previous_wet {
-                let id = if current_wet {
-                    self.crossing(current, previous)?
-                } else {
-                    self.crossing(previous, current)?
-                };
-                wet.push(id);
-                dry.push(id);
-            }
-            let id = self.node_vertex(current);
-            if current_wet {
-                wet.push(id);
-            } else {
-                dry.push(id);
-            }
-        }
-        // Wet ground and water are literally the same triangles, evaluated
-        // at different canonical elevations. Dry ground uses the same
-        // shoreline endpoints, so there are no internal T-junctions.
-        let start = self.mesh.land_indices.len();
-        wet.triangulate(&mut self.mesh.land_indices);
-        self.mesh
-            .river_indices
-            .extend_from_slice(&self.mesh.land_indices[start..]);
-        dry.triangulate(&mut self.mesh.land_indices);
+        let ids = triangle.map(|index| self.node_vertex(index));
+        let flags = triangle.map(|index| self.nodes[index].wet());
+        let pieces = partition_triangle(ids, flags, |wet, dry| {
+            self.crossing(triangle[wet], triangle[dry])
+        })?;
+        // The wet bed and water use the same triangles at distinct heights.
+        pieces.append_wet(&mut self.mesh.river_indices);
+        pieces.append_wet(&mut self.mesh.land_indices);
+        pieces.append_dry(&mut self.mesh.land_indices);
         Ok(())
     }
 }

@@ -88,6 +88,10 @@ pub struct Weathered {
     pub scour: f64,
     pub deposit: f64,
     pub depth: f64,
+    /// Signed wet/dry depth for piecewise-linear render meshes. Positive
+    /// values are the physical water depth; dry banks retain the negative
+    /// margin of the limiting channel constraint. None outside the profile.
+    pub river_signed_depth: Option<f64>,
 }
 
 impl Weathered {
@@ -395,6 +399,14 @@ impl ChannelField {
         if cross <= radius && stage > result.bed + 0.02 && stage <= base + Self::MAX_RAISE {
             result.water = Some(stage);
             result.depth = stage - result.bed;
+            result.river_signed_depth = Some(result.depth);
+        } else {
+            result.river_signed_depth = Some(
+                (stage - result.bed - 0.02)
+                    .min(radius - cross)
+                    .min(base + Self::MAX_RAISE - stage)
+                    .min(-0.02),
+            );
         }
         result
     }

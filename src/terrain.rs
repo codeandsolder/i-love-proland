@@ -4,4 +4,4 @@ pub use channel::{ChannelField, Reach, Section, Weathered};
 mod region;
 pub use region::{Region, RegionCell, RegionChart, RegionSample, WaterKind};
 mod channel_mesh;
-pub use channel_mesh::{ChannelPatch, ChannelVertex};
+pub use channel_mesh::{ChannelPatch, ChannelVertex, ShorelinePartition, partition_triangle};
