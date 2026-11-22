@@ -157,19 +157,19 @@ fn check_overlap(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
 
 fn check_explicit_points(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = synthetic()?;
-    let side = 17;
+    let side = 17_u16;
     let mut gpu = TerrainGpu::new(device, &region, side, 3, 0x7654_3210, 1.0)?;
     let grid = TerrainRequest {
         origin_ticks: [12800, 14400],
         spacing_ticks: 192,
         slot: 0,
     };
-    let size = u32::from(side);
-    let addresses = (0..size * size)
+    let width = u32::from(side);
+    let addresses = (0..width * width)
         .map(|index| {
             [
-                grid.origin_ticks[0] + grid.spacing_ticks * (index % size),
-                grid.origin_ticks[1] + grid.spacing_ticks * (index / size),
+                grid.origin_ticks[0] + grid.spacing_ticks * (index % width),
+                grid.origin_ticks[1] + grid.spacing_ticks * (index / width),
             ]
         })
         .collect::<Vec<_>>();
