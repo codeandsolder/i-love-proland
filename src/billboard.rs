@@ -25,12 +25,12 @@ impl Billboard {
         Ok(Self { center, radius })
     }
 
-    #[must_use]
+    #[must_use = "Use the center to place the billboard relative to its source geometry"]
     pub const fn center(self) -> [f32; 3] {
         self.center
     }
 
-    #[must_use]
+    #[must_use = "Use the radius to bound and scale the billboard"]
     pub const fn radius(self) -> f32 {
         self.radius
     }
@@ -39,7 +39,7 @@ impl Billboard {
     /// Camera back is a unit vector in source coordinates. At the zenith
     /// use the atlas's analytic azimuth right vector as the degenerate
     /// fallback; the source's cylindrical rule is otherwise unchanged.
-    #[must_use]
+    #[must_use = "Use the mapped point to sample the impostor atlas"]
     pub(crate) fn atlas_point(
         self,
         normalized: [f32; 3],

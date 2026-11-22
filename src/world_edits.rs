@@ -88,7 +88,7 @@ impl<T> Default for WorldEdits<T> {
 }
 
 impl<T> WorldEdits<T> {
-    #[must_use]
+    #[must_use = "Retain the new edit store to record world changes"]
     pub fn new() -> Self {
         Self::default()
     }
@@ -127,12 +127,12 @@ impl<T> WorldEdits<T> {
         self.added.values()
     }
 
-    #[must_use]
+    #[must_use = "Use the recorded change or handle an unedited generated object"]
     pub fn get_generated(&self, id: u128) -> Option<&GeneratedChange<T>> {
         self.generated.get(&id)
     }
 
-    #[must_use]
+    #[must_use = "Use the stored added object or handle an unknown identity"]
     pub fn get_added(&self, id: u128) -> Option<&AddedObject<T>> {
         self.added.get(&id)
     }

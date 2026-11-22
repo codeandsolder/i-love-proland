@@ -36,7 +36,7 @@ impl TreeVertex {
     /// Validate floating-point source-material color, not a normalized
     /// vertex attribute: linear RGB multipliers may legitimately exceed 1.
     /// The alpha channel remains ordinary fractional coverage.
-    #[must_use]
+    #[must_use = "Check the result before accepting a material color"]
     pub fn valid_color(color: [f32; 4]) -> bool {
         color[..3].iter().all(|c| c.is_finite() && *c >= 0.0)
             && color[3].is_finite()
@@ -91,7 +91,7 @@ impl TreeMesh {
         })
     }
 
-    #[must_use]
+    #[must_use = "Use the index count when issuing indexed draws"]
     pub const fn index_count(&self) -> u32 {
         self.index_count
     }
@@ -132,27 +132,27 @@ impl AtlasImage {
         })
     }
 
-    #[must_use]
+    #[must_use = "Use the atlas width for texture allocation and addressing"]
     pub const fn width(&self) -> u32 {
         self.tile_size * AZIMUTH_VIEWS
     }
 
-    #[must_use]
+    #[must_use = "Use the atlas height for texture allocation and addressing"]
     pub const fn height(&self) -> u32 {
         self.tile_size * ELEVATION_VIEWS
     }
 
-    #[must_use]
+    #[must_use = "Use the tile size when addressing a view in the atlas"]
     pub const fn tile_size(&self) -> u32 {
         self.tile_size
     }
 
-    #[must_use]
+    #[must_use = "Use the gutter when sampling the padded atlas tile"]
     pub const fn gutter(&self) -> u32 {
         self.gutter
     }
 
-    #[must_use]
+    #[must_use = "Use the returned texels when uploading the atlas"]
     pub fn rgba(&self) -> &[u8] {
         &self.rgba
     }
@@ -328,7 +328,7 @@ impl TreeCamera {
     }
 
     /// Attach stable wind coordinates and elapsed animation time.
-    #[must_use]
+    #[must_use = "Use the returned view because the original wind state is unchanged"]
     pub const fn with_wind(mut self, frame: WindFrame) -> Self {
         self.wind = Some(frame);
         self
@@ -852,7 +852,7 @@ impl TreePipelines {
         })
     }
 
-    #[must_use]
+    #[must_use = "Use the owning device to create compatible render resources"]
     pub const fn device(&self) -> &wgpu::Device {
         self.compaction.device()
     }
@@ -960,13 +960,13 @@ impl TreeRenderer {
     }
 
     /// The shared immutable state; other compatible families can use it.
-    #[must_use]
+    #[must_use = "Use the initialized pipelines when drawing trees"]
     pub const fn pipelines(&self) -> &TreePipelines {
         &self.pipelines
     }
 
     /// Read-only access to classification metadata and compacted bins.
-    #[must_use]
+    #[must_use = "Use the compactor to update visibility and LOD bins"]
     pub const fn compactor(&self) -> &GpuCompactor {
         &self.compactor
     }
@@ -1106,7 +1106,7 @@ impl TreeRenderer {
         pass.draw_indexed_indirect(self.compactor.indirect(), self.impostor_indirect_offset);
     }
 
-    #[must_use]
+    #[must_use = "Use the count to enumerate the available material draws"]
     pub const fn material_count(&self) -> usize {
         self.mesh_draws.len()
     }

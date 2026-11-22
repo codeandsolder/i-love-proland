@@ -24,18 +24,18 @@ impl CellRect {
         })
     }
 
-    #[must_use]
+    #[must_use = "Use the lower bounds to enumerate the cell window"]
     pub const fn min(self) -> [i64; 2] {
         self.min
     }
 
-    #[must_use]
+    #[must_use = "Use the exclusive upper bounds to enumerate the cell window"]
     pub const fn end_exclusive(self) -> [i64; 2] {
         self.end
     }
 
     /// Tests membership using the canonical cell, not its rendering tile.
-    #[must_use]
+    #[must_use = "Check membership before processing a cell in this window"]
     pub const fn contains(self, x: i64, y: i64) -> bool {
         x >= self.min[0] && x < self.end[0] && y >= self.min[1] && y < self.end[1]
     }
