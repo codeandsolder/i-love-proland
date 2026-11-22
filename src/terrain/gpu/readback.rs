@@ -39,7 +39,7 @@ impl<T: bytemuck::Pod> RecordedReadback<T> {
             });
         PendingReadback {
             staging: self.staging,
-            receiver,
+            receiver: Some(receiver),
             marker: PhantomData,
         }
     }
@@ -47,7 +47,7 @@ impl<T: bytemuck::Pod> RecordedReadback<T> {
 
 pub struct PendingReadback<T> {
     staging: wgpu::Buffer,
-    receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    receiver: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
     marker: PhantomData<T>,
 }
 
@@ -57,15 +57,19 @@ impl<T: bytemuck::Pod> PendingReadback<T> {
     /// # Errors
     /// Reports failed mapping, invalid data or repeated consumption.
     pub fn try_take(&mut self) -> io::Result<Option<Vec<T>>> {
-        match self.receiver.try_recv() {
-            Ok(result) => result.map_err(io::Error::other)?,
+        let receiver = self
+            .receiver
+            .as_ref()
+            .ok_or_else(|| io::Error::other("GPU readback already consumed"))?;
+        let result = match receiver.try_recv() {
+            Ok(result) => result.map_err(io::Error::other),
             Err(mpsc::TryRecvError::Empty) => return Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => {
-                return Err(io::Error::other(
-                    "GPU readback disconnected or already consumed",
-                ));
+                Err(io::Error::other("GPU readback disconnected"))
             }
-        }
+        };
+        self.receiver = None;
+        result?;
         let samples = {
             let mapped = self
                 .staging

@@ -152,7 +152,7 @@ impl PresentationHistory {
         &self.poses
     }
 
-    /// Optional diagnostic readback; rendering binds poses() directly.
+    /// Optional diagnostic readback; rendering binds `poses()` directly.
     #[must_use = "Submit the encoder and begin the diagnostic map"]
     pub fn snapshot(
         &self,

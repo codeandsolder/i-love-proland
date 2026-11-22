@@ -394,7 +394,7 @@ impl Region {
     }
 
     #[cfg(feature = "gpu")]
-    pub(super) fn gpu_channels(&self) -> &ChannelField {
+    pub(super) const fn gpu_channels(&self) -> &ChannelField {
         &self.channels
     }
 
