@@ -48,7 +48,14 @@ Runtime uniforms: 16-byte input count/bin stride/mesh tier count/host-population
 normalized source bounds center, and six 16-byte frustum planes = 160 bytes. The frustum plane equation is
 `dot(plane.xyz, camera_relative_position) + plane.w >= -radius`.
 Zero planes are accepted as explicitly disabled planes for broad visibility
-and reproducibility tests.
+and reproducibility tests. `GpuView::from_projection` extracts normalized
+planes directly from the actual column-major camera-relative clip matrix
+using WebGPU's 0..w depth convention, including off-axis and orthographic
+projections and a disabled infinite far plane. Culling uses the larger
+of the animation-expanded physical sphere and the circumscribed sphere
+of the impostor square (sqrt(2) times the physical radius), plus f32
+plane-evaluation rounding allowance. Projected visual LOD uses the
+original physical radius, not the inflated culling bound.
 
 ### LOD and buffer semantics
 

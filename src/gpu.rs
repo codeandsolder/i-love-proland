@@ -242,6 +242,71 @@ impl GpuView {
         })
     }
 
+    /// Derive the six inward-facing planes from the actual column-major
+    /// camera-relative clip matrix. Uses WebGPU depth (0 <= z <= w), not
+    /// OpenGL depth. An infinite far plane is represented by a disabled
+    /// zero plane. Off-axis and orthographic projections are supported.
+    ///
+    /// # Errors
+    /// Rejects nonfinite/degenerate clip volumes or invalid view parameters.
+    pub fn from_projection(
+        focal_length_px: f32,
+        mesh_threshold_px: f32,
+        impostor_threshold_px: f32,
+        forward: [f32; 3],
+        projection: [[f32; 4]; 4],
+    ) -> Result<Self> {
+        if projection.iter().flatten().any(|v| !v.is_finite()) {
+            return Err(Error::InvalidConfiguration("nonfinite clip matrix"));
+        }
+        let row = |i: usize| core::array::from_fn::<_, 4, _>(|j| f64::from(projection[j][i]));
+        let w = row(3);
+        let x = row(0);
+        let y = row(1);
+        let z = row(2);
+        let combine = |a: [f64; 4], b: [f64; 4], sign: f64| {
+            core::array::from_fn(|i| sign.mul_add(b[i], a[i]))
+        };
+        let raw = [
+            combine(w, x, 1.),
+            combine(w, x, -1.),
+            combine(w, y, 1.),
+            combine(w, y, -1.),
+            z,
+            combine(w, z, -1.),
+        ];
+        let mut planes = [[0.0; 4]; 6];
+        for (dst, plane) in planes.iter_mut().zip(raw) {
+            let length = plane[..3].iter().map(|v| v * v).sum::<f64>().sqrt();
+            if length == 0.0 {
+                // A positive constant inequality is always satisfied (the
+                // conventional infinite-far projection). Zero has no
+                // orientation and is allowed only as a disabled far plane.
+                if plane[3] < 0.0 {
+                    return Err(Error::InvalidConfiguration("empty clip half-space"));
+                }
+                continue;
+            }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "plane is normalized in f64 then represented by the same f32 coefficients on CPU and GPU"
+            )]
+            for (value, v) in dst.iter_mut().zip(plane) {
+                *value = (v / length) as f32;
+            }
+        }
+        if planes[..5].contains(&[0.0; 4]) {
+            return Err(Error::InvalidConfiguration("degenerate clip volume"));
+        }
+        Self::new(
+            focal_length_px,
+            mesh_threshold_px,
+            impostor_threshold_px,
+            forward,
+            planes,
+        )
+    }
+
     /// Supply the original mesh bounds centre relative to its placement anchor,
     /// in unit-sphere mesh coordinates. Distance LOD selection then uses
     /// the reconstructed physical anchor even when the source is offset,
@@ -420,9 +485,17 @@ fn source_anchor(object: &PackedInstance, view: GpuView) -> [f32; 3] {
 pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods) -> VisualLod {
     let pos = &object.position_radius[..3];
     let radius = object.position_radius[3];
-    let visibility_radius = radius + view.displacement_bound;
+    let visibility_radius =
+        (radius + view.displacement_bound).max(radius * core::f32::consts::SQRT_2);
     if view.planes.iter().any(|p| {
-        p[0].mul_add(pos[0], p[1].mul_add(pos[1], p[2] * pos[2])) + p[3] < -visibility_radius
+        let signed = p[0].mul_add(pos[0], p[1].mul_add(pos[1], p[2] * pos[2])) + p[3];
+        // Bound normalized-plane evaluation and f32 rounding at tangency.
+        let magnitude = p[0].abs().mul_add(
+            pos[0].abs(),
+            p[1].abs().mul_add(pos[1].abs(), p[2].abs() * pos[2].abs()),
+        );
+        let margin = (magnitude + p[3].abs() + visibility_radius) * (8.0 * f32::EPSILON);
+        signed < -visibility_radius - margin
     }) {
         return VisualLod::OutsideFrustum;
     }
@@ -430,7 +503,7 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods
         pos[0],
         view.forward[1].mul_add(pos[1], view.forward[2] * pos[2]),
     );
-    if depth + visibility_radius <= 0.0 {
+    if depth + visibility_radius < 0.0 {
         return VisualLod::OutsideFrustum;
     }
     let projected_crown = (2.0 * radius) * view.focal_length_px;
@@ -872,6 +945,79 @@ impl GpuCompactor {
 mod tests {
     use super::*;
     use crate::{Distribution, Domain, Generator, GeneratorConfig, Layer, TileKey, Variant};
+
+    #[test]
+    fn webgpu_clip_planes_match_actual_homogeneous_inequalities() {
+        // Off-axis affine projection with nonzero translation and WGPU depth.
+        let projection = [
+            [0.25, 0., 0., 0.],
+            [0.05, 0.5, 0., 0.],
+            [0., 0., 0.125, 0.],
+            [-0.2, 0.1, -0.25, 1.],
+        ];
+        let view = GpuView::from_projection(540., 32., 1., [0., 0., 1.], projection).unwrap();
+        for x in -10_i16..=10 {
+            for y in -5_i16..=5 {
+                for z in -2_i16..=12 {
+                    let p = [
+                        f32::from(x) + 0.13,
+                        f32::from(y) + 0.17,
+                        f32::from(z) + 0.19,
+                        1.,
+                    ];
+                    let clip = core::array::from_fn::<_, 4, _>(|i| {
+                        (0..4).map(|j| projection[j][i] * p[j]).sum::<f32>()
+                    });
+                    let expected = clip[0].abs() <= clip[3]
+                        && clip[1].abs() <= clip[3]
+                        && (0.0..=clip[3]).contains(&clip[2]);
+                    let actual = view
+                        .planes
+                        .iter()
+                        .all(|plane| (0..4).map(|j| plane[j] * p[j]).sum::<f32>() >= 0.0);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+        // Positive constant far inequality of a +Z infinite perspective.
+        let infinite = [
+            [1., 0., 0., 0.],
+            [0., 1., 0., 0.],
+            [0., 0., 1., 1.],
+            [0., 0., -0.5, 0.],
+        ];
+        let view = GpuView::from_projection(540., 32., 1., [0., 0., 1.], infinite).unwrap();
+        assert_eq!(view.planes[5], [0.; 4]);
+        assert_eq!(view.planes[4], [0., 0., 1., -0.5]);
+        assert!(GpuView::from_projection(540., 32., 1., [0., 0., 1.], [[0.; 4]; 4]).is_err());
+    }
+
+    #[test]
+    fn impostor_quad_tangent_is_not_rejected_by_mesh_sphere() {
+        let lods = MeshLods::new(vec![MeshLod {
+            start_m: 0.,
+            index_count: 3,
+            prefer_mesh: false,
+        }])
+        .unwrap();
+        let mut planes = [[0.; 4]; 6];
+        planes[0] = [1., 0., 0., 0.];
+        let view = GpuView::new(540., 32., 1., [0., 0., 1.], planes).unwrap();
+        let mut object = PackedInstance {
+            position_radius: [-1.3, 0., 100., 1.],
+            rotation: [0., 0., 0., 1.],
+            axis_radii: [1., 1., 1., 1.],
+            object_id: [0; 4],
+            metadata: [0; 4],
+            tint: [1.; 4],
+        };
+        assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Impostor);
+        object.position_radius[0] = -1.5;
+        assert_eq!(
+            classify_cpu(&object, view, &lods),
+            VisualLod::OutsideFrustum
+        );
+    }
 
     #[test]
     fn gpu_layout_and_identity_roundtrip() {
