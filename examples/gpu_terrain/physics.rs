@@ -105,6 +105,95 @@ fn simulate(
     );
     Ok((output, start.elapsed().as_secs_f64()))
 }
+fn check_presentation(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    terrain: &TerrainGpu,
+) -> Result<()> {
+    use i_love_proland::terrain::gpu::physics::{PresentationHistory, PresentationTime, StepBatch};
+    let sphere = [Sphere {
+        center: [0.0; 3],
+        radius: 0.5,
+    }];
+    let mut initial = body([32.0, 32.0, 110.0], [1.0, 0.0, 0.0], 1);
+    initial.clock = [u32::MAX - 100, 15, 0, 0];
+    let epoch = initial.completed_tick();
+    let mut physics = PhysicsGpu::new(
+        device,
+        terrain,
+        0,
+        PhysicsConfig {
+            initial_tick: epoch,
+            gravity_m_s2: 0.0,
+            ..CONFIG
+        },
+        &[initial],
+        &sphere,
+    )?;
+    let mut history = PresentationHistory::new(device, &physics)?;
+    let mut commands = encoder(device);
+    let midpoint = PresentationTime {
+        tick: epoch + 120,
+        fraction: 0.5,
+    };
+    assert!(
+        history
+            .interpolate(device, &mut commands, midpoint)
+            .is_err()
+    );
+    history.capture(&mut commands);
+    physics.encode(
+        device,
+        &mut commands,
+        terrain,
+        StepBatch {
+            start_tick: epoch,
+            steps: 240,
+            hz: CONFIG.hz,
+        },
+    )?;
+    history.capture(&mut commands);
+    let mut snapshots = Vec::new();
+    for time in [
+        PresentationTime {
+            tick: epoch - 10,
+            fraction: 0.0,
+        },
+        midpoint,
+        PresentationTime {
+            tick: epoch + 500,
+            fraction: 0.0,
+        },
+    ] {
+        history.interpolate(device, &mut commands, time)?;
+        snapshots.push(history.snapshot(device, &mut commands));
+    }
+    let final_state = physics.snapshot(device, &mut commands);
+    queue.submit([commands.finish()]);
+    let mut pending: Vec<_> = snapshots.into_iter().map(|s| s.begin()).collect();
+    let mut final_state = final_state.begin();
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let poses = pending
+        .iter_mut()
+        .map(|p| {
+            p.try_take()?
+                .ok_or_else(|| io::Error::other("missing render pose"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let final_state = final_state
+        .try_take()?
+        .ok_or_else(|| io::Error::other("missing final physics state"))?;
+    assert!((poses[0][0].position[0] - 32.0).abs() < 1e-5);
+    assert!((poses[1][0].position[0] - (32.0 + 120.5 / 240.0)).abs() < 0.0005);
+    assert!((poses[2][0].position[0] - 33.0).abs() < 0.0005);
+    assert_eq!(final_state[0].completed_tick(), epoch + 240);
+    println!(
+        "GPU_PRESENTATION epoch={epoch} samples=[{:.6},{:.6},{:.6}] physics_ticks=240",
+        poses[0][0].position[0], poses[1][0].position[0], poses[2][0].position[0]
+    );
+    Ok(())
+}
+
 pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = slope_region(0.0)?;
     let mut terrain = TerrainGpu::new(device, &region, 65, 1, 0, 0.0)?;
@@ -119,6 +208,7 @@ pub(super) fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         }],
     )?;
     queue.submit([commands.finish()]);
+    check_presentation(device, queue, &terrain)?;
     let sphere = [Sphere {
         center: [0.0; 3],
         radius: 0.5,
