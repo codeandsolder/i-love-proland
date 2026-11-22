@@ -100,8 +100,23 @@ impl Weathered {
 #[derive(Debug)]
 pub struct ChannelField {
     reaches: Vec<Reach>,
-    buckets: Vec<Vec<usize>>,
+    buckets: Vec<Bucket>,
     side: usize,
+}
+
+#[derive(Clone, Debug)]
+struct Bucket {
+    indices: Vec<usize>,
+    minimum_width: f64,
+}
+
+impl Default for Bucket {
+    fn default() -> Self {
+        Self {
+            indices: Vec::new(),
+            minimum_width: f64::INFINITY,
+        }
+    }
 }
 
 struct Profile {
@@ -146,7 +161,7 @@ impl ChannelField {
         let side = (extent / BUCKET).ceil() as usize + 1;
         let mut result = Self {
             reaches,
-            buckets: vec![Vec::new(); side * side],
+            buckets: vec![Bucket::default(); side * side],
             side,
         };
         for (i, reach) in result.reaches.iter().enumerate() {
@@ -163,7 +178,10 @@ impl ChannelField {
                 std::array::from_fn(|c| result.bin(reach.a.xy[c].max(reach.b.xy[c]) + margin));
             for y in ymin..=ymax {
                 for x in xmin..=xmax {
-                    result.buckets[y * side + x].push(i);
+                    let bucket = &mut result.buckets[y * side + x];
+                    bucket.indices.push(i);
+                    bucket.minimum_width =
+                        bucket.minimum_width.min(reach.a.width.min(reach.b.width));
                 }
             }
         }
@@ -184,15 +202,22 @@ impl ChannelField {
 
     fn candidates(&self, p: [f64; 2]) -> &[usize] {
         let [x, y] = p.map(|v| self.bin(v));
-        &self.buckets[y * self.side + x]
+        &self.buckets[y * self.side + x].indices
     }
 
-    /// Broad-phase intersection against the conservative channel support bins.
-    /// False means no channel can contribute to any sample in the rectangle.
-    pub(super) fn intersects_bounds(&self, min: [f64; 2], max: [f64; 2]) -> bool {
+    /// Conservative minimum nominal width of candidate reaches over a
+    /// chart rectangle. This uses the same support bins as point sampling.
+    /// No per-candidate distance test or allocation is needed.
+    pub(super) fn minimum_width(&self, min: [f64; 2], max: [f64; 2]) -> Option<f64> {
         let [xmin, ymin] = min.map(|v| self.bin(v));
         let [xmax, ymax] = max.map(|v| self.bin(v));
-        (ymin..=ymax).any(|y| (xmin..=xmax).any(|x| !self.buckets[y * self.side + x].is_empty()))
+        let mut width = f64::INFINITY;
+        for y in ymin..=ymax {
+            for bucket in &self.buckets[y * self.side + xmin..=y * self.side + xmax] {
+                width = width.min(bucket.minimum_width);
+            }
+        }
+        width.is_finite().then_some(width)
     }
 
     fn projection(reach: Reach, p: [f64; 2]) -> (f64, f64) {
@@ -384,7 +409,7 @@ impl ChannelField {
 mod tests {
     use super::*;
     #[test]
-    fn cross_section_is_incised_and_bounded() {
+    fn cross_section_is_incised_and_bounded() -> io::Result<()> {
         let reach = Reach {
             a: Section {
                 xy: [100.0, 250.0],
@@ -400,11 +425,7 @@ mod tests {
             },
             valley: 1.0,
         };
-        let field = ChannelField {
-            reaches: vec![reach],
-            buckets: vec![vec![0]; 9],
-            side: 3,
-        };
+        let field = ChannelField::new(500.0, vec![reach])?;
         let center = field.at([250.0, 250.0], 104.0);
         assert!(center.bed < 100.0);
         assert_eq!(center.water, Some(100.0));
@@ -415,5 +436,6 @@ mod tests {
         let low = field.at([250.0, 250.0], 0.0);
         assert_eq!(low.bed, 0.0);
         assert!(field.at([250.0, 250.0], 160.0).water.is_none());
+        Ok(())
     }
 }

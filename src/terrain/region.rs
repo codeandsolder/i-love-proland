@@ -316,7 +316,60 @@ impl Region {
         if river { weather.water } else { None }
     }
     pub(super) fn channel_candidates(&self, min: [f64; 2], max: [f64; 2]) -> bool {
-        self.channels.intersects_bounds(min, max)
+        self.channels.minimum_width(min, max).is_some()
+    }
+
+    /// Minimum nominal width of any potential channel affecting a spherical
+    /// cap on this region, in metres. This is a conservative broad-phase
+    /// detail hint: a candidate does not imply water at every point.
+    /// A cap crossing the longitude seam or a geographic pole is handled
+    /// without assuming the centre lies inside the chart.
+    #[must_use = "Use the local feature scale to select terrain detail"]
+    pub fn channel_width_in_cap(&self, direction: [f64; 3], half_angle: f64) -> Option<f64> {
+        if !direction.iter().all(|v| v.is_finite())
+            || direction.iter().all(|&v| v == 0.0)
+            || !half_angle.is_finite()
+            || half_angle < 0.0
+            || self.channels.reaches().is_empty()
+        {
+            return None;
+        }
+        let chart = self.chart;
+        // A small angular padding covers trig/projection roundoff at closed
+        // cap and chart boundaries. It is independent of planetary radius.
+        let angle = 64.0_f64.mul_add(f64::EPSILON, half_angle).min(PI);
+        let latitude = direction[1].atan2(direction[0].hypot(direction[2]));
+        let half = chart.extent() * 0.5;
+        let center = (latitude - chart.latitude_rad).mul_add(chart.radius_m, half);
+        let span = angle * chart.radius_m;
+        let ymin = (center - span).max(0.0);
+        let ymax = (center + span).min(chart.extent());
+        if ymin > ymax {
+            return None;
+        }
+        // If a pole is inside the cap, its longitude interval is the
+        // entire circle. Otherwise the extremal meridian is tangent to it.
+        if latitude.abs() + angle >= PI * 0.5 {
+            return self
+                .channels
+                .minimum_width([0.0, ymin], [chart.extent(), ymax]);
+        }
+        let longitude = direction[2].atan2(direction[0]);
+        let delta = (longitude - chart.longitude_rad + PI).rem_euclid(TAU) - PI;
+        let scale = chart.radius_m * chart.latitude_rad.cos();
+        let lon_span = (angle.sin() / latitude.cos()).clamp(0.0, 1.0).asin() * scale;
+        let mut width = f64::INFINITY;
+        for shift in [-TAU, 0.0, TAU] {
+            let chart_x = (-(delta + shift)).mul_add(scale, half);
+            let xmin = (chart_x - lon_span).max(0.0);
+            let xmax = (chart_x + lon_span).min(chart.extent());
+            if xmin <= xmax
+                && let Some(candidate) = self.channels.minimum_width([xmin, ymin], [xmax, ymax])
+            {
+                width = width.min(candidate);
+            }
+        }
+        width.is_finite().then_some(width)
     }
 
     /// Little-endian, versioned format. No machine-dependent struct layout.
@@ -446,6 +499,48 @@ mod tests {
         assert_eq!(edge.weight, 0.0);
         assert!(region.sample([0.0; 3]).is_none());
         assert!(region.sample(chart.direction([3000.0, 1000.0])).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn channel_detail_cap_encloses_wet_samples_at_seams_and_poles() -> io::Result<()> {
+        for latitude_rad in [0.0, 1.55, -1.55] {
+            let chart = RegionChart {
+                radius_m: 600_000.0,
+                latitude_rad,
+                longitude_rad: PI - 0.001,
+                spacing_m: 250.0,
+                cells: 16,
+            };
+            let cell = RegionCell::new(104.0, None, [0.2, 0.4, 0.6])?;
+            let section = |x| Section {
+                xy: [x, 2000.0],
+                stage: 100.0,
+                width: 40.0,
+                bend: 0.0,
+            };
+            let region = Region::new(
+                chart,
+                vec![cell; 289],
+                vec![Reach {
+                    a: section(1000.0),
+                    b: section(3000.0),
+                    valley: 1.0,
+                }],
+            )?;
+            let wet = chart.direction([2000.0, 2000.0]);
+            assert_eq!(region.channel_width_in_cap(wet, 0.0), Some(40.0));
+            for dx in [-5000.0, -1000.0, 0.0, 1000.0, 5000.0] {
+                for dy in [-5000.0, -1000.0, 0.0, 1000.0, 5000.0] {
+                    let center = chart.direction([2000.0 + dx, 2000.0 + dy]);
+                    let dot = center.iter().zip(wet).map(|(a, b)| a * b).sum::<f64>();
+                    let half_angle = dot.clamp(-1.0, 1.0).acos() + 1e-8;
+                    assert_eq!(region.channel_width_in_cap(center, half_angle), Some(40.0));
+                }
+            }
+            assert!(region.channel_width_in_cap(wet.map(|v| -v), 0.01).is_none());
+            assert!(region.channel_width_in_cap([0.0; 3], 1.0).is_none());
+        }
         Ok(())
     }
 
