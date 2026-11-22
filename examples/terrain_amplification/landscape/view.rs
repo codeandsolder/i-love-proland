@@ -1,5 +1,8 @@
 //! Small deterministic reference renderer for evaluating relief from a cockpit
 //! instead of relying exclusively on overhead hillshades. Not the game renderer.
+mod rock;
+mod shading;
+
 use super::{Grid, Surface, lerp, light, rgb};
 use std::{fs, io, path::Path};
 
@@ -132,7 +135,9 @@ fn max_slope(grid: &Grid, surface: &Surface) -> f64 {
             let h = at(x, y);
             m = m
                 .max((at(x + 1, y) - h).abs())
-                .max((at(x, y + 1) - h).abs());
+                .max((at(x, y + 1) - h).abs())
+                .max((at(x + 1, y + 1) - at(x, y + 1)).abs())
+                .max((at(x + 1, y + 1) - at(x + 1, y)).abs());
         }
     }
     m / grid.spacing * std::f64::consts::SQRT_2
@@ -178,6 +183,17 @@ pub(super) fn render(
     camera: &Camera,
     path: &Path,
 ) -> io::Result<()> {
+    render_legacy(grid, surface, camera, path, WIDTH, HEIGHT)
+}
+
+fn render_legacy(
+    grid: &Grid,
+    surface: &Surface,
+    camera: &Camera,
+    path: &Path,
+    width: u16,
+    height: u16,
+) -> io::Result<()> {
     let slope_bound = max_slope(grid, surface);
     let shaded: Vec<_> = (0..grid.heights.len())
         .map(|i| {
@@ -192,13 +208,13 @@ pub(super) fn render(
             })
         })
         .collect();
-    let mut bytes = format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let u = (2.0 * (f64::from(x) + 0.5) / f64::from(WIDTH) - 1.0) * 0.76;
+    let mut bytes = format!("P6\n{width} {height}\n255\n").into_bytes();
+    for y in 0..height {
+        for x in 0..width {
+            let u = (2.0 * (f64::from(x) + 0.5) / f64::from(width) - 1.0) * 0.76;
             let v =
-                (1.0 - 2.0 * (f64::from(y) + 0.5) / f64::from(HEIGHT)) * 0.76 * f64::from(HEIGHT)
-                    / f64::from(WIDTH);
+                (1.0 - 2.0 * (f64::from(y) + 0.5) / f64::from(height)) * 0.76 * f64::from(height)
+                    / f64::from(width);
             let ray = normalize(std::array::from_fn(|i| {
                 camera.forward[i] + camera.right[i] * u + camera.up[i] * v
             }));
@@ -217,4 +233,69 @@ pub(super) fn render(
         }
     }
     fs::write(path, bytes)
+}
+
+// Same camera and raster dimensions for all comparisons. Ray intersections
+// continue to use the unmodified heightfield, including lake surfaces.
+pub(super) fn compare_shading(
+    grid: &Grid,
+    surface: &Surface,
+    camera: &Camera,
+    output: &Path,
+    label: &str,
+    source: &Grid,
+    full: bool,
+) -> io::Result<()> {
+    const W: u16 = 1280;
+    const H: u16 = 720;
+    if full {
+        render_legacy(
+            grid,
+            surface,
+            camera,
+            &output.join(format!("{label}-legacy.ppm")),
+            W,
+            H,
+        )?;
+    }
+    let bound = max_slope(grid, surface);
+    let pixel_angle = 1.52 / f64::from(W);
+    let atlas = rock::RockAtlas::new(source);
+    let rivers = super::hydro::RiverCoverage::new(grid, &surface.hydro);
+    for (name, style) in [
+        ("lighting", shading::Style::Lighting),
+        ("detail", shading::Style::Procedural),
+        (
+            "geologic",
+            shading::Style::Geologic {
+                atlas: &atlas,
+                rivers: &rivers,
+            },
+        ),
+    ] {
+        if !full && !matches!(style, shading::Style::Geologic { .. }) {
+            continue;
+        }
+        let mut bytes = format!("P6\n{W} {H}\n255\n").into_bytes();
+        for y in 0..H {
+            for x in 0..W {
+                let u = (f64::from(x) + 0.5) * pixel_angle - 0.76;
+                let v = (f64::from(H) * 0.5 - f64::from(y) - 0.5) * pixel_angle;
+                let ray = normalize(std::array::from_fn(|i| {
+                    camera.forward[i] + camera.right[i] * u + camera.up[i] * v
+                }));
+                let color = if let Some((sample, distance)) =
+                    trace(grid, surface, camera.eye, ray, bound)
+                {
+                    let p = std::array::from_fn(|i| ray[i].mul_add(distance, camera.eye[i]));
+                    shading::shade(grid, surface, &sample, p, ray, distance, pixel_angle, style)
+                } else {
+                    shading::sky(ray)
+                };
+                bytes.extend(color.map(rgb));
+            }
+        }
+        fs::write(output.join(format!("{label}-{name}.ppm")), bytes)?;
+    }
+    Ok(())
 }

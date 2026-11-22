@@ -204,3 +204,109 @@ mod tests {
         assert_eq!(water.lake_levels.iter().filter(|&&v| v == 20.0).count(), 36);
     }
 }
+
+/// Small regional index over the existing curved river segments. Used to
+/// evaluate projected water coverage independently of height-grid spacing.
+/// This is a rendering query, not a river-bed displacement or water mesh.
+pub(super) struct RiverCoverage<'a> {
+    segments: &'a [Segment],
+    buckets: Vec<Vec<usize>>,
+    side: usize,
+    spacing: f64,
+}
+
+impl<'a> RiverCoverage<'a> {
+    const BIN_M: f64 = 250.0;
+    const MAX_FILTER_M: f64 = 125.0;
+
+    pub(super) fn new(grid: &Grid, water: &'a Water) -> Self {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "regional bin count is bounded by grid extent"
+        )]
+        #[expect(clippy::cast_sign_loss, reason = "grid extent is positive")]
+        let side = (f64::from(grid.cells) * grid.spacing / Self::BIN_M).ceil() as usize + 1;
+        let mut index = Self {
+            segments: &water.segments,
+            buckets: vec![Vec::new(); side * side],
+            side,
+            spacing: grid.spacing,
+        };
+        for (i, s) in water.segments.iter().enumerate() {
+            let margin = s.width * 0.5 + Self::MAX_FILTER_M;
+            let [xmin, ymin] = std::array::from_fn(|c| {
+                index.bin(s.start_xy[c].min(s.end_xy[c]) * grid.spacing - margin)
+            });
+            let [xmax, ymax] = std::array::from_fn(|c| {
+                index.bin(s.start_xy[c].max(s.end_xy[c]) * grid.spacing + margin)
+            });
+            for y in ymin..=ymax {
+                for x in xmin..=xmax {
+                    index.buckets[y * side + x].push(i);
+                }
+            }
+        }
+        index
+    }
+
+    fn bin(&self, value: f64) -> usize {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "bounded regional bin index"
+        )]
+        #[expect(clippy::cast_sign_loss, reason = "clamped nonnegative bin index")]
+        let result = (value / Self::BIN_M).max(0.0).floor() as usize;
+        result.min(self.side - 1)
+    }
+
+    pub(super) fn at(&self, p: [f64; 2], footprint: f64) -> f64 {
+        let [x, y] = p.map(|v| self.bin(v));
+        let half = (footprint * 0.5).clamp(0.4, Self::MAX_FILTER_M);
+        let mut coverage = 0.0_f64;
+        for &i in &self.buckets[y * self.side + x] {
+            let s = &self.segments[i];
+            let a = s.start_xy.map(|v| v * self.spacing);
+            let b = s.end_xy.map(|v| v * self.spacing);
+            let d = [b[0] - a[0], b[1] - a[1]];
+            let delta = [p[0] - a[0], p[1] - a[1]];
+            let t = (delta[0].mul_add(d[0], delta[1] * d[1])
+                / d[0].mul_add(d[0], d[1] * d[1]).max(1e-9))
+            .clamp(0.0, 1.0);
+            let distance = (delta[0] - t * d[0]).hypot(delta[1] - t * d[1]);
+            let radius = s.width * 0.5;
+            // Approximate pixel integral of an infinite strip locally:
+            // a subpixel river cannot cover the entire pixel, even at its
+            // centerline. The union of segment capsules is approximated by max.
+            let alpha = (radius + half - distance).clamp(0.0, (2.0 * radius).min(2.0 * half))
+                / (2.0 * half);
+            coverage = coverage.max(alpha);
+        }
+        coverage
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    #[test]
+    fn coverage_tracks_metric_width_and_subpixel_filter() {
+        let grid = Grid::new(32, 62.5);
+        let water = Water {
+            lake_levels: Vec::new(),
+            river: Vec::new(),
+            lakes: 0,
+            segments: vec![Segment {
+                start: 0,
+                end: 1,
+                width: 10.0,
+                start_xy: [3.0, 4.0],
+                end_xy: [9.0, 4.0],
+            }],
+        };
+        let index = RiverCoverage::new(&grid, &water);
+        assert!((index.at([250.0, 250.0], 2.0) - 1.0).abs() < 1e-12);
+        assert!((index.at([250.0, 255.0], 2.0) - 0.5).abs() < 1e-12);
+        assert!(index.at([250.0, 260.0], 2.0) < 1e-12);
+        assert!((index.at([250.0, 250.0], 20.0) - 0.5).abs() < 1e-12);
+    }
+}

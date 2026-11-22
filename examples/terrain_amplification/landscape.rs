@@ -801,6 +801,48 @@ pub(super) fn run_natural(
     Ok(())
 }
 
+pub(super) fn run_sharp(
+    stock: &StockMap,
+    biome: &Path,
+    dem: &Path,
+    output: &Path,
+    full: bool,
+) -> Result<(), Box<dyn Error>> {
+    let biomes = Biomes::read(biome)?;
+    let atlas = exemplars::Atlas::read_broad(dem)?;
+    for (label, center) in [
+        ("mountains", stock.select_region()),
+        ("coast", coast_region(stock)),
+    ] {
+        let base = stock.region(center.0, center.1);
+        let mut raw = base.clone();
+        for _ in 0..4 {
+            raw = upsample(&raw, 0, 0.0);
+        }
+        let camera = view::Camera::choose(&raw);
+        let (mut grid, climate) =
+            generate(&base, Climate::new(stock, &biomes, center), 1.45, false);
+        atlas.apply_constrained(&mut grid, &climate, 1.75);
+        let surface = materials(&grid, &climate);
+        super::statistics(&grid, label);
+        let start = Instant::now();
+        view::compare_shading(
+            &grid,
+            &surface,
+            &camera,
+            output,
+            label,
+            atlas.source(),
+            full,
+        )?;
+        println!(
+            "{label}: reference renders {:.3}s",
+            start.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

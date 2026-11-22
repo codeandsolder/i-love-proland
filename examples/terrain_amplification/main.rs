@@ -516,11 +516,20 @@ fn statistics(grid: &Grid, label: &str) {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if let [map, output, biome, dem, mode] = args.as_slice() {
-        if mode != "natural" {
-            return Err("expected natural".into());
+        if mode != "natural" && mode != "sharp" && mode != "material" {
+            return Err("expected natural, sharp, or material".into());
         }
         let output = Path::new(output);
         fs::create_dir_all(output)?;
+        if mode == "sharp" || mode == "material" {
+            return landscape::run_sharp(
+                &StockMap::read(Path::new(map))?,
+                Path::new(biome),
+                Path::new(dem),
+                output,
+                mode == "sharp",
+            );
+        }
         return landscape::run_natural(
             &StockMap::read(Path::new(map))?,
             Path::new(biome),
@@ -545,7 +554,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let [map, output] = args.as_slice() else {
         return Err(
-            "usage: terrain_amplification KERBIN_MAP OUTPUT_DIR [BIOME_RGB [DEM_RAW [natural]]]"
+            "usage: terrain_amplification KERBIN_MAP OUTPUT_DIR [BIOME_RGB [DEM_RAW [natural|sharp|material]]]"
                 .into(),
         );
     };

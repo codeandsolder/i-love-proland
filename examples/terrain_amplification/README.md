@@ -74,3 +74,26 @@ can lift individual samples by hundreds of metres; future fitting should
 respect drainage constraints during synthesis instead. River widths in
 the preview are raster coverage, not an in-game water mesh. Both test
 regions overlap, and neither establishes spherical or LOD continuity.
+
+## Sharp flight-preview comparison
+
+Use the same input files as `natural`, but select `sharp` (all four
+render styles) or `material` (only the final geologic style). The camera,
+base `gentle-natural` heightfield and hydrology are unchanged.
+
+The 1280×720 reference renders compare legacy interpolated vertex lighting,
+per-hit bicubic-derived shading normals with linear-light illumination,
+synthetic microdetail, and geologic microdetail. The latter reuses the
+existing source DEM high-pass residual, overlapping spatially seeded
+patches at three reduced scales with triplanar normal perturbation and
+approximate pixel-footprint filtering. This affects shading only, not
+terrain intersections or physics. Biome-dependent albedo modulation and
+directional sky fill preserve small-scale relief in shadows. Rivers use
+metric-width analytic coverage of the existing curved segment graph,
+not interpolation of the coarse river raster. Standing water is still
+sampled from the coarse field. No additional atlas asset is required.
+
+The final preview is not the game shader or a physical water simulation:
+the finer material detail does not alter the terrain silhouette, and
+low-altitude geometry, spherical addressing, and GPU implementation
+remain separate experiments.
