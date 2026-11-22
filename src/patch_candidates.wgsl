@@ -11,6 +11,6 @@ struct CandidatePatch {
 @compute @workgroup_size(64)
 fn patch_candidates(@builtin(global_invocation_id) id:vec3<u32>){
     if id.x >= count {return;}
-    let patch=patches[id.x];
-    candidates[patch.slot.x]=patch.candidate;
+    let update_record=patches[id.x];
+    candidates[update_record.slot.x]=update_record.candidate;
 }
