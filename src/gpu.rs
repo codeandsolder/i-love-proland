@@ -9,7 +9,14 @@ use crate::{Error, Instance, Result};
 use std::num::NonZeroU64;
 use wgpu::util::DeviceExt;
 
-pub const WGSL_COMPACTION: &str = include_str!("compact.wgsl");
+pub const WGSL_COMPACTION: &str = concat!(
+    include_str!("gpu_instance.wgsl"),
+    include_str!("compact.wgsl")
+);
+
+mod patch;
+pub use patch::CandidatePatch;
+use patch::{PatchPipeline, PatchStorage};
 
 const INSTANCE_BYTES: u64 = core::mem::size_of::<PackedInstance>() as u64;
 const INDEX_BYTES: u64 = 4;
@@ -627,6 +634,7 @@ pub struct GpuCompactor {
     bind_group: wgpu::BindGroup,
     pipeline: CompactionPipeline,
     templates: Vec<IndexedDraw>,
+    patch_storage: Option<PatchStorage>,
 }
 
 const fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -654,6 +662,7 @@ pub struct CompactionPipeline {
     device: wgpu::Device,
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
+    patches: PatchPipeline,
 }
 
 impl CompactionPipeline {
@@ -676,6 +685,7 @@ impl CompactionPipeline {
             device: device.clone(),
             pipeline,
             layout,
+            patches: PatchPipeline::new(device),
         }
     }
 
@@ -854,6 +864,7 @@ impl GpuCompactor {
             bind_group,
             pipeline: pipeline.clone(),
             templates,
+            patch_storage: None,
         })
     }
 
@@ -890,6 +901,7 @@ impl GpuCompactor {
             &self.uniforms,
         );
         self.input = input;
+        self.patch_storage = None;
         self.visible = visible;
         self.bind_group = bind_group;
         self.bin_stride = bin_stride;

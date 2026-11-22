@@ -3,8 +3,8 @@
 //! This is an end-to-end latency probe, not a shader-only timestamp benchmark.
 
 use i_love_proland::gpu::{
-    CompactionPipeline, GpuCompactor, GpuView, IndexedDraw, MeshLod, MeshLods, PackedInstance,
-    RenderPose, VisualLod, classify_cpu,
+    CandidatePatch, CompactionPipeline, GpuCompactor, GpuView, IndexedDraw, MeshLod, MeshLods,
+    PackedInstance, RenderPose, VisualLod, classify_cpu,
 };
 use i_love_proland::{Distribution, Domain, Generator, GeneratorConfig, Layer, TileKey, Variant};
 use std::collections::{BTreeMap, BTreeSet};
@@ -344,6 +344,53 @@ fn validate_moving_handoff(
     Ok(())
 }
 
+fn validate_sparse_patches(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    compactor: &mut GpuCompactor,
+    candidates: &[PackedInstance],
+    view: GpuView,
+) -> Result<(), Box<dyn Error>> {
+    let mut expected = candidates[..37].to_vec();
+    assert!(!compactor.set_candidates(queue, &expected)?);
+    let patch = |compactor: &mut GpuCompactor,
+                 expected: &[PackedInstance],
+                 slots: &[u32]|
+     -> Result<(), Box<dyn Error>> {
+        let records = slots
+            .iter()
+            .map(|&slot| Ok(CandidatePatch::new(slot, expected[usize::try_from(slot)?])))
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        compactor.patch_candidates(
+            queue,
+            &mut encoder,
+            u32::try_from(expected.len())?,
+            &records,
+        )?;
+        queue.submit(Some(encoder.finish()));
+        let (reference, _) = reference(expected, view, compactor.mesh_lods());
+        gpu_parity(device, queue, compactor, expected, view, &reference)?;
+        Ok(())
+    };
+    expected[2].tint = [0.2, 0.3, 0.4, 1.0];
+    expected[17].position_radius[2] += 120.0;
+    expected.extend_from_slice(&candidates[37..42]);
+    patch(compactor, &expected, &[2, 17, 37, 38, 39, 40, 41])?;
+    expected.truncate(9);
+    patch(compactor, &expected, &[])?;
+    expected.extend_from_slice(&candidates[9..20]);
+    expected[9].position_radius[1] += 9.0;
+    patch(compactor, &expected, &(9..20).collect::<Vec<_>>())?;
+    expected.clear();
+    patch(compactor, &expected, &[])?;
+    expected.extend_from_slice(&candidates[..4]);
+    patch(compactor, &expected, &[0, 1, 2, 3])?;
+    assert!(!compactor.set_candidates(queue, candidates)?);
+    println!("GPU_SPARSE_PATCH_PARITY PASS");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let (candidates, generation_ms) = generate_sample()?;
     let view = GpuView::unculled(540.0, 32.0, 1.0)?.with_source_center([0.12, 0.4, -0.19])?;
@@ -436,6 +483,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let resident_ms = benchmark(&device, &queue, &mut compactor, None, view)?;
     println!("GPU_RESIDENT_INPUT upload_ms={frame_ms:.4} resident_ms={resident_ms:.4}");
     validate_replacement(&device, &queue, &mut compactor, &candidates, view)?;
+    validate_sparse_patches(&device, &queue, &mut compactor, &candidates, view)?;
 
     let generated = candidates.len();
     let counts = |draws: &[IndexedDraw]| draws.iter().map(|d| d.instance_count).collect::<Vec<_>>();
