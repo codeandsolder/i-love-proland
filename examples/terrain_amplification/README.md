@@ -132,3 +132,20 @@ using a deterministic low-altitude diagnostic camera near a river.
 This is geomorphic profile synthesis, not time-integrated sediment
 transport or fluid dynamics; the local field has not yet been wired
 into KSP physics, the production GPU renderer, or global spherical LOD.
+
+## Regional runtime integration
+
+The `weathered` mode now adds drainage-conditioned foothill aprons and
+exports a versioned `*.plterrain` asset per region. It contains a
+quarter-metre i16 heightfield and lake stages, RGB8 land materials, and
+the vector channel network (not a fine river raster). The shared
+`i_love_proland::terrain::Region` loads and samples it using the
+body-fixed direction, with a 4 km smooth edge taper. The same
+`ChannelField` implementation is used by the laboratory and runtime.
+The lab prints direction-query CPU throughput and the serialized size.
+Generated source terrain and assets remain untracked.
+
+This first integration deliberately covers a single regional chart,
+not global hydrology or multi-region seam stitching. Its chart is
+valid around the test regions without a polar singularity. Fine material
+normal maps and the full water optics remain in the reference renderer.

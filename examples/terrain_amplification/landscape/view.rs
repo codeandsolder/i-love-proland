@@ -301,7 +301,8 @@ pub(super) fn compare_weathering(
         1280,
         720,
     )?;
-    if let Some((center, direction)) = channels.viewpoint(
+    if let Some((center, direction)) = super::hydro::weathering::viewpoint(
+        channels,
         [camera.eye[0], camera.eye[1]],
         f64::from(grid.cells) * grid.spacing,
     ) {

@@ -2,6 +2,7 @@
 //! are priors, not painted colors or fixed final surface classifications.
 mod evolution;
 mod exemplars;
+mod foothills;
 mod hydro;
 mod view;
 
@@ -407,6 +408,7 @@ fn materials(grid: &Grid, climate: &Climate) -> Surface {
     let mut cover = Vec::with_capacity(grid.heights.len());
     let mut river_cells = 0;
     let mut lake_cells = 0;
+    let broad_heights = blur(grid, &grid.heights, 12);
     // Persistent water coverage derived from connected drainage, not biome
     // color. Current grid is too coarse for meter-wide streams, so this
     // map represents pixel-area coverage (not a full water mesh).
@@ -417,7 +419,10 @@ fn materials(grid: &Grid, climate: &Climate) -> Surface {
         let [rain, mountain, arid, cold, veg] = climate.at(i);
         let moist = smooth((rain / 1.2).clamp(0.0, 1.0));
         let variation = noise(SEED ^ 8, x, y) * 0.06 + noise(SEED ^ 9, x / 4, y / 4) * 0.12;
-        let rock = smooth(((slope - 0.30) / 0.54).clamp(0.0, 1.0));
+        let rock = smooth(((slope - 0.20 + variation * 0.18) / 0.70).clamp(0.0, 1.0));
+        let talus = smooth(((broad_heights[i] - h) / 70.0).clamp(0.0, 1.0))
+            * smooth((slope / 0.45).clamp(0.0, 1.0))
+            * (1.0 - rock);
         let snowline = 3100.0 - 900.0 * cold + 280.0 * gy.clamp(-1.0, 1.0);
         let snow = smooth(((h - snowline + variation * 450.0) / 500.0).clamp(0.0, 1.0))
             * (1.0 - 0.65 * rock);
@@ -432,7 +437,11 @@ fn materials(grid: &Grid, climate: &Climate) -> Surface {
         let color = std::array::from_fn(|c| {
             let vegetated = lerp(grass[c], forest_color[c], forest);
             let soil = lerp(lerp(vegetated, dry[c], arid), wet[c], floodplain * 0.6);
-            let rocky = lerp(soil, stone[c] * (1.0 + variation), rock);
+            let rocky = lerp(
+                lerp(soil, [0.46, 0.425, 0.34][c], talus * 0.45),
+                stone[c] * (1.0 + variation),
+                rock,
+            );
             (lerp(rocky, [0.82, 0.86, 0.87][c], snow) * (1.0 + variation)).clamp(0.0, 1.0)
         });
         let lake = hydro.lake_levels[i] > 0.0;
@@ -801,6 +810,63 @@ pub(super) fn run_natural(
     Ok(())
 }
 
+fn export_region(
+    grid: &Grid,
+    surface: &Surface,
+    channels: &hydro::weathering::ChannelField,
+    stock: &StockMap,
+    center: (u16, u16),
+    path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    use i_love_proland::terrain::{Region, RegionCell, RegionChart};
+    let latitude = (f64::from(center.1) / f64::from(stock.height) - 0.5) * std::f64::consts::PI;
+    let longitude = ((1.75 - f64::from(center.0) / f64::from(stock.width)) * std::f64::consts::TAU)
+        .rem_euclid(std::f64::consts::TAU)
+        - std::f64::consts::PI;
+    let chart = RegionChart {
+        radius_m: RADIUS_M,
+        latitude_rad: latitude,
+        longitude_rad: longitude,
+        spacing_m: grid.spacing,
+        cells: grid.cells,
+    };
+    let cells = grid
+        .heights
+        .iter()
+        .zip(&surface.water_level)
+        .zip(&surface.colors)
+        .map(|((&h, &lake), &rgb)| RegionCell::new(h, (lake > 0.0).then_some(lake), rgb))
+        .collect::<io::Result<Vec<_>>>()?;
+    let region = Region::new(chart, cells, channels.reaches().to_vec())?;
+    let now = Instant::now();
+    let mut sum = 0.0;
+    for y in 0..=grid.cells {
+        for x in 0..=grid.cells {
+            let p = [f64::from(x) * grid.spacing, f64::from(y) * grid.spacing];
+            let d = chart.direction(p);
+            if let Some(sample) = region.sample(std::hint::black_box(d)) {
+                sum += sample.weather.bed;
+            }
+        }
+    }
+    println!(
+        "regional direction query: {:.3}s for {} samples, checksum {:.3}",
+        now.elapsed().as_secs_f64(),
+        grid.heights.len(),
+        sum
+    );
+    let mut file = io::BufWriter::new(fs::File::create(path)?);
+    region.write(&mut file)?;
+    use std::io::Write;
+    file.flush()?;
+    println!(
+        "region artifact {} bytes, {} reaches",
+        fs::metadata(path)?.len(),
+        region.reaches().len()
+    );
+    Ok(())
+}
+
 pub(super) fn run_sharp(
     stock: &StockMap,
     biome: &Path,
@@ -824,12 +890,23 @@ pub(super) fn run_sharp(
         let (mut grid, climate) =
             generate(&base, Climate::new(stock, &biomes, center), 1.45, false);
         atlas.apply_constrained(&mut grid, &climate, 1.75);
+        if weathered {
+            foothills::blend(&mut grid, &climate);
+        }
         let surface = materials(&grid, &climate);
         super::statistics(&grid, label);
         let start = Instant::now();
         if weathered {
             let flow = Rivers::route(&grid, &climate);
-            let channels = hydro::weathering::ChannelField::new(&grid, &flow);
+            let channels = hydro::weathering::build(&grid, &flow)?;
+            export_region(
+                &grid,
+                &surface,
+                &channels,
+                stock,
+                center,
+                &output.join(format!("{label}.plterrain")),
+            )?;
             view::compare_weathering(
                 &grid,
                 &surface,

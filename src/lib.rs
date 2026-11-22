@@ -36,6 +36,7 @@ mod generator;
 mod random;
 mod selection;
 mod stream;
+pub mod terrain;
 mod world_edits;
 
 pub use domain::{Anchor, CubeFace, Domain, SurfaceCell, TileKey};
