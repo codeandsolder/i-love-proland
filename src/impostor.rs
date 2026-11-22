@@ -569,8 +569,8 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 fn instance_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("i-love-proland shared tier instance layout"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
+        entries: &[0, 1].map(|binding| wgpu::BindGroupLayoutEntry {
+            binding,
             visibility: wgpu::ShaderStages::VERTEX,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -578,7 +578,7 @@ fn instance_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 min_binding_size: None,
             },
             count: None,
-        }],
+        }),
     })
 }
 
@@ -595,10 +595,16 @@ fn instance_bindings(
             Ok(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("i-love-proland shared tier instances"),
                 layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(bin.instances),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(bin.candidates),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(bin.indices),
+                    },
+                ],
             }))
         })
         .collect()

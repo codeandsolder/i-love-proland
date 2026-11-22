@@ -144,7 +144,8 @@ geometry over the generated impostor. A host that selects its explicit
 population with a complementary aggregate handoff can disable the
 independent subpixel cutoff. Every candidate is atomically appended at most once.
 Each bin has its own indexed-indirect record and device-aligned storage
-slice, both exposed through `compactor.bin(index)`. Draw materials
+slice of frame-local u32 candidate indices, exposed together with the
+shared input record buffer through `compactor.bin(index)`. Draw materials
 within a tier share its instance list and immutable uploaded source
 mesh buffers; no per-material compaction or CPU readback is needed.
 
@@ -172,7 +173,7 @@ resource limits.
 ### Actual near-tree meshes and 32-angle impostor draws
 
 The GPU feature also provides `impostor::TreeMesh` and `TreeRenderer`, which
-consume the two compacted instance buffers and **indexed-indirect draw counts**
+consume the original candidate buffer, compacted index bins, and **indexed-indirect draw counts**
 inside an existing wgpu render pass. It draws multiple independently textured original source-material meshes nearby
 with **one GPU visibility-compaction pass** and **one** middle-distance
 camera-facing impostor draw. Each near-field material retains its own

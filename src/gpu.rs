@@ -12,6 +12,7 @@ use wgpu::util::DeviceExt;
 pub const WGSL_COMPACTION: &str = include_str!("compact.wgsl");
 
 const INSTANCE_BYTES: u64 = 96;
+const INDEX_BYTES: u64 = 4;
 const WORKGROUP_SIZE: u32 = 64;
 
 /// An explicit, stable, shader-compatible 96-byte instance layout. All
@@ -449,10 +450,12 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods
 
 /// One compacted instance-bin binding and its indexed indirect record.
 ///
-/// Each bin is an aligned, independently bindable slice of one storage
-/// buffer. The same instance record is written at most once per dispatch.
+/// All bins share immutable submitted candidates. Each bin is an aligned
+/// slice of u32 candidate slots, written at most once per dispatch. Slot
+/// indices are frame-local; stable identities remain in the source records.
 pub struct CompactedBin<'a> {
-    pub instances: wgpu::BufferBinding<'a>,
+    pub candidates: wgpu::BufferBinding<'a>,
+    pub indices: wgpu::BufferBinding<'a>,
     pub indirect: &'a wgpu::Buffer,
     pub indirect_offset: u64,
     pub index_count: u32,
@@ -483,15 +486,15 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
-/// A bin offsets whole instance records, and also meets WGPU storage
+/// A bin offsets whole candidate indices, and also meets WGPU storage
 /// binding offset alignment. Padding is private, never counted/drawn.
 fn aligned_bin_stride(capacity: u32, alignment: u64) -> Option<u64> {
     let alignment = alignment.max(1);
-    let records_alignment = alignment / gcd(INSTANCE_BYTES, alignment);
+    let records_alignment = alignment / gcd(INDEX_BYTES, alignment);
     u64::from(capacity)
         .div_ceil(records_alignment)
         .checked_mul(records_alignment)?
-        .checked_mul(INSTANCE_BYTES)
+        .checked_mul(INDEX_BYTES)
 }
 
 fn create_compaction_pipeline(device: &wgpu::Device) -> wgpu::ComputePipeline {
@@ -537,7 +540,7 @@ fn compaction_sizes(
         || bytes > limits.max_buffer_size
         || visible_bytes > limits.max_storage_buffer_binding_size
         || visible_bytes > limits.max_buffer_size
-        || visible_bytes / INSTANCE_BYTES > u64::from(u32::MAX)
+        || visible_bytes / INDEX_BYTES > u64::from(u32::MAX)
         || capacity.div_ceil(WORKGROUP_SIZE) > limits.max_compute_workgroups_per_dimension
     {
         return Err(Error::InvalidConfiguration(
@@ -609,8 +612,11 @@ impl GpuCompactor {
         let (bytes, bin_stride, visible_bytes) =
             compaction_sizes(device, capacity, &mesh_lods, impostor_index_count)?;
         let input = create_instance_buffer(device, "i-love-proland candidate input", bytes);
-        let visible =
-            create_instance_buffer(device, "i-love-proland compacted LOD bins", visible_bytes);
+        let visible = create_instance_buffer(
+            device,
+            "i-love-proland compacted LOD index bins",
+            visible_bytes,
+        );
         let templates = mesh_lods
             .tiers
             .iter()
@@ -695,8 +701,11 @@ impl GpuCompactor {
                 ),
             };
         let input = create_instance_buffer(device, "i-love-proland candidate input", bytes);
-        let visible =
-            create_instance_buffer(device, "i-love-proland compacted LOD bins", visible_bytes);
+        let visible = create_instance_buffer(
+            device,
+            "i-love-proland compacted LOD index bins",
+            visible_bytes,
+        );
         let bind_group = create_compaction_bind(
             device,
             &self.pipeline,
@@ -733,17 +742,22 @@ impl GpuCompactor {
         self.templates.len()
     }
 
-    /// Bind or copy the exact capacity-sized instance slice and the
+    /// Bind or copy the exact capacity-sized index slice and the
     /// corresponding indirect record. Mesh bins precede the impostor bin.
     #[must_use]
     pub fn bin(&self, index: usize) -> Option<CompactedBin<'_>> {
         let template = self.templates.get(index)?;
         let index = u64::try_from(index).ok()?;
         Some(CompactedBin {
-            instances: wgpu::BufferBinding {
+            candidates: wgpu::BufferBinding {
+                buffer: &self.input,
+                offset: 0,
+                size: NonZeroU64::new(u64::from(self.capacity) * INSTANCE_BYTES),
+            },
+            indices: wgpu::BufferBinding {
                 buffer: &self.visible,
                 offset: index * self.bin_stride,
-                size: NonZeroU64::new(u64::from(self.capacity) * INSTANCE_BYTES),
+                size: NonZeroU64::new(u64::from(self.capacity) * INDEX_BYTES),
             },
             indirect: &self.indirect,
             indirect_offset: index * core::mem::size_of::<IndexedDraw>() as u64,
@@ -773,7 +787,7 @@ impl GpuCompactor {
         let uniform = GpuUniform {
             counts: [
                 count,
-                u32::try_from(self.bin_stride / INSTANCE_BYTES)
+                u32::try_from(self.bin_stride / INDEX_BYTES)
                     .map_err(|_| Error::InvalidConfiguration("GPU LOD bin stride overflow"))?,
                 u32::try_from(self.mesh_lods.tiers.len())
                     .map_err(|_| Error::InvalidConfiguration("GPU mesh LOD count overflow"))?,
@@ -985,8 +999,8 @@ mod tests {
             for alignment in [1, 16, 32, 64, 256, 4096] {
                 let stride = aligned_bin_stride(capacity, alignment).unwrap();
                 assert_eq!(stride % alignment, 0);
-                assert_eq!(stride % INSTANCE_BYTES, 0);
-                assert!(stride >= u64::from(capacity) * INSTANCE_BYTES);
+                assert_eq!(stride % INDEX_BYTES, 0);
+                assert!(stride >= u64::from(capacity) * INDEX_BYTES);
             }
         }
     }

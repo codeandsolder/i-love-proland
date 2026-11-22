@@ -30,6 +30,7 @@ struct RenderUniform {
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
 @group(1) @binding(0) var<storage, read> objects: array<Instance>;
+@group(1) @binding(1) var<storage, read> visible_indices: array<u32>;
 @group(0) @binding(2) var atlas_texture: texture_2d_array<f32>;
 @group(0) @binding(3) var atlas_sampler: sampler;
 @group(0) @binding(4) var source_texture: texture_2d<f32>;
@@ -95,7 +96,7 @@ fn wind_offset(world: vec3<f32>, source_y: f32, rotation: vec4<f32>) -> vec3<f32
 
 @vertex
 fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> MeshOutput {
-    let object = objects[instance_id];
+    let object = objects[visible_indices[instance_id]];
     var vertex = input.position.xyz;
     let source = camera.billboard_source;
     if source.w > 0.0 {
@@ -146,7 +147,7 @@ fn impostor_vs(
     @builtin(vertex_index) vertex_id: u32,
     @builtin(instance_index) instance_id: u32,
 ) -> ImpostorOutput {
-    let object = objects[instance_id];
+    let object = objects[visible_indices[instance_id]];
     let center = object.position_radius.xyz;
     let radius = object.position_radius.w;
     let to_eye = select(normalize(-center), vec3<f32>(0.0, 0.0, 1.0), dot(center, center) < 0.000001);

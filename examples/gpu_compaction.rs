@@ -138,7 +138,7 @@ fn device() -> Result<(wgpu::Device, wgpu::Queue), Box<dyn Error>> {
     ))?)
 }
 
-/// Verify both output lists and both indirect arguments byte-for-byte
+/// Verify output candidate indices, source records and indirect arguments
 /// against the same canonical CPU objects, regardless of atomic append order.
 fn gpu_parity(
     device: &wgpu::Device,
@@ -160,12 +160,11 @@ fn gpu_parity(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let output_bytes =
-        u64::from(compactor.capacity()) * u64::try_from(core::mem::size_of::<PackedInstance>())?;
+    let output_bytes = u64::from(compactor.capacity()) * 4;
     let outputs = (0..bins)
         .map(|_| {
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("compacted LOD instances readback"),
+                label: Some("compacted LOD indices readback"),
                 size: output_bytes,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
@@ -182,16 +181,38 @@ fn gpu_parity(
             20,
         );
         encoder.copy_buffer_to_buffer(
-            bin.instances.buffer,
-            bin.instances.offset,
+            bin.indices.buffer,
+            bin.indices.offset,
             output,
             0,
             output_bytes,
         );
     }
+    // The input records are the actual render-side source data. Verify
+    // those GPU bytes too, not merely the host copy used for dereferencing.
+    let source_size = u64::try_from(core::mem::size_of_val(candidates))?;
+    let source = if source_size == 0 {
+        None
+    } else {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("submitted source instance readback"),
+            size: source_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let binding = compactor.bin(0).ok_or("missing source binding")?.candidates;
+        encoder.copy_buffer_to_buffer(binding.buffer, binding.offset, &buffer, 0, source_size);
+        Some(buffer)
+    };
     queue.submit(Some(encoder.finish()));
     device.poll(wgpu::PollType::wait_indefinitely())?;
     let gpu_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if let Some(source) = source {
+        assert_eq!(
+            readback(device, &source)?,
+            bytemuck::cast_slice::<PackedInstance, u8>(candidates)
+        );
+    }
     let args_bytes = readback(device, &args)?;
     let draws = args_bytes
         .as_chunks::<20>()
@@ -209,14 +230,13 @@ fn gpu_parity(
         assert_eq!(draw.first_instance, 0);
         assert_eq!(usize::try_from(draw.instance_count)?, expected[index].len());
         let bytes = readback(device, output)?;
-        let visible_bytes =
-            usize::try_from(draw.instance_count)? * core::mem::size_of::<PackedInstance>();
+        let visible_bytes = usize::try_from(draw.instance_count)? * 4;
         let mut gpu = BTreeMap::new();
-        for record in bytes[..visible_bytes]
-            .as_chunks::<{ core::mem::size_of::<PackedInstance>() }>()
-            .0
-        {
-            let object = bytemuck::pod_read_unaligned::<PackedInstance>(record);
+        for record in bytes[..visible_bytes].as_chunks::<4>().0 {
+            let slot = usize::try_from(u32::from_le_bytes(*record))?;
+            let object = *candidates
+                .get(slot)
+                .ok_or("out-of-range compacted candidate")?;
             assert!(gpu.insert(object.stable_id(), object).is_none());
             assert!(unique.insert(object.stable_id()));
         }

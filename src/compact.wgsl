@@ -20,7 +20,7 @@ struct IndexedDraw {
 }
 
 struct View {
-    counts: vec4<u32>,             // input count, aligned bin stride (records), mesh bin count, host-owned population flag
+    counts: vec4<u32>,             // input count, aligned bin stride (u32 indices), mesh bin count, host-owned population flag
     lod: vec4<f32>,                // focal pixels, mesh threshold, impostor threshold, animation displacement bound
     forward: vec4<f32>,            // normalized camera forward
     source_center: vec4<f32>,      // normalized original mesh bounds centre
@@ -28,7 +28,7 @@ struct View {
 }
 
 @group(0) @binding(0) var<storage, read> input: array<PackedInstance>;
-@group(0) @binding(1) var<storage, read_write> visible: array<PackedInstance>;
+@group(0) @binding(1) var<storage, read_write> visible: array<u32>;
 @group(0) @binding(2) var<storage, read_write> draws: array<IndexedDraw>;
 @group(0) @binding(3) var<storage, read> mesh_lods: array<vec2<f32>>;
 @group(0) @binding(4) var<uniform> camera: View;
@@ -92,5 +92,5 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
         bin = low;
     }
     let slot = atomicAdd(&draws[bin].instance_count, 1u);
-    visible[bin * camera.counts.y + slot] = instance;
+    visible[bin * camera.counts.y + slot] = input_id;
 }

@@ -99,9 +99,11 @@ non-preferred meshes still choose the generated impostor. The compactor
 does not generate the aggregate field or alter canonical existence.
 
 GPU atomics allocate contiguous output slots in **nondeterministic order**.
-All records retain their ID, variant, and attributes bit-for-bit, so render
-storage order is irrelevant to game state and saved worlds. The instance
-buffer is not a stable indexable database. Sort by IDs outside the GPU draw
+Every output is a frame-local u32 candidate slot. The vertex shader uses
+that slot to read the original immutable 96-byte candidate record, so ID,
+variant and attributes are not duplicated or modified. Render slot order
+is irrelevant to game state and saved worlds. The index buffer is not a
+stable indexable database. Sort by IDs outside the GPU draw
 phase if a particular external workflow requires a canonical order.
 
 The compactor processes one compatible physical source family. A tier can
@@ -114,14 +116,15 @@ per submission and consume those bins in later passes in that submission.
 
 Let B be the number of mesh tiers plus one impostor bin, C the candidate
 capacity, A the device storage buffer offset alignment and
-S = align_up(C, A/gcd(A,96)) * 96 the byte stride across output bins.
+S = align_up(C, A/gcd(A,4)) * 4 the byte stride across output index bins.
 The allocation is bounded by the actual GPU storage buffer and dispatch
-limits: one C*96-byte input, one B*S-byte output buffer, B*20-byte
-indirect records, N*4-byte immutable squared mesh boundaries and a
+limits: one C*96-byte input, one B*S-byte candidate-index output buffer, B*20-byte
+indirect records, N*8-byte immutable squared mesh boundaries and preferences and a
 160-byte camera uniform. The shader uses four storage bindings
 (input, output, indirect, thresholds) and one uniform. Slots inside a
 bin never overlap another bin, even when all candidates select one tier.
-The fixed worst-case per-bin allocation trades memory for a single
+Using u32 indices rather than copying 96-byte records reduces per-bin
+logical storage and writes by 24×. The fixed worst-case per-bin allocation trades memory for a single
 pass without per-bin prefix scans, extra dispatches or per-object CPU
 work. Padding is never drawn. Empty frames reset all indirect counts
 before returning.
@@ -140,8 +143,8 @@ cargo +stable run --locked --features gpu --example gpu_compaction
 
 The Vulkan example constructs more than sixty thousand deterministic tree
 and rock instances, reads back four mesh tiers plus the impostor bin, every
-indexed indirect command, and every visible packed record against the
-Rust reference in ID-keyed maps. The probe exercises full anisotropy,
+indexed indirect command, source GPU bytes, and every visible candidate
+index resolved to its original record against the Rust reference in ID-keyed maps. The probe exercises full anisotropy,
 rotation, non-neutral tint, nonzero source-center offset, frustum
 rejection, and empty-dispatch resetting. This is stronger than count parity. It also
 reports per-frame elapsed time including CPU uploads and GPU queue drain.

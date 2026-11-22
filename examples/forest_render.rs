@@ -904,7 +904,7 @@ fn validate_capacity_growth(
     assert_ne!(empty, before, "fixture must render visible geometry");
     let bin = renderer.compactor().bin(0).ok_or("missing first bin")?;
     let previous_indirect = bin.indirect.clone();
-    let previous_visible = bin.instances.buffer.clone();
+    let previous_visible = bin.indices.buffer.clone();
     let growth_started = Instant::now();
     assert!(renderer.reserve(device, u32::try_from(required)?)?);
     let growth_ms = growth_started.elapsed().as_secs_f64() * 1000.0;
@@ -913,7 +913,7 @@ fn validate_capacity_growth(
         .bin(0)
         .ok_or("missing grown first bin")?;
     assert_eq!(&previous_indirect, bin.indirect);
-    assert_ne!(&previous_visible, bin.instances.buffer);
+    assert_ne!(&previous_visible, bin.indices.buffer);
     assert!(!renderer.reserve(device, 1)?);
     assert!(renderer.reserve(device, u32::MAX).is_err());
     let after = subset_capture(renderer, &fixture)?;
