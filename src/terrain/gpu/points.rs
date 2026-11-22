@@ -26,8 +26,11 @@ impl RegionChart {
         }
         #[expect(
             clippy::cast_possible_truncation,
+            reason = "rounded coordinates fit the validated regional extent"
+        )]
+        #[expect(
             clippy::cast_sign_loss,
-            reason = "projected coordinates rounded within the validated nonnegative regional extent"
+            reason = "the projected chart coordinates are nonnegative"
         )]
         Some(point.map(|v| (v * super::TICKS_PER_METRE).round().min(extent) as u32))
     }
