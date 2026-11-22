@@ -163,10 +163,7 @@ impl PhysicsGpu {
             return Err(invalid("physics body dispatch exceeds device limit"));
         }
         let request = terrain
-            .resident
-            .get(slot as usize)
-            .copied()
-            .flatten()
+            .grid_request(slot)
             .ok_or_else(|| invalid("physics terrain slot not initialized"))?;
         let pipeline = Kernel::new(device, "fixed physics steps", STEP_WGSL, "advance");
         let bytes = bytemuck::cast_slice(bodies);
@@ -245,12 +242,7 @@ impl PhysicsGpu {
         batch: StepBatch,
     ) -> io::Result<()> {
         if terrain.samples() != &self.terrain
-            || terrain
-                .resident
-                .get(self.request.slot as usize)
-                .copied()
-                .flatten()
-                != Some(self.request)
+            || terrain.grid_request(self.request.slot) != Some(self.request)
             || batch.hz != self.hz
             || batch.start_tick != self.submitted
             || !(1..=1024).contains(&batch.steps)

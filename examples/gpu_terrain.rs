@@ -4,7 +4,7 @@ mod physics;
 // collision snapshot ownership, real channel samples, batched timings.
 use i_love_proland::terrain::{
     Reach, Region, RegionCell, RegionChart, Section,
-    gpu::{CollisionGrid, TerrainGpu, TerrainRequest},
+    gpu::{CollisionGrid, TerrainGpu, TerrainPointRequest, TerrainRequest},
 };
 use std::{error::Error, io, path::Path, time::Instant};
 
@@ -155,6 +155,97 @@ fn check_overlap(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     Ok(())
 }
 
+fn check_explicit_points(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    let region = synthetic()?;
+    let side = 17;
+    let mut gpu = TerrainGpu::new(device, &region, side, 3, 0x7654_3210, 1.0)?;
+    let grid = TerrainRequest {
+        origin_ticks: [12800, 14400],
+        spacing_ticks: 192,
+        slot: 0,
+    };
+    let size = u32::from(side);
+    let addresses = (0..size * size)
+        .map(|index| {
+            [
+                grid.origin_ticks[0] + grid.spacing_ticks * (index % size),
+                grid.origin_ticks[1] + grid.spacing_ticks * (index / size),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let reversed = addresses.iter().rev().copied().collect::<Vec<_>>();
+    let mut commands = encoder(device);
+    gpu.encode(device, &mut commands, &[grid])?;
+    let expected = gpu.snapshot_samples(device, &mut commands, 0)?;
+    let malformed = TerrainPointRequest {
+        slot: 0,
+        addresses: &addresses[..1],
+    };
+    assert!(
+        gpu.encode_points(device, &mut commands, &[malformed])
+            .is_err()
+    );
+    let outside = vec![[u32::MAX, 0]; addresses.len()];
+    assert!(
+        gpu.encode_points(
+            device,
+            &mut commands,
+            &[TerrainPointRequest {
+                slot: 0,
+                addresses: &outside,
+            }]
+        )
+        .is_err()
+    );
+    // Neither rejected batch may mutate an existing grid.
+    assert!(gpu.snapshot(device, &mut commands, 0).is_ok());
+    gpu.encode_points(
+        device,
+        &mut commands,
+        &[
+            TerrainPointRequest {
+                slot: 0,
+                addresses: &addresses,
+            },
+            TerrainPointRequest {
+                slot: 2,
+                addresses: &reversed,
+            },
+        ],
+    )?;
+    assert!(gpu.snapshot(device, &mut commands, 0).is_err());
+    assert!(gpu.snapshot_samples(device, &mut commands, 1).is_err());
+    let ordered = gpu.snapshot_samples(device, &mut commands, 0)?;
+    let unordered = gpu.snapshot_samples(device, &mut commands, 2)?;
+    // Reuse an explicit slot again with an aligned grid.
+    gpu.encode(device, &mut commands, &[TerrainRequest { slot: 2, ..grid }])?;
+    assert!(gpu.snapshot(device, &mut commands, 2).is_ok());
+    queue.submit([commands.finish()]);
+    let mut pending = [expected.begin(), ordered.begin(), unordered.begin()];
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let [expected, ordered, reversed] = pending.each_mut().map(|value| {
+        value
+            .try_take()
+            .and_then(|result| result.ok_or_else(|| io::Error::other("point readback unfinished")))
+    });
+    let expected = expected?;
+    let ordered = ordered?;
+    let mut reversed = reversed?;
+    assert_eq!(expected.len(), addresses.len());
+    reversed.reverse();
+    let bytes = |samples: &[i_love_proland::terrain::gpu::TerrainSample]| {
+        bytemuck::cast_slice::<_, u8>(samples).to_vec()
+    };
+    assert_eq!(bytes(&expected), bytes(&ordered));
+    assert_eq!(bytes(&expected), bytes(&reversed));
+    println!(
+        "GPU_TERRAIN explicit_points={} identical_bytes={} invalid_preserves_grid=true",
+        addresses.len() * 2,
+        bytes(&expected).len()
+    );
+    Ok(())
+}
+
 fn profile(device: &wgpu::Device, queue: &wgpu::Queue, region: &Region, side: u16) -> Result<()> {
     let mut gpu = TerrainGpu::new(device, region, side, 32, 0x7654_3210, 1.0)?;
     let extent = region.chart().extent();
@@ -220,7 +311,14 @@ fn main() -> Result<()> {
     {
         return physics::run(&device, &queue);
     }
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--points")
+    {
+        return check_explicit_points(&device, &queue);
+    }
     check_overlap(&device, &queue)?;
+    check_explicit_points(&device, &queue)?;
     let region = if let Some(path) = std::env::args_os().nth(1) {
         Region::read(&std::fs::read(Path::new(&path))?)?
     } else {

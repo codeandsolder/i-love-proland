@@ -6,6 +6,8 @@
 use super::Region;
 use std::io;
 mod kernel;
+mod points;
+pub use points::TerrainPointRequest;
 mod readback;
 use kernel::Kernel;
 pub use readback::{PendingReadback, RecordedReadback};
@@ -158,14 +160,21 @@ impl Source {
     }
 }
 
-/// Fixed-size resident grid pool; both draw and scatter may consume it
+#[derive(Clone, Copy)]
+enum Resident {
+    Grid(TerrainRequest),
+    Points,
+}
+
+/// Fixed-size resident sample pool; both draw and scatter may consume it
 /// without any copy to the CPU. The caller owns slot lifetime and scheduling.
 pub struct TerrainGpu {
     source: Source,
     pipeline: Kernel,
+    points_pipeline: Option<Kernel>,
     samples: wgpu::Buffer,
     config: Config,
-    resident: Vec<Option<TerrainRequest>>,
+    resident: Vec<Option<Resident>>,
 }
 
 impl TerrainGpu {
@@ -234,6 +243,7 @@ impl TerrainGpu {
         Ok(Self {
             source,
             pipeline,
+            points_pipeline: None,
             samples,
             config,
             resident: vec![None; usize::try_from(slots).map_err(io::Error::other)?],
@@ -304,7 +314,7 @@ impl TerrainGpu {
             [self.samples_per_slot().div_ceil(64), count, 1],
         )?;
         for request in requests {
-            self.resident[request.slot as usize] = Some(*request);
+            self.resident[request.slot as usize] = Some(Resident::Grid(*request));
         }
         Ok(())
     }
@@ -324,6 +334,37 @@ impl TerrainGpu {
                 })
     }
 
+    fn grid_request(&self, slot: u32) -> Option<TerrainRequest> {
+        match self.resident.get(slot as usize).copied().flatten()? {
+            Resident::Grid(request) => Some(request),
+            Resident::Points => None,
+        }
+    }
+
+    /// Capture raw samples from either kind of resident slot, in request order.
+    ///
+    /// # Errors
+    /// Rejects uninitialized or out-of-range slots.
+    pub fn snapshot_samples(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        slot: u32,
+    ) -> io::Result<RecordedReadback<TerrainSample>> {
+        self.resident
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| invalid("terrain slot not initialized"))?;
+        let bytes = u64::from(self.samples_per_slot()) * 16;
+        Ok(RecordedReadback::copy(
+            device,
+            encoder,
+            &self.samples,
+            u64::from(slot) * bytes,
+            bytes,
+        ))
+    }
+
     /// Copy exactly one initialized slot into its own staging buffer.
     /// The request is captured with the data, so later slot reuse cannot
     /// change the address attached to this collision mesh snapshot.
@@ -337,19 +378,9 @@ impl TerrainGpu {
         slot: u32,
     ) -> io::Result<TerrainSnapshot> {
         let request = self
-            .resident
-            .get(slot as usize)
-            .copied()
-            .flatten()
-            .ok_or_else(|| invalid("terrain slot not initialized"))?;
-        let bytes = u64::from(self.samples_per_slot()) * 16;
-        let data = RecordedReadback::copy(
-            device,
-            encoder,
-            &self.samples,
-            u64::from(slot) * bytes,
-            bytes,
-        );
+            .grid_request(slot)
+            .ok_or_else(|| invalid("collision snapshot requires a regular terrain grid"))?;
+        let data = self.snapshot_samples(device, encoder, slot)?;
         Ok(TerrainSnapshot {
             request,
             side: self.side(),

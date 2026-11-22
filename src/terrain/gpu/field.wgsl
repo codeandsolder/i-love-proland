@@ -16,6 +16,7 @@ struct Job { origin: vec2<u32>, spacing: u32, slot: u32 }
 @group(0) @binding(3) var<storage,read> bins: array<u32>;
 @group(0) @binding(4) var<storage,read> jobs: array<Job>;
 @group(0) @binding(5) var<storage,read_write> output: array<TerrainSample>;
+@group(0) @binding(6) var<storage,read> points: array<vec2<u32>>;
 
 fn smooth_unit(t:f32)->f32 {let q=clamp(t,0.0,1.0);return q*q*(3.0-2.0*q);}
 fn mix_hash(v:u32)->u32 {
@@ -173,4 +174,14 @@ fn generate(@builtin(global_invocation_id) id:vec3<u32>){
     let address=job.origin+vec2<u32>(id.x%config.grid_side,id.x/config.grid_side)*job.spacing;
     let p=vec2<f32>(address)*0.0625;
     output[job.slot*count+id.x]=evaluate(p);
+}
+
+// Planetmap's spherical grid can supply its chart-projected addresses in
+// arbitrary order. The canonical evaluator is identical to regular grids.
+@compute @workgroup_size(64)
+fn generate_points(@builtin(global_invocation_id) id:vec3<u32>){
+    let count=config.grid_side*config.grid_side;
+    if id.x>=count {return;}
+    let address=points[id.y*count+id.x];
+    output[jobs[id.y].slot*count+id.x]=evaluate(vec2<f32>(address)*0.0625);
 }
