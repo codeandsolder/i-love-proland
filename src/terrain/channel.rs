@@ -187,6 +187,14 @@ impl ChannelField {
         &self.buckets[y * self.side + x]
     }
 
+    /// Broad-phase intersection against the conservative channel support bins.
+    /// False means no channel can contribute to any sample in the rectangle.
+    pub(super) fn intersects_bounds(&self, min: [f64; 2], max: [f64; 2]) -> bool {
+        let [xmin, ymin] = min.map(|v| self.bin(v));
+        let [xmax, ymax] = max.map(|v| self.bin(v));
+        (ymin..=ymax).any(|y| (xmin..=xmax).any(|x| !self.buckets[y * self.side + x].is_empty()))
+    }
+
     fn projection(reach: Reach, p: [f64; 2]) -> (f64, f64) {
         let d = difference(reach.b.xy, reach.a.xy);
         let delta = difference(p, reach.a.xy);

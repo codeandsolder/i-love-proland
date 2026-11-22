@@ -146,6 +146,23 @@ pub struct Region {
     max_elevation: f64,
 }
 
+struct CellInterpolation {
+    points: [RegionCell; 4],
+    fraction: [f64; 2],
+}
+
+impl CellInterpolation {
+    fn sample(&self, f: impl Fn(RegionCell) -> f64) -> f64 {
+        let [southwest, southeast, northwest, northeast] = self.points.map(f);
+        let [tx, ty] = self.fraction;
+        lerp(
+            lerp(southwest, southeast, tx),
+            lerp(northwest, northeast, tx),
+            ty,
+        )
+    }
+}
+
 fn read_section(input: &mut impl Read) -> io::Result<Section> {
     Ok(Section {
         xy: [read_f64(input)?, read_f64(input)?],
@@ -203,58 +220,10 @@ impl Region {
     }
     #[must_use = "Use the canonical terrain sample"]
     pub fn sample_chart(&self, point: [f64; 2]) -> Option<RegionSample> {
+        let interpolation = self.interpolation(point)?;
+        let interpolate = |f: &dyn Fn(RegionCell) -> f64| interpolation.sample(f);
+        let (weather, _) = self.weather_at(point, &interpolation);
         let extent = self.chart.extent();
-        if !point.iter().all(|&v| (0.0..=extent).contains(&v)) {
-            return None;
-        }
-        let grid = point.map(|v| v / self.chart.spacing_m);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "coordinates bounded by the chart's u16 cell count"
-        )]
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "validated nonnegative chart coordinates"
-        )]
-        let [column, row] = grid.map(|v| v.floor() as u16);
-        let column = column.min(self.chart.cells - 1);
-        let row = row.min(self.chart.cells - 1);
-        let side = usize::from(self.chart.cells) + 1;
-        let index = usize::from(row) * side + usize::from(column);
-        let points = [
-            self.cells[index],
-            self.cells[index + 1],
-            self.cells[index + side],
-            self.cells[index + side + 1],
-        ];
-        let [tx, ty] = [grid[0] - f64::from(column), grid[1] - f64::from(row)];
-        let interpolate = |f: &dyn Fn(RegionCell) -> f64| {
-            let [southwest, southeast, northwest, northeast] = points.map(f);
-            lerp(
-                lerp(southwest, southeast, tx),
-                lerp(northwest, northeast, tx),
-                ty,
-            )
-        };
-        let height = interpolate(&|c| f64::from(c.height) * QUANTUM);
-        let water = interpolate(&|c| {
-            let ground = f64::from(c.height) * QUANTUM;
-            if c.lake == NO_LAKE {
-                ground.max(0.0)
-            } else {
-                ground.max(f64::from(c.lake) * QUANTUM)
-            }
-        });
-        let weather = if water > height + 0.02 {
-            Weathered {
-                bed: height,
-                water: Some(water),
-                depth: water - height,
-                ..Weathered::default()
-            }
-        } else {
-            self.channels.at(point, height)
-        };
         let rgb = std::array::from_fn(|i| {
             let base = interpolate(&|c| f64::from(c.rgb[i]) / 255.0);
             let vegetated = lerp(base, [0.19, 0.31, 0.125][i], weather.floodplain * 0.30);
@@ -284,6 +253,70 @@ impl Region {
             rgb,
             weight,
         })
+    }
+
+    fn interpolation(&self, point: [f64; 2]) -> Option<CellInterpolation> {
+        let extent = self.chart.extent();
+        if !point.iter().all(|&v| (0.0..=extent).contains(&v)) {
+            return None;
+        }
+        let grid = point.map(|v| v / self.chart.spacing_m);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "coordinates bounded by the chart's u16 cell count"
+        )]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "validated nonnegative chart coordinates"
+        )]
+        let [column, row] = grid.map(|v| v.floor() as u16);
+        let column = column.min(self.chart.cells - 1);
+        let row = row.min(self.chart.cells - 1);
+        let side = usize::from(self.chart.cells) + 1;
+        let index = usize::from(row) * side + usize::from(column);
+        let points = [
+            self.cells[index],
+            self.cells[index + 1],
+            self.cells[index + side],
+            self.cells[index + side + 1],
+        ];
+        let [tx, ty] = [grid[0] - f64::from(column), grid[1] - f64::from(row)];
+        Some(CellInterpolation {
+            points,
+            fraction: [tx, ty],
+        })
+    }
+    fn weather_at(&self, point: [f64; 2], interpolation: &CellInterpolation) -> (Weathered, bool) {
+        let height = interpolation.sample(|cell| f64::from(cell.height) * QUANTUM);
+        let water = interpolation.sample(|cell| {
+            let ground = f64::from(cell.height) * QUANTUM;
+            if cell.lake == NO_LAKE {
+                ground.max(0.0)
+            } else {
+                ground.max(f64::from(cell.lake) * QUANTUM)
+            }
+        });
+        if water > height + 0.02 {
+            (
+                Weathered {
+                    bed: height,
+                    water: Some(water),
+                    depth: water - height,
+                    ..Weathered::default()
+                },
+                false,
+            )
+        } else {
+            (self.channels.at(point, height), true)
+        }
+    }
+    pub(super) fn river_stage(&self, point: [f64; 2]) -> Option<f64> {
+        let interpolation = self.interpolation(point)?;
+        let (weather, river) = self.weather_at(point, &interpolation);
+        if river { weather.water } else { None }
+    }
+    pub(super) fn channel_candidates(&self, min: [f64; 2], max: [f64; 2]) -> bool {
+        self.channels.intersects_bounds(min, max)
     }
 
     /// Little-endian, versioned format. No machine-dependent struct layout.
