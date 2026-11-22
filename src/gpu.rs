@@ -295,7 +295,7 @@ impl GpuView {
                 *value = (v / length) as f32;
             }
         }
-        if planes[..5].iter().any(|plane| *plane == [0.0; 4]) {
+        if planes[..5].contains(&[0.0; 4]) {
             return Err(Error::InvalidConfiguration("degenerate clip volume"));
         }
         Self::new(
