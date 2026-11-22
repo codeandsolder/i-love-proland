@@ -48,18 +48,23 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let instance = input[input_id];
     let position = instance.position_radius.xyz;
     let radius = instance.position_radius.w;
-    let visibility_radius = radius + camera.lod.w;
+    // Mesh sphere plus animation, or the circumscribed sphere of a
+    // conservative impostor square. Keep visual LOD diameter unchanged.
+    let visibility_radius = max(radius + camera.lod.w, radius * sqrt(2.0));
 
     // Conservatively keep every sphere intersecting the camera frustum.
     for (var p: u32 = 0u; p < 6u; p += 1u) {
         let plane = camera.planes[p];
-        if dot(plane.xyz, position) + plane.w < -visibility_radius {
+        // Eight f32 epsilons conservatively cover normalized-plane
+        // evaluation error near a tangent, including large offsets.
+        let margin = (dot(abs(plane.xyz), abs(position)) + abs(plane.w) + visibility_radius) * (8.0 * 1.1920928955078125e-7);
+        if dot(plane.xyz, position) + plane.w < -visibility_radius - margin {
             return;
         }
     }
 
     let depth = dot(position, camera.forward.xyz);
-    if depth + visibility_radius <= 0.0 {
+    if depth + visibility_radius < 0.0 {
         return;
     }
     // Cross-multiply the projected diameter test. This avoids a costly
