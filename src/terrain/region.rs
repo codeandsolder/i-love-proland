@@ -130,9 +130,17 @@ impl RegionCell {
     }
 }
 
+/// Distinguishes standing ocean/lake water from independently meshed rivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaterKind {
+    Standing,
+    River,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RegionSample {
     pub weather: Weathered,
+    pub water_kind: Option<WaterKind>,
     pub rgb: [f64; 3],
     /// Blend with the host planet over the outer 4 km of the chart.
     pub weight: f64,
@@ -222,7 +230,7 @@ impl Region {
     pub fn sample_chart(&self, point: [f64; 2]) -> Option<RegionSample> {
         let interpolation = self.interpolation(point)?;
         let interpolate = |f: &dyn Fn(RegionCell) -> f64| interpolation.sample(f);
-        let (weather, _) = self.weather_at(point, &interpolation);
+        let (weather, water_kind) = self.weather_at(point, &interpolation);
         let extent = self.chart.extent();
         let rgb = std::array::from_fn(|i| {
             let base = interpolate(&|c| f64::from(c.rgb[i]) / 255.0);
@@ -250,6 +258,7 @@ impl Region {
         let weight = t * t * 2.0_f64.mul_add(-t, 3.0);
         Some(RegionSample {
             weather,
+            water_kind,
             rgb,
             weight,
         })
@@ -286,7 +295,11 @@ impl Region {
             fraction: [tx, ty],
         })
     }
-    fn weather_at(&self, point: [f64; 2], interpolation: &CellInterpolation) -> (Weathered, bool) {
+    fn weather_at(
+        &self,
+        point: [f64; 2],
+        interpolation: &CellInterpolation,
+    ) -> (Weathered, Option<WaterKind>) {
         let height = interpolation.sample(|cell| f64::from(cell.height) * QUANTUM);
         let water = interpolation.sample(|cell| {
             let ground = f64::from(cell.height) * QUANTUM;
@@ -304,16 +317,12 @@ impl Region {
                     depth: water - height,
                     ..Weathered::default()
                 },
-                false,
+                Some(WaterKind::Standing),
             )
         } else {
-            (self.channels.at(point, height), true)
+            let weather = self.channels.at(point, height);
+            (weather, weather.water.map(|_| WaterKind::River))
         }
-    }
-    pub(super) fn river_stage(&self, point: [f64; 2]) -> Option<f64> {
-        let interpolation = self.interpolation(point)?;
-        let (weather, river) = self.weather_at(point, &interpolation);
-        if river { weather.water } else { None }
     }
     pub(super) fn channel_candidates(&self, min: [f64; 2], max: [f64; 2]) -> bool {
         self.channels.minimum_width(min, max).is_some()

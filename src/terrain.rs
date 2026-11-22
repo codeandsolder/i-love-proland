@@ -2,6 +2,6 @@
 mod channel;
 pub use channel::{ChannelField, Reach, Section, Weathered};
 mod region;
-pub use region::{Region, RegionCell, RegionChart, RegionSample};
-mod river_mesh;
-pub use river_mesh::RiverPatch;
+pub use region::{Region, RegionCell, RegionChart, RegionSample, WaterKind};
+mod channel_mesh;
+pub use channel_mesh::{ChannelPatch, ChannelVertex};
