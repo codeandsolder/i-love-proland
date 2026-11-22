@@ -42,8 +42,15 @@ fn append_ellipsoid(
                 (radii[2] * sin_lat).mul_add(cos_azi, center[2]),
                 1.0,
             ];
+            let n = [
+                sin_lat * sin_azi / radii[0],
+                cos_lat / radii[1],
+                sin_lat * cos_azi / radii[2],
+            ];
+            let norm = n.iter().map(|x| x * x).sum::<f32>().sqrt();
             vertices.push(TreeVertex {
                 position,
+                normal: [n[0] / norm, n[1] / norm, n[2] / norm, 0.0],
                 color,
                 uv: [
                     f32::from(side) / f32::from(SIDES),
@@ -72,11 +79,13 @@ fn sample_tree() -> Result<(Vec<TreeVertex>, Vec<u32>), Box<dyn Error>> {
         let (sin_angle, cos_angle) = angle.sin_cos();
         let brown = [0.35, 0.22, 0.12, 1.0];
         vertices.push(TreeVertex {
+            normal: [sin_angle, 0.0, cos_angle, 0.0],
             position: [0.085 * sin_angle, -0.89, 0.085 * cos_angle, 1.0],
             color: brown,
             uv: [0.5, 0.5],
         });
         vertices.push(TreeVertex {
+            normal: [sin_angle, 0.0, cos_angle, 0.0],
             position: [0.069 * sin_angle, 0.37, 0.069 * cos_angle, 1.0],
             color: brown,
             uv: [0.5, 0.5],
@@ -602,6 +611,7 @@ fn validate_source_billboards(
         return Ok(());
     }
     let vertices = [[0.0_f32, 0.0_f32], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]].map(|uv| TreeVertex {
+        normal: [0.0, 0.0, 1.0, 0.0],
         position: [uv[0] - 0.5, uv[1] - 0.5, 0.0, 1.0],
         color: [1.0, 0.0, 0.0, 1.0],
         uv,

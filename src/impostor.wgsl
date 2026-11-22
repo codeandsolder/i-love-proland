@@ -18,6 +18,7 @@ struct RenderUniform {
     camera_forward: vec4<f32>,
     billboard_source: vec4<f32>, // normalized source center, original radius (zero = static)
     eye: vec4<f32>,              // eye in the resident local frame
+    sun: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: RenderUniform;
@@ -28,17 +29,21 @@ struct RenderUniform {
 @group(0) @binding(4) var source_texture: texture_2d<f32>;
 @group(0) @binding(5) var source_sampler: sampler;
 @group(0) @binding(6) var wind_texture: texture_2d<f32>;
+@group(0) @binding(7) var normal_atlas: texture_2d_array<f32>;
 
 struct MeshVertex {
     @location(0) position: vec4<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) uv: vec2<f32>,
+    @location(1) normal: vec4<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) uv: vec2<f32>,
 }
 
 struct MeshOutput {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) normal: vec3<f32>,
+    @location(3) @interpolate(flat) up: vec3<f32>,
 }
 
 // Quaternion XYZW rotation without constructing a matrix per vertex.
@@ -49,6 +54,22 @@ fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
 
 fn inverse_rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     return rotate(vec4<f32>(-q.xyz, q.w), v);
+}
+
+fn safe_normal(n: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    let squared = dot(n,n);
+    return select(fallback,n*inverseSqrt(max(squared,1e-8)),squared>1e-8);
+}
+
+// A small transmitted diffuse component approximates thin leaves instead
+// of treating every backlit card as an unlit light-green surface.
+fn foliage_light(normal: vec3<f32>, up: vec3<f32>) -> vec3<f32> {
+    let n = safe_normal(normal,up);
+    let hemi = clamp(dot(n,up)*0.5+0.5,0.0,1.0);
+    let indirect = mix(vec3<f32>(0.12,0.11,0.085),vec3<f32>(0.24,0.29,0.34),hemi);
+    let cosine = dot(n,camera.sun.xyz);
+    let direct = max(cosine,0.0)+0.18*max(-cosine,0.0);
+    return indirect+vec3<f32>(0.95,0.87,0.74)*direct;
 }
 
 // Four half-texel-offset bilinear taps reproduce the authored smooth wind
@@ -114,6 +135,9 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
     out.clip = camera.projection * vec4<f32>(displaced, 1.0);
     out.color = input.color * object.tint;
     out.uv = input.uv;
+    out.up = rotate(object.rotation,vec3<f32>(0.0,1.0,0.0));
+    let local_normal = select(input.normal.xyz,vec3<f32>(0.0,1.0,0.0),source.w>0.0);
+    out.normal = rotate(object.rotation, safe_normal(local_normal/object.axis_radii.xyz,vec3<f32>(0.0,1.0,0.0)));
     return out;
 }
 
@@ -123,7 +147,7 @@ fn mesh_fs(input: MeshOutput) -> @location(0) vec4<f32> {
     if (texel.a * input.color.a < camera.material.x) {
         discard;
     }
-    return vec4<f32>(texel.rgb * input.color.rgb, 1.0);
+    return vec4<f32>(texel.rgb * input.color.rgb * foliage_light(input.normal,input.up), 1.0);
 }
 
 struct ImpostorOutput {
@@ -132,6 +156,8 @@ struct ImpostorOutput {
     @location(1) view_indices: vec4<f32>, // azimuth0, azimuth1, elevation0, elevation1
     @location(2) blend: vec2<f32>,
     @location(3) tint: vec4<f32>,
+    @location(4) @interpolate(flat) rotation: vec4<f32>,
+    @location(5) @interpolate(flat) axis_radii: vec3<f32>,
 }
 
 @vertex
@@ -183,31 +209,31 @@ fn impostor_vs(
     // Tiny deterministic visual variation without redefining the world ID.
     let variation = 0.90 + object.axis_radii.w * 0.10;
     out.tint = vec4<f32>(object.tint.rgb * variation, object.tint.a);
+    out.rotation = object.rotation;
+    out.axis_radii = object.axis_radii.xyz;
     return out;
 }
 
-fn atlas_sample(tile: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
+fn atlas_sample(tex: texture_2d_array<f32>, tile: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
     let layer = i32(tile.y * AZIMUTH_VIEWS + tile.x);
-    return textureSample(atlas_texture, atlas_sampler, uv, layer);
+    return textureSample(tex, atlas_sampler, uv, layer);
 }
 
-@fragment
-fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
+fn angular_sample(tex: texture_2d_array<f32>,input: ImpostorOutput) -> vec4<f32> {
     let a0 = input.view_indices.x;
     let a1 = input.view_indices.y;
     let e0 = input.view_indices.z;
     let e1 = input.view_indices.w;
-    let lower = mix(
-        atlas_sample(vec2<f32>(a0, e0), input.uv),
-        atlas_sample(vec2<f32>(a1, e0), input.uv),
-        input.blend.x
-    );
-    let upper = mix(
-        atlas_sample(vec2<f32>(a0, e1), input.uv),
-        atlas_sample(vec2<f32>(a1, e1), input.uv),
-        input.blend.x
-    );
-    let color = mix(lower, upper, input.blend.y);
+    let lower = mix(atlas_sample(tex,vec2<f32>(a0,e0),input.uv),atlas_sample(tex,vec2<f32>(a1,e0),input.uv),input.blend.x);
+    let upper = mix(atlas_sample(tex,vec2<f32>(a0,e1),input.uv),atlas_sample(tex,vec2<f32>(a1,e1),input.uv),input.blend.x);
+    return mix(lower,upper,input.blend.y);
+}
+
+@fragment
+fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
+    let color = angular_sample(atlas_texture,input);
+    // Both texture planes use the same exact coverage at every mip.
+    let encoded_normal = angular_sample(normal_atlas,input);
     let alpha = color.a * input.tint.a;
     if (alpha <= 0.0) {
         discard;
@@ -228,5 +254,8 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
     }
     // With multisample targets, hardware alpha-to-coverage uses this alpha.
     // Unpremultiply after both spatial mip filtering and angular blending.
-    return vec4<f32>(color.rgb / color.a * input.tint.rgb, alpha);
+    let up = rotate(input.rotation,vec3<f32>(0.0,1.0,0.0));
+    let local_normal = encoded_normal.rgb/max(encoded_normal.a,1e-6)*2.0-1.0;
+    let n = rotate(input.rotation,safe_normal(local_normal/input.axis_radii,vec3<f32>(0.0,1.0,0.0)));
+    return vec4<f32>(color.rgb / color.a * input.tint.rgb * foliage_light(n,up), alpha);
 }

@@ -15,6 +15,7 @@ struct Sample {
     pixel: [f32; 2],
     depth: f32,
     color: [f32; 4],
+    normal: [f32; 3],
     uv: [f32; 2],
 }
 
@@ -78,6 +79,7 @@ fn project(
         pixel: [(u + 1.0) * pixels * 0.5, (1.0 - v) * pixels * 0.5],
         depth: dot(position, eye),
         color: vertex.color,
+        normal: [vertex.normal[0], vertex.normal[1], vertex.normal[2]],
         uv: vertex.uv,
     }
 }
@@ -86,11 +88,16 @@ fn edge(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
     (p[0] - a[0]).mul_add(b[1] - a[1], -(p[1] - a[1]) * (b[0] - a[0]))
 }
 
+struct RasterImages {
+    color: Vec<[f32; 4]>,
+    normal: Vec<[f32; 4]>,
+}
+
 fn raster_triangle(
     triangle: [Sample; 3],
     side: u16,
     depth: &mut [f32],
-    color: &mut [[f32; 4]],
+    images: &mut RasterImages,
     material: RasterMaterial<'_>,
 ) {
     let [a, b, c] = triangle;
@@ -166,20 +173,41 @@ fn raster_triangle(
                 continue;
             }
             depth[at] = z;
-            color[at] = [
+            images.color[at] = [
                 texel[0] * rgba[0],
                 texel[1] * rgba[1],
                 texel[2] * rgba[2],
+                1.0,
+            ];
+            let n: [f32; 3] = core::array::from_fn(|i| {
+                weights[0].mul_add(
+                    a.normal[i],
+                    weights[1].mul_add(b.normal[i], weights[2] * c.normal[i]),
+                )
+            });
+            let inverse_length = dot(n, n).sqrt().recip();
+            let unit = if inverse_length.is_finite() {
+                n.map(|v| v * inverse_length)
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            images.normal[at] = [
+                unit[0].mul_add(0.5, 0.5),
+                unit[1].mul_add(0.5, 0.5),
+                unit[2].mul_add(0.5, 0.5),
                 1.0,
             ];
         }
     }
 }
 
-fn render_view(surfaces: &[PreparedSurface<'_>], side: u16, azi: u16, elev: u16) -> Vec<[f32; 4]> {
+fn render_view(surfaces: &[PreparedSurface<'_>], side: u16, azi: u16, elev: u16) -> RasterImages {
     let extent = usize::from(side);
     let mut depth = vec![f32::NEG_INFINITY; extent * extent];
-    let mut color = vec![[0.0_f32; 4]; extent * extent];
+    let mut images = RasterImages {
+        color: vec![[0.0; 4]; extent * extent],
+        normal: vec![[0.0; 4]; extent * extent],
+    };
     let (eye, right, up) = basis(azi, elev);
     for surface in surfaces {
         let projected: Vec<_> = surface
@@ -194,6 +222,9 @@ fn render_view(surfaces: &[PreparedSurface<'_>], side: u16, azi: u16, elev: u16)
                         right,
                     );
                     vertex.position[..3].copy_from_slice(&point);
+                    // Camera-facing source cards use a stable vegetation-up
+                    // normal instead of lighting that rotates with the eye.
+                    vertex.normal = [0.0, 1.0, 0.0, 0.0];
                 }
                 project(&vertex, eye, right, up, f32::from(side))
             })
@@ -205,10 +236,10 @@ fn render_view(surfaces: &[PreparedSurface<'_>], side: u16, azi: u16, elev: u16)
         };
         for face in surface.indices.as_chunks::<3>().0 {
             let samples = [projected[face[0]], projected[face[1]], projected[face[2]]];
-            raster_triangle(samples, side, &mut depth, &mut color, material);
+            raster_triangle(samples, side, &mut depth, &mut images, material);
         }
     }
-    color
+    images
 }
 
 #[expect(
@@ -235,6 +266,7 @@ fn downsample(
     tile_size: usize,
     gutter: usize,
     supersampled: &[[f32; 4]],
+    srgb: bool,
 ) {
     let content = tile_size - 2 * gutter;
     let side = content * 2;
@@ -252,10 +284,14 @@ fn downsample(
                 }
             }
             let color = if alpha > 0.0 {
+                let encode = |channel| {
+                    let value = channel / alpha;
+                    to_byte(if srgb { linear_to_srgb(value) } else { value })
+                };
                 [
-                    to_byte(linear_to_srgb(premultiplied[0] / alpha)),
-                    to_byte(linear_to_srgb(premultiplied[1] / alpha)),
-                    to_byte(linear_to_srgb(premultiplied[2] / alpha)),
+                    encode(premultiplied[0]),
+                    encode(premultiplied[1]),
+                    encode(premultiplied[2]),
                     to_byte(alpha * 0.25),
                 ]
             } else {
@@ -324,6 +360,7 @@ pub fn bake_scene(surfaces: &[BakeSurface<'_>], tile_size: u32, gutter: u32) -> 
             !v.position.iter().all(|x| x.is_finite())
                 || !v.uv.iter().all(|x| x.is_finite())
                 || !TreeVertex::valid_color(v.color)
+                || !TreeVertex::valid_normal(v.normal)
                 || dot(
                     [v.position[0], v.position[1], v.position[2]],
                     [v.position[0], v.position[1], v.position[2]],
@@ -392,20 +429,20 @@ pub fn bake_scene(surfaces: &[BakeSurface<'_>], tile_size: u32, gutter: u32) -> 
     let col_count = u16::try_from(AZIMUTH_VIEWS).map_err(|_| Error::IndexOverflow)?;
     let side = u16::try_from((tile - 2 * padding) * 2).map_err(|_| Error::IndexOverflow)?;
     let mut rgba = vec![0_u8; width * height * 4];
+    let mut normals_rgba = vec![0_u8; rgba.len()];
     for row in 0..row_count {
         for col in 0..col_count {
             let supersampled = render_view(&prepared, side, col, row);
-            downsample(
-                &mut rgba,
-                width,
-                [usize::from(col) * tile, usize::from(row) * tile],
-                tile,
-                padding,
-                &supersampled,
-            );
+            let origin = [usize::from(col) * tile, usize::from(row) * tile];
+            for (destination, source, srgb) in [
+                (&mut rgba, &supersampled.color, true),
+                (&mut normals_rgba, &supersampled.normal, false),
+            ] {
+                downsample(destination, width, origin, tile, padding, source, srgb);
+            }
         }
     }
-    AtlasImage::new(tile_size, gutter, rgba)
+    AtlasImage::new(tile_size, gutter, rgba, normals_rgba)
 }
 
 /// Convenience entrypoint for a source with one material.
@@ -447,6 +484,7 @@ mod tests {
         let vertices = positions
             .into_iter()
             .map(|position| TreeVertex {
+                normal: [0.0, 1.0, 0.0, 0.0],
                 position,
                 color: [0.1, 0.8, 0.2, 1.0],
                 uv: [0.0, 0.0],
@@ -532,6 +570,7 @@ mod textured_tests {
         let vertices = corners
             .into_iter()
             .map(|(position, uv)| TreeVertex {
+                normal: [0.0, 1.0, 0.0, 0.0],
                 position,
                 color: [1.0; 4],
                 uv,
@@ -634,6 +673,7 @@ mod multi_material_tests {
             ([0.6, 0.6, z, 1.0], [1.0, 1.0]),
         ]
         .map(|(position, uv)| TreeVertex {
+            normal: [0.0, 1.0, 0.0, 0.0],
             position,
             uv,
             color: [1.0; 4],
@@ -727,21 +767,25 @@ mod multi_material_tests {
     fn billboard_atlas_rotates_source_card_for_every_azimuth() {
         let vertices = [
             TreeVertex {
+                normal: [0.0, 1.0, 0.0, 0.0],
                 position: [-0.5, -0.5, 0.0, 1.0],
                 color: [1.0; 4],
                 uv: [0.0, 0.0],
             },
             TreeVertex {
+                normal: [0.0, 1.0, 0.0, 0.0],
                 position: [0.5, -0.5, 0.0, 1.0],
                 color: [1.0; 4],
                 uv: [1.0, 0.0],
             },
             TreeVertex {
+                normal: [0.0, 1.0, 0.0, 0.0],
                 position: [-0.5, 0.5, 0.0, 1.0],
                 color: [1.0; 4],
                 uv: [0.0, 1.0],
             },
             TreeVertex {
+                normal: [0.0, 1.0, 0.0, 0.0],
                 position: [0.5, 0.5, 0.0, 1.0],
                 color: [1.0; 4],
                 uv: [1.0, 1.0],

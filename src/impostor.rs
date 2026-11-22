@@ -27,12 +27,20 @@ const SHADER: &str = concat!(
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TreeVertex {
     pub position: [f32; 4],
+    /// Unit source-space surface normal (w is padding).
+    pub normal: [f32; 4],
     pub color: [f32; 4],
     /// Source UVs are normalized texture coordinates (may repeat outside 0..1).
     pub uv: [f32; 2],
 }
 
 impl TreeVertex {
+    #[must_use = "Reject invalid normals before baking or uploading geometry"]
+    pub fn valid_normal(normal: [f32; 4]) -> bool {
+        let length_squared: f32 = normal[..3].iter().map(|x| x * x).sum();
+        normal.iter().all(|x| x.is_finite()) && (length_squared - 1.0).abs() < 0.001
+    }
+
     /// Validate floating-point source-material color, not a normalized
     /// vertex attribute: linear RGB multipliers may legitimately exceed 1.
     /// The alpha channel remains ordinary fractional coverage.
@@ -65,6 +73,7 @@ impl TreeMesh {
             !v.position.iter().all(|p| p.is_finite())
                 || !v.uv.iter().all(|p| p.is_finite())
                 || !TreeVertex::valid_color(v.color)
+                || !TreeVertex::valid_normal(v.normal)
         }) || indices
             .iter()
             .any(|i| usize::try_from(*i).map_or(true, |i| i >= vertices.len()))
@@ -104,12 +113,13 @@ pub struct AtlasImage {
     tile_size: u32,
     gutter: u32,
     rgba: Vec<u8>,
+    normals_rgba: Vec<u8>,
 }
 
 impl AtlasImage {
     /// # Errors
     /// Rejects inconsistent image byte lengths and inadequate tile padding.
-    pub fn new(tile_size: u32, gutter: u32, rgba: Vec<u8>) -> Result<Self> {
+    pub fn new(tile_size: u32, gutter: u32, rgba: Vec<u8>, normals_rgba: Vec<u8>) -> Result<Self> {
         if !(8..=512).contains(&tile_size)
             || gutter == 0
             || u64::from(gutter) * 4 >= u64::from(tile_size)
@@ -120,7 +130,15 @@ impl AtlasImage {
         }
         let pixels =
             u64::from(tile_size).pow(2) * u64::from(AZIMUTH_VIEWS) * u64::from(ELEVATION_VIEWS) * 4;
-        if usize::try_from(pixels).ok() != Some(rgba.len()) {
+        if usize::try_from(pixels).ok() != Some(rgba.len())
+            || normals_rgba.len() != rgba.len()
+            || !rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(normals_rgba.as_chunks::<4>().0)
+                .all(|(a, b)| a[3] == b[3])
+        {
             return Err(Error::InvalidConfiguration(
                 "impostor atlas RGBA length mismatch",
             ));
@@ -129,6 +147,7 @@ impl AtlasImage {
             tile_size,
             gutter,
             rgba,
+            normals_rgba,
         })
     }
 
@@ -157,6 +176,13 @@ impl AtlasImage {
         &self.rgba
     }
 
+    /// Linear source-normal XYZ mapped from [-1,1] to [0,1], and the
+    /// identical coverage in alpha. Filtering is coverage-weighted.
+    #[must_use = "Use the paired normal plane for directional impostor lighting"]
+    pub fn normals_rgba(&self) -> &[u8] {
+        &self.normals_rgba
+    }
+
     /// Upload each angular view as an independent, coverage-filtered
     /// texture-array layer. The disk/CPU atlas retains its original layout.
     ///
@@ -171,33 +197,48 @@ impl AtlasImage {
                 "impostor view array exceeds GPU texture limit",
             ));
         }
-        let (mip_level_count, data) = self.isolated_mips();
-        let texture = device.create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
-                label: Some("i-love-proland independently filtered angular views"),
-                size: wgpu::Extent3d {
-                    width: side,
-                    height: side,
-                    depth_or_array_layers: layers,
+        let upload = |format, pixels, srgb| {
+            let (mip_level_count, data) = self.isolated_mips(pixels, srgb);
+            let texture = device.create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("i-love-proland independently filtered angular views"),
+                    size: wgpu::Extent3d {
+                        width: side,
+                        height: side,
+                        depth_or_array_layers: layers,
+                    },
+                    mip_level_count,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
                 },
-                mip_level_count,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &data,
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &data,
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            (texture, view)
+        };
+        let (color, view) = upload(
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            self.rgba.as_slice(),
+            true,
         );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+        let (normal, normal_view) = upload(
+            wgpu::TextureFormat::Rgba8Unorm,
+            self.normals_rgba.as_slice(),
+            false,
+        );
         Ok(AtlasTexture {
-            _texture: texture,
+            _color: color,
             view,
+            _normal: normal,
+            normal_view,
         })
     }
 
@@ -206,14 +247,18 @@ impl AtlasImage {
     /// including arbitrary (non-power-of-two and odd) source dimensions.
     /// Derive every level from the unquantized base, never from a quantized
     /// intermediate. No angular neighbours can contribute to a view's mip.
-    fn isolated_mips(&self) -> (u32, Vec<u8>) {
+    fn isolated_mips(&self, pixels: &[u8], srgb: bool) -> (u32, Vec<u8>) {
         let side = self.tile_size - 2 * self.gutter;
         let pitch = self.width() as usize;
         let levels = side.bit_width();
         let mut data = Vec::new();
         let mut linear = [0.0; 256];
         for (slot, byte) in linear.iter_mut().zip(0..=u8::MAX) {
-            *slot = srgb_to_linear(byte);
+            *slot = if srgb {
+                srgb_to_linear(byte)
+            } else {
+                f32::from(byte) / 255.0
+            };
         }
         let mut base = Vec::with_capacity((side * side) as usize);
         for elevation in 0..ELEVATION_VIEWS {
@@ -224,7 +269,7 @@ impl AtlasImage {
                 for y in y0..y0 + side {
                     for x in x0..x0 + side {
                         let i = 4 * (y as usize * pitch + x as usize);
-                        let p = &self.rgba[i..i + 4];
+                        let p = &pixels[i..i + 4];
                         let a = f32::from(p[3]) / 255.0;
                         base.push([
                             linear[p[0] as usize] * a,
@@ -235,7 +280,7 @@ impl AtlasImage {
                     }
                 }
                 for level in 0..levels {
-                    append_area_mip(&base, side, side >> level, &mut data);
+                    append_area_mip(&base, side, side >> level, &mut data, srgb);
                 }
             }
         }
@@ -245,7 +290,13 @@ impl AtlasImage {
 
 // Coordinates use exact integer overlap lengths in units of 1/dest_side
 // of an original texel. Each output square has total weight source_side².
-fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &mut Vec<u8>) {
+fn append_area_mip(
+    base: &[[f32; 4]],
+    source_side: u32,
+    dest_side: u32,
+    data: &mut Vec<u8>,
+    srgb: bool,
+) {
     let norm = f64::from(source_side).powi(2).recip();
     for y in 0..dest_side {
         let y0 = y * source_side;
@@ -270,10 +321,11 @@ fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &m
                 reason = "normalized area averages are converted to the f32 color transfer function before 8-bit quantization"
             )]
             let average = sum.map(|v| (v * norm) as f32);
+            let encode = |v| to_byte(if srgb { linear_to_srgb(v) } else { v });
             data.extend_from_slice(&[
-                to_byte(linear_to_srgb(average[0])),
-                to_byte(linear_to_srgb(average[1])),
-                to_byte(linear_to_srgb(average[2])),
+                encode(average[0]),
+                encode(average[1]),
+                encode(average[2]),
                 to_byte(average[3]),
             ]);
         }
@@ -282,8 +334,10 @@ fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &m
 
 /// Owns the texture used by a live GPU renderer.
 pub struct AtlasTexture {
-    _texture: wgpu::Texture,
+    _color: wgpu::Texture,
     view: wgpu::TextureView,
+    _normal: wgpu::Texture,
+    normal_view: wgpu::TextureView,
 }
 
 /// Explicit camera-relative projection. The application owns view rotation.
@@ -293,6 +347,7 @@ pub struct TreeCamera {
     forward: [f32; 3],
     wind: Option<WindFrame>,
     eye: [f32; 3],
+    sun: [f32; 3],
 }
 
 impl TreeCamera {
@@ -311,6 +366,7 @@ impl TreeCamera {
             forward,
             wind: None,
             eye: [0.0; 3],
+            sun: [0.64, 0.60, 0.48],
         })
     }
 
@@ -324,6 +380,18 @@ impl TreeCamera {
             return Err(Error::InvalidConfiguration("nonfinite tree camera eye"));
         }
         self.eye = eye;
+        Ok(self)
+    }
+
+    /// Direction towards the shared directional sun in resident-local space.
+    /// # Errors
+    /// Rejects nonfinite or non-unit directions.
+    pub fn with_sun(mut self, direction: [f32; 3]) -> Result<Self> {
+        let length_squared: f32 = direction.iter().map(|v| v * v).sum();
+        if !length_squared.is_finite() || (length_squared - 1.0).abs() > 1e-4 {
+            return Err(Error::InvalidConfiguration("invalid directional light"));
+        }
+        self.sun = direction;
         Ok(self)
     }
 
@@ -380,6 +448,7 @@ struct DrawUniform {
     camera_forward: [f32; 4],
     billboard_source: [f32; 4],
     eye: [f32; 4],
+    sun: [f32; 4],
 }
 
 /// Render targets and material alpha-cutoff semantics.
@@ -573,6 +642,16 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 count: None,
             },
             BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
                 binding: 6,
                 visibility: ShaderStages::VERTEX,
                 ty: BindingType::Texture {
@@ -655,6 +734,10 @@ fn make_draw_bind(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(&materials.atlas.view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(&materials.atlas.normal_view),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
@@ -801,7 +884,7 @@ impl TreePipelines {
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: core::mem::size_of::<TreeVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x2],
         })];
         let mesh = render_pipeline(
             device,
@@ -1029,6 +1112,7 @@ impl TreeRenderer {
             camera_forward: [camera.forward[0], camera.forward[1], camera.forward[2], 0.0],
             billboard_source: [0.0; 4],
             eye: [camera.eye[0], camera.eye[1], camera.eye[2], 0.0],
+            sun: [camera.sun[0], camera.sun[1], camera.sun[2], 0.0],
         };
         for material in &self.mesh_draws {
             uniform.material[0] = material.cutoff;
@@ -1119,14 +1203,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn impostor_shader_validates_without_an_adapter() {
+        use wgpu::naga::{
+            front::wgsl,
+            valid::{Capabilities, ValidationFlags, Validator},
+        };
+        let module = wgsl::parse_str(SHADER)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(SHADER)));
+        Validator::new(ValidationFlags::all(), Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(SHADER)));
+    }
+
+    #[test]
     fn atlas_size_validation() {
         let len = 8 * 4 * 16 * 16 * 4;
-        let image = AtlasImage::new(16, 2, vec![0; len]).unwrap();
+        let image = AtlasImage::new(16, 2, vec![0; len], vec![0; len]).unwrap();
         assert_eq!((image.width(), image.height()), (128, 64));
         assert_eq!(image.rgba().len(), len);
-        assert!(AtlasImage::new(4, 1, vec![]).is_err());
-        assert!(AtlasImage::new(16, 4, vec![]).is_err());
-        assert!(AtlasImage::new(16, 2, vec![]).is_err());
+        assert!(AtlasImage::new(4, 1, vec![], vec![]).is_err());
+        assert!(AtlasImage::new(16, 4, vec![], vec![]).is_err());
+        assert!(AtlasImage::new(16, 2, vec![], vec![]).is_err());
     }
 
     #[test]
@@ -1156,8 +1253,26 @@ mod tests {
                 }
             }
         }
-        let atlas = AtlasImage::new(tile, gutter, rgba).unwrap();
-        let (levels, bytes) = atlas.isolated_mips();
+        let normals = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [128, 255, 128, p[3]])
+            .collect();
+        let atlas = AtlasImage::new(tile, gutter, rgba, normals).unwrap();
+        let (levels, bytes) = atlas.isolated_mips(atlas.rgba(), true);
+        let (normal_levels, normal_bytes) = atlas.isolated_mips(atlas.normals_rgba(), false);
+        assert_eq!(levels, normal_levels);
+        for (color, normal) in bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(normal_bytes.as_chunks::<4>().0)
+        {
+            assert_eq!(color[3], normal[3]);
+            assert_eq!(normal[1], normal[3]);
+            assert!((i16::from(normal[0]) * 2 - i16::from(normal[3])).abs() <= 2);
+        }
         assert_eq!(levels, 4);
         let layer_bytes: usize = (0..levels).map(|l| ((side >> l).pow(2) * 4) as usize).sum();
         assert_eq!(bytes.len(), layer_bytes * 32);
