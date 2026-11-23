@@ -6,7 +6,7 @@ use i_love_proland::procedural::bake;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let species = Species::default();
-    let plant = Plant::generate(&species, 0x4f414b)?;
+    let plant = Plant::generate(&species, 0x4f_41_4b)?;
     let bounds = plant.bounds();
     println!(
         "Source sphere center {:?}, radius {:.3}",
