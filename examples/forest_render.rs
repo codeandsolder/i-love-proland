@@ -1049,6 +1049,7 @@ struct ModuleForestSmoke {
     largest_expansion: f32,
     bin_counts: Vec<u64>,
     triangles: u64,
+    impostors: u64,
 }
 
 /// Compile all visual tiers of one reproducible source variant family.
