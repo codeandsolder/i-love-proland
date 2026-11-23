@@ -1077,8 +1077,15 @@ impl TreeRenderer {
             billboard_source: [0.0; 4],
             eye: [camera.eye[0], camera.eye[1], camera.eye[2], 0.0],
         };
-        for material in &self.mesh_draws {
+        for (material_id, material) in self.mesh_draws.iter().enumerate() {
             uniform.material[0] = material.cutoff;
+            // Diagnostic-only immutable draw identity, not used by production shading.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "one material draw ordinal per GPU binding, always much smaller than 2^24"
+            )]
+            let draw_id = material_id as f32;
+            uniform.material[2] = draw_id;
             uniform.billboard_source = material.billboard.map_or([0.0; 4], |b| {
                 let [x, y, z] = b.center();
                 [x, y, z, b.radius()]
@@ -1102,6 +1109,7 @@ impl TreeRenderer {
             queue.write_buffer(&material.uniforms, 0, bytemuck::bytes_of(&uniform));
         }
         uniform.material[0] = 0.0;
+        uniform.material[2] = -1.0; // composite impostor is a different primitive namespace
         uniform.wind_parameters = [0.0; 4];
         queue.write_buffer(&self.impostor_uniforms, 0, bytemuck::bytes_of(&uniform));
     }
