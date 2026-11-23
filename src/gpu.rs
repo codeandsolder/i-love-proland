@@ -41,6 +41,10 @@ pub struct PackedInstance {
     pub axis_radii: [f32; 4],
     pub object_id: [u32; 4],
     pub metadata: [u32; 4],
+    /// Dense render-local module bank selection. Canonical variant_id and layer
+    /// stay intact in metadata; this index may be remapped without re-seeding
+    /// or changing the persistent object identity.
+    pub render_model: [u32; 4],
     /// Independent per-object RGBA tint in linear source color space.
     /// The material's vertex tint is baked into its source mesh/atlas.
     pub tint: [f32; 4],
@@ -143,6 +147,7 @@ impl PackedInstance {
                 layer as u32,
                 (layer >> 32) as u32,
             ],
+            render_model: [0; 4],
             tint: [1.0; 4],
             handoff_anchor_rank: [
                 pose.local_position[0],
@@ -188,6 +193,14 @@ impl PackedInstance {
         }
         self.handoff_anchor_rank = [anchor[0], anchor[1], anchor[2], rank];
         Ok(self)
+    }
+
+    /// Select the dense module bank slot without changing canonical variant ID,
+    /// source placement, tint, or canopy-handoff rank.
+    #[must_use = "Use the returned render pose with its module model"]
+    pub const fn with_render_model(mut self, index: u32) -> Self {
+        self.render_model = [index, 0, 0, 0];
+        self
     }
 
     #[must_use = "Use the canonical identity to associate edits and candidates"]
@@ -1099,6 +1112,7 @@ mod tests {
             axis_radii: [1., 1., 1., 1.],
             object_id: [0; 4],
             metadata: [0; 4],
+            render_model: [0; 4],
             handoff_anchor_rank: [0.0; 4],
             tint: [1.; 4],
         };
@@ -1124,6 +1138,7 @@ mod tests {
             axis_radii: [3.0, 3.0, 3.0, 1.0],
             object_id: [42, 0, 0, 0],
             metadata: [0; 4],
+            render_model: [0; 4],
             tint: [1.0; 4],
             handoff_anchor_rank: [10_000.0, 20_000.0, 30_095.0, 0.5],
         };
@@ -1168,7 +1183,7 @@ mod tests {
 
     #[test]
     fn gpu_layout_and_identity_roundtrip() {
-        assert_eq!(core::mem::size_of::<PackedInstance>(), 112);
+        assert_eq!(core::mem::size_of::<PackedInstance>(), 128);
         assert_eq!(core::mem::size_of::<GpuUniform>(), 192);
         assert_eq!(core::mem::size_of::<IndexedDraw>(), 20);
         let g = Generator::new(
@@ -1245,7 +1260,7 @@ mod tests {
         assert_eq!(packed.position_radius, [-14.0, 20.0, 88.0, 7.0]);
         assert_eq!(packed.stable_id(), original.candidate.id);
         assert_eq!(packed.variant_id(), original.variant_id);
-        assert_eq!(core::mem::size_of::<PackedInstance>(), 112);
+        assert_eq!(core::mem::size_of::<PackedInstance>(), 128);
         let mut invalid = pose;
         invalid.rotation_xyzw[3] = 2.0;
         assert!(PackedInstance::from_instance(&original, invalid).is_err());
@@ -1272,6 +1287,7 @@ mod tests {
             axis_radii: [radius, radius, radius, 0.0],
             object_id: [0; 4],
             metadata: [0; 4],
+            render_model: [0; 4],
             handoff_anchor_rank: [0.0; 4],
             tint: [1.0; 4],
         };
@@ -1373,6 +1389,7 @@ mod tests {
             axis_radii: [3.0, 5.0, 13.0, 0.0],
             object_id: [1; 4],
             metadata: [2; 4],
+            render_model: [0; 4],
             handoff_anchor_rank: [0.0; 4],
             tint: [1.0; 4],
         };
@@ -1405,6 +1422,7 @@ mod tests {
             axis_radii: [radius, radius, radius, 1.0],
             object_id: [1; 4],
             metadata: [0; 4],
+            render_model: [0; 4],
             handoff_anchor_rank: [0.0; 4],
             tint: [1.0; 4],
         };
@@ -1464,6 +1482,7 @@ mod tests {
             axis_radii: [1.0, 1.0, 1.0, 0.0],
             object_id: [1; 4],
             metadata: [2; 4],
+            render_model: [0; 4],
             handoff_anchor_rank: [0.0; 4],
             tint: [1.0; 4],
         };
