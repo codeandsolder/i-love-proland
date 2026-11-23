@@ -71,3 +71,25 @@ the distant end; foliage area and apparent density matter more than
 polygon-count reduction alone.
 
 See the technical [Notion foliage lab](https://app.notion.com/p/421f74be902081a689fcced26594a4bc).
+
+## Mid-LOD aerial and grove-population experiment
+
+In addition to the original ground-level overdraw stress test, the example
+measures the same four rendering methods with 4,096 trees over an extended
+terrain-sized footprint. The aerial camera is 40 m up and pitched downward
+0.22 radians, with the first trunks about 50 m away. Unlike the original
+stress test, these trees occupy smaller projected areas; the test helps
+distinguish fragment/overdraw pressure from vertex-generation pressure.
+
+The spatial population uses a **smooth seeded habitat/moisture field** to
+create patches of broadleaf, conifer and shrubs instead of independent
+uniform per-tree species selection. Eight percent of trees are out-of-habitat
+colonizers. The example logs observed adjacent-tree species agreement
+alongside the same-species probability expected from randomly scrambled
+assignments. The density and biomes are synthetic; canonical Kerbin biomes
+remain entirely owned by i-love-proland and KSP.
+
+Outputs include aerial-timings.csv, four aerial comparison PPMs and separate
+24-to-8 and 64-to-24 six-frame crossfade sequences with coverage CSVs.
+Aerial and ground captures share the same four WGSL vertex methods and
+fragment code. They are still alpha-card proxies, not finished foliage art.

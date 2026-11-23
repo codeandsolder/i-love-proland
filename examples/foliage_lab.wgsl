@@ -76,8 +76,13 @@ fn corner(i:u32)->vec2<f32> {
 fn write_vertex(local:vec3<f32>,uv:vec2<f32>,brightness:f32,trunk:bool,tree:Tree)->Output {
  var out:Output;
  let world=tree.position_scale.xyz+local*tree.position_scale.w;
- let z=world.z+scene.switches.w;
- out.position=vec4f(world.x*scene.view.x/scene.view.y,(world.y-scene.view.z)*scene.view.x,z-0.1,z);
+ let rel_z=world.z+scene.switches.w;
+ let rel_y=world.y-scene.view.z;
+ let cosine=cos(scene.view.w);
+ let sine=sin(scene.view.w);
+ let forward=cosine*rel_z-sine*rel_y;
+ let vertical=cosine*rel_y+sine*rel_z;
+ out.position=vec4f(world.x*scene.view.x/scene.view.y,vertical*scene.view.x,forward-0.1,forward);
  let bark=vec3f(0.41,0.27,0.14);
  let foliage=select(vec3f(0.18,0.38,0.13),vec3f(0.15,0.30,0.18),tree.ids.z==1u);
  out.color=select(foliage*tree.tint.xyz*brightness,bark*brightness,trunk);

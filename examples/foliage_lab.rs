@@ -11,6 +11,12 @@ const VARIANTS: u32 = 8;
 const MODELS: u32 = KINDS * VARIANTS;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const QUERIES: u32 = 32;
+const MODES: [&str; 4] = [
+    "gpu_unique",
+    "gpu_24_variants",
+    "shared_modules",
+    "expanded_24_variants",
+];
 type AnyResult<T> = Result<T, Box<dyn Error>>;
 
 #[repr(C)]
@@ -166,17 +172,76 @@ fn make_modules(clumps: u32) -> (Vec<Patch>, Vec<BakedVertex>) {
     }
     (models, expanded_models)
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Camera {
+    Ground,
+    Aerial,
+}
+
+/// Smooth two-dimensional biome field from stable grid points, not a random
+/// species assignment per tree. The eight-clump morphology is still stable.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "benchmark habitat grid coordinates are at most 88 by 47"
+)]
+fn habitat_kind(i: u32) -> u32 {
+    let gx = i % 88;
+    let gz = i / 88;
+    let bx = gx / 18;
+    let bz = gz / 10;
+    let mut tx = (gx % 18) as f32 / 18.0;
+    let mut tz = (gz % 10) as f32 / 10.0;
+    tx = tx * tx * tx.mul_add(-2.0, 3.0);
+    tz = tz * tz * tz.mul_add(-2.0, 3.0);
+    let sample = |x: u32, z: u32| {
+        random(
+            x.wrapping_mul(0x9e37_79b9) ^ z.wrapping_mul(0x85eb_ca6b),
+            0x1bd3,
+        )
+    };
+    let n00 = sample(bx, bz);
+    let n10 = sample(bx + 1, bz);
+    let n01 = sample(bx, bz + 1);
+    let n11 = sample(bx + 1, bz + 1);
+    let moisture = (n10 - n00).mul_add(tx, n00);
+    let moisture2 = (n11 - n01).mul_add(tx, n01);
+    let climate = (moisture2 - moisture).mul_add(tz, moisture);
+    // Species-specific groves, with occasional out-of-habitat colonizers.
+    if random(i, 0x3f42_8a1d) < 0.08 {
+        return hash(i) % KINDS;
+    }
+    if climate < 0.39 {
+        1 // conifer
+    } else if climate < 0.49 {
+        2 // shrub
+    } else {
+        0 // broadleaf
+    }
+}
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "benchmark grid has <2^16 positions"
 )]
-fn make_trees(count: u32) -> Vec<Tree> {
+fn make_trees(count: u32, camera: Camera) -> Vec<Tree> {
     (0..count)
         .map(|i| {
-            let kind = hash(i) % KINDS;
+            let kind = if camera == Camera::Aerial {
+                habitat_kind(i)
+            } else {
+                hash(i) % KINDS
+            };
             let model = kind * VARIANTS + hash(i ^ 0x9e37_79b9) % VARIANTS;
-            let x = ((i % 88) as f32 - 44.0).mul_add(1.65, (random(i, 55) - 0.5) * 0.75);
-            let z = random(i, 72).mul_add(1.4, ((i / 88) as f32).mul_add(3.4, 14.0));
+            let (spacing_x, spacing_z, start_z) = match camera {
+                Camera::Ground => (1.65, 3.4, 14.0),
+                Camera::Aerial => (4.3, 7.5, 50.0),
+            };
+            let x = ((i % 88) as f32 - 44.0)
+                .mul_add(spacing_x, (random(i, 55) - 0.5) * spacing_x * 0.55);
+            let z = random(i, 72).mul_add(
+                spacing_z * 0.42,
+                ((i / 88) as f32).mul_add(spacing_z, start_z),
+            );
             let size = if kind == 2 {
                 4.4
             } else {
@@ -403,11 +468,15 @@ impl DrawCase {
         clippy::cast_precision_loss,
         reason = "fixed W=960 and H=600 are exactly representable as f32"
     )]
-    fn new(gpu: &Gpu, clumps: u32, count: u32, fade: f32, side: u32) -> Self {
+    fn new(gpu: &Gpu, clumps: u32, count: u32, fade: f32, side: u32, camera: Camera) -> Self {
         let models = make_modules(clumps);
-        let trees = make_trees(count);
+        let trees = make_trees(count, camera);
+        let (eye_height, pitch) = match camera {
+            Camera::Ground => (2.5, 0.0),
+            Camera::Aerial => (40.0, 0.22),
+        };
         let uniform_data = Scene {
-            view: [1.73, W as f32 / H as f32, 2.5, 200.0],
+            view: [1.73, W as f32 / H as f32, eye_height, pitch],
             counts: [clumps, MODELS, side, count],
             switches: [fade, W as f32, H as f32, 0.0],
         };
@@ -682,10 +751,145 @@ fn green_pixels(data: &[u8]) -> usize {
         .filter(|rgba| rgba[1] > rgba[0] && rgba[1] > rgba[2])
         .count()
 }
+/// The same source trees in two different LODs compete for every pixel;
+/// complementary hashes reduce coverage pops without remapping stable IDs.
 #[expect(
     clippy::cast_precision_loss,
-    reason = "captured pixel count is limited to W*H=576000"
+    reason = "green-pixel counts are bounded by W*H=576000"
 )]
+fn capture_transitions(
+    gpu: &Gpu,
+    output: &Path,
+    camera: Camera,
+    trees: u32,
+    pair: (u32, u32),
+    label: &str,
+) -> AnyResult<()> {
+    let mut transition = String::from("fade,green_pixels,coverage_ratio_to_near\n");
+    let mut original_count = None;
+    for fade in [0.0_f32, 0.20, 0.40, 0.60, 0.80, 1.0] {
+        let near = DrawCase::new(gpu, pair.0, trees, fade, 1, camera);
+        let far = DrawCase::new(gpu, pair.1, trees, fade, 2, camera);
+        let path = output.join(format!("{label}-{fade:.2}.ppm"));
+        let rgba = capture(gpu, &[(&near, 0), (&far, 0)], &path)?;
+        let count = green_pixels(&rgba);
+        let original = *original_count.get_or_insert(count);
+        if original == 0 {
+            return Err("no visible foliage in LOD transition".into());
+        }
+        let relative = count as f64 / original as f64;
+        println!(
+            "FOLIAGE_TRANSITION scenario={label} fade={fade:.2} green_pixels={count} ratio_to_near={relative:.5}"
+        );
+        writeln!(&mut transition, "{fade:.2},{count},{relative:.6}")?;
+    }
+    fs::write(output.join(format!("{label}.csv")), transition)?;
+    Ok(())
+}
+
+/// Compare both ALU-heavy procedural and bandwidth-heavy shared geometry
+/// at actual intermediate LOD projected sizes, not just a dense ground view.
+fn benchmark_aerial(gpu: &Gpu, output: &Path) -> AnyResult<()> {
+    const TREES: u32 = 4096;
+    let mut csv = String::from(
+        "mode,trees,clumps,triangles,geometry_bytes,patch_bytes,min_ms,p50_ms,p90_ms\n",
+    );
+    for clumps in [8, 24, 64] {
+        let case = DrawCase::new(gpu, clumps, TREES, 0.0, 0, Camera::Aerial);
+        for (mode, name) in MODES.iter().enumerate() {
+            let ms = measure(gpu, &case, mode)?;
+            let bytes = match mode {
+                0 | 1 => 0,
+                2 => case.module_bytes,
+                _ => case.geometry_bytes,
+            };
+            println!(
+                "FOLIAGE_AERIAL mode={name} trees={TREES} clumps={clumps} triangles={} gpu_ms_p50={:.5} p90={:.5} bytes={bytes}",
+                (clumps * 4 + 2) * TREES,
+                ms.median,
+                ms.p90
+            );
+            writeln!(
+                &mut csv,
+                "{name},{TREES},{clumps},{},{bytes},{},{:.6},{:.6},{:.6}",
+                (clumps * 4 + 2) * TREES,
+                case.module_bytes,
+                ms.min,
+                ms.median,
+                ms.p90
+            )?;
+        }
+    }
+    fs::write(output.join("aerial-timings.csv"), csv)?;
+    Ok(())
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "population counts are bounded by 4096; exact as f64"
+)]
+fn population_summary(trees: &[Tree]) {
+    let mut counts = [0_usize; 3];
+    let mut same_neighbor = 0_usize;
+    let mut neighbors = 0_usize;
+    for (i, tree) in trees.iter().enumerate() {
+        counts[tree.ids[2] as usize] += 1;
+        for other in [i + 1, i + 88] {
+            if other >= trees.len() || other == i + 1 && i % 88 == 87 {
+                continue;
+            }
+            neighbors += 1;
+            same_neighbor += usize::from(tree.ids[2] == trees[other].ids[2]);
+        }
+    }
+    let expected = counts
+        .iter()
+        .map(|count| (*count as f64 / trees.len() as f64).powi(2))
+        .sum::<f64>();
+    println!(
+        "FOLIAGE_BIOME trees={} broadleaf={} conifer={} shrub={} adjacent_same={:.4} random_expected={expected:.4}",
+        trees.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        same_neighbor as f64 / neighbors as f64
+    );
+}
+
+fn run_aerial(gpu: &Gpu, output: &Path) -> AnyResult<()> {
+    let trees = make_trees(4096, Camera::Aerial);
+    population_summary(&trees);
+    benchmark_aerial(gpu, output)?;
+    let case = DrawCase::new(gpu, 24, 4096, 0.0, 0, Camera::Aerial);
+    let mut images = Vec::new();
+    for (mode, name) in MODES.iter().enumerate() {
+        let path = output.join(format!("aerial-{name}.ppm"));
+        let rgba = capture(gpu, &[(&case, mode)], &path)?;
+        println!(
+            "FOLIAGE_AERIAL_IMAGE mode={name} green_pixels={} file={}",
+            green_pixels(&rgba),
+            path.display()
+        );
+        images.push(rgba);
+    }
+    println!(
+        "FOLIAGE_AERIAL_MATCH generated_vs_modules_mae={:.5} generated_vs_expanded_mae={:.5} unique_vs_shared_mae={:.5}",
+        image_difference(&images[1], &images[2]),
+        image_difference(&images[1], &images[3]),
+        image_difference(&images[0], &images[2])
+    );
+    capture_transitions(gpu, output, Camera::Aerial, 4096, (24, 8), "aerial-24-to-8")?;
+    capture_transitions(
+        gpu,
+        output,
+        Camera::Aerial,
+        4096,
+        (64, 24),
+        "aerial-64-to-24",
+    )?;
+    Ok(())
+}
+
 fn run() -> AnyResult<()> {
     let output = std::env::args()
         .nth(1)
@@ -701,16 +905,10 @@ fn run() -> AnyResult<()> {
         "gpu={}\nmode,trees,clumps,triangles,geometry_bytes,patch_bytes,min_ms,p50_ms,p90_ms\n",
         gpu.name
     );
-    let modes = [
-        "gpu_unique",
-        "gpu_24_variants",
-        "shared_modules",
-        "expanded_24_variants",
-    ];
     for trees in [1024, 4096] {
         for clumps in [8, 24, 64] {
-            let case = DrawCase::new(&gpu, clumps, trees, 0.0, 0);
-            for (mode, name) in modes.iter().enumerate() {
+            let case = DrawCase::new(&gpu, clumps, trees, 0.0, 0, Camera::Ground);
+            for (mode, name) in MODES.iter().enumerate() {
                 let sample = measure(&gpu, &case, mode)?;
                 let bytes = match mode {
                     0 | 1 => 0,
@@ -736,9 +934,9 @@ fn run() -> AnyResult<()> {
         }
     }
     fs::write(output.join("timings.csv"), &report)?;
-    let case = DrawCase::new(&gpu, 24, 2048, 0.0, 0);
+    let case = DrawCase::new(&gpu, 24, 2048, 0.0, 0, Camera::Ground);
     let mut pictures = Vec::new();
-    for (mode, name) in modes.iter().enumerate() {
+    for (mode, name) in MODES.iter().enumerate() {
         let path = output.join(format!("{name}.ppm"));
         let rgba = capture(&gpu, &[(&case, mode)], &path)?;
         println!(
@@ -754,25 +952,16 @@ fn run() -> AnyResult<()> {
         image_difference(&pictures[1], &pictures[3]),
         image_difference(&pictures[0], &pictures[1])
     );
-    // Identical per-pixel seeds are used in both LODs to avoid alpha spikes.
-    let mut transition = String::from("fade,green_pixels,coverage_ratio_to_near\n");
-    let mut near_count = 0;
-    for fade in [0.0_f32, 0.20, 0.40, 0.60, 0.80, 1.0] {
-        let near = DrawCase::new(&gpu, 24, 2048, fade, 1);
-        let far = DrawCase::new(&gpu, 8, 2048, fade, 2);
-        let path = output.join(format!("transition-{fade:.2}.ppm"));
-        let rgba = capture(&gpu, &[(&near, 0), (&far, 0)], &path)?;
-        let count = green_pixels(&rgba);
-        if near_count == 0 {
-            near_count = count;
-        }
-        let relative = count as f64 / near_count as f64;
-        println!(
-            "FOLIAGE_TRANSITION fade={fade:.2} green_pixels={count} ratio_to_near={relative:.5}"
-        );
-        writeln!(&mut transition, "{fade:.2},{count},{relative:.6}")?;
-    }
-    fs::write(output.join("transitions.csv"), transition)?;
+    // Two LODs are rendered together with complementary stochastic alpha.
+    capture_transitions(
+        &gpu,
+        output,
+        Camera::Ground,
+        2048,
+        (24, 8),
+        "ground-24-to-8",
+    )?;
+    run_aerial(&gpu, output)?;
     Ok(())
 }
 fn main() {
