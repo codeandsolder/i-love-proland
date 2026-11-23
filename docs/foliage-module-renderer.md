@@ -38,6 +38,21 @@ scatter system or an automatic replacement for the current KSP assets.
   The canopy cards have an ellipse coverage envelope with anti-aliasing and
   multisample alpha-to-coverage, or stable dither when single sampled.
 
+## Projected-diameter LOD selection
+
+Procedural foliage can choose mesh tiers by each tree's actual screen
+footprint rather than the authored metre boundaries. Construct the usual
+MeshLods tiers, then explicitly select
+MeshLods::with_projected_diameters(vec![80.0, 24.0, 0.0]):
+near at >=80 px, clustered leaves at 24-80 px, sparse cards below 24 px.
+These are experiment thresholds, not a calibrated art acceptance. Both
+CPU and GPU compare projected crown times depth against threshold times
+depth without a division; source identities stay unchanged.
+
+Authored distance LOD remains the default. Per-tier prefer_mesh continues
+to control the existing mesh/impostor crossover. Subpixel population and
+terrain canopy handoff remain independent.
+
 ## Test with the real GPU compactor
 
 Use the existing headless Proland scene with an *optional* module pass:

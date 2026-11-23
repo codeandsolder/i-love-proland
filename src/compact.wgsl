@@ -14,7 +14,7 @@ struct View {
     counts: vec4<u32>,             // input count, aligned bin stride (u32 indices), mesh bin count, host-owned population flag
     lod: vec4<f32>,                // focal pixels, mesh threshold, impostor threshold, animation displacement bound
     forward: vec4<f32>,            // normalized camera forward
-    source_center: vec4<f32>,      // normalized original mesh bounds centre
+    source_center: vec4<f32>,      // original source XYZ, W=projected-diameter LOD mode
     planes: array<vec4<f32>, 6>,   // xyz normal, w offset; camera-relative
     eye: vec4<f32>,               // eye in resident local frame
     handoff_range: vec4<f32>,     // begin/end, zero pair disables
@@ -23,7 +23,7 @@ struct View {
 @group(0) @binding(0) var<storage, read> input: array<PackedInstance>;
 @group(0) @binding(1) var<storage, read_write> visible: array<u32>;
 @group(0) @binding(2) var<storage, read_write> draws: array<IndexedDraw>;
-@group(0) @binding(3) var<storage, read> mesh_lods: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read> mesh_lods: array<vec2<f32>>; // boundary squared metres or min projected px; prefer_mesh
 @group(0) @binding(4) var<uniform> camera: View;
 
 fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
@@ -83,17 +83,33 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if camera.counts.w == 0u && projected_crown < camera.lod.z * safe_depth {
         return;
     }
-    let anchor = position - rotate(instance.rotation, camera.source_center.xyz * instance.axis_radii.xyz);
-    let distance_squared = dot(anchor, anchor);
-    // Upper bound search for the final inclusive authored start range.
     var low = 0u;
     var high = camera.counts.z;
-    while low + 1u < high {
-        let middle = low + (high - low) / 2u;
-        if mesh_lods[middle].x <= distance_squared {
-            low = middle;
-        } else {
-            high = middle;
+    if camera.source_center.w > 0.5 {
+        // Lower-bound search on strictly descending screen thresholds.
+        // Cross-multiply the same crown diameter and depth as the impostor
+        // crossover. This keeps GPU classifications zoom-invariant and
+        // consistent across differently scaled physical tree instances.
+        while low < high {
+            let middle = low + (high - low) / 2u;
+            if projected_crown < mesh_lods[middle].x * safe_depth {
+                low = middle + 1u;
+            } else {
+                high = middle;
+            }
+        }
+        low = min(low, camera.counts.z - 1u);
+    } else {
+        let anchor = position - rotate(instance.rotation, camera.source_center.xyz * instance.axis_radii.xyz);
+        let distance_squared = dot(anchor, anchor);
+        // Upper-bound search for inclusive authored distance ranges.
+        while low + 1u < high {
+            let middle = low + (high - low) / 2u;
+            if mesh_lods[middle].x <= distance_squared {
+                low = middle;
+            } else {
+                high = middle;
+            }
         }
     }
     // Cheap original cards can be preferable to generated impostors,

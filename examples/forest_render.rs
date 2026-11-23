@@ -998,6 +998,27 @@ fn module_grove_candidates(
     Ok(selected)
 }
 
+fn module_submission_stats(
+    objects: &[PackedInstance],
+    view: GpuView,
+    lods: &MeshLods,
+) -> Result<(Vec<u64>, u64), Box<dyn Error>> {
+    let mut counts = vec![0_u64; lods.tiers().len()];
+    for object in objects {
+        if let VisualLod::Mesh(tier) = classify_cpu(object, view, lods) {
+            counts[tier] = counts[tier].checked_add(1).ok_or("module bin overflow")?;
+        }
+    }
+    let tris = counts
+        .iter()
+        .zip(lods.tiers())
+        .try_fold(0_u64, |sum, (&count, tier)| {
+            sum.checked_add(count * u64::from(tier.index_count / 3))
+                .ok_or("submitted triangle count overflow")
+        })?;
+    Ok((counts, tris))
+}
+
 fn assert_all_visual_forms_present(visuals: &[PackedInstance], model_count: usize) {
     let distinct = visuals
         .iter()
@@ -1062,7 +1083,10 @@ fn capture_module_forest(
             wind: None,
         }]);
     }
-    let lods = MeshLods::new(tier_descriptors)?;
+    // Procedural near/mid/far geometry follows the projected crown footprint.
+    let lods = MeshLods::new(tier_descriptors)?.with_projected_diameters(vec![80.0, 24.0, 0.0])?;
+    let (camera, view) = pitched_view(0.0)?;
+    let (bin_counts, triangles) = module_submission_stats(&visuals, view, &lods)?;
     let mut renderer = TreeRenderer::new(
         pipelines,
         u32::try_from(candidates.len().min(256))?,
@@ -1070,7 +1094,6 @@ fn capture_module_forest(
         bank_materials,
         atlas,
     )?;
-    let (camera, view) = pitched_view(0.0)?;
     renderer.set_camera(queue, camera);
     let targets = make_frame_targets(device);
     let background = background_pipeline(device, "fs_main");
@@ -1112,8 +1135,12 @@ fn capture_module_forest(
         "a render-local module model must never silently differ from the canonical source variant"
     );
     renderer.set_candidates(queue, &visuals)?;
+    let tri_per_changed_px_milli = triangles
+        .checked_mul(1000)
+        .ok_or("submitted geometry density overflow")?
+        / u64::try_from(changed)?;
     println!(
-        "FOREST_MODULE_PASS changed_pixels={changed} resident={} module_tiers=3 cull_expansion={largest_expansion:.5} image={prefix}-modules.ppm",
+        "FOREST_MODULE_PASS changed_pixels={changed} resident={} module_tiers=3 screen_thresholds_px=80,24,0 bins={bin_counts:?} submitted_tris={triangles} tri_per_changed_px_milli={tri_per_changed_px_milli} cull_expansion={largest_expansion:.5} image={prefix}-modules.ppm",
         candidates.len(),
     );
     Ok(())
