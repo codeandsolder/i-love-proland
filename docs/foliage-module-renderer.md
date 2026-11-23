@@ -11,12 +11,14 @@ scatter system or an automatic replacement for the current KSP assets.
 - Lorax owns the immutable source plant, tapering stems and spatial canopy
   group membership. Create each tier using Plant::module_tier with ScreenLod.
   Original source foliage IDs are kept for later texture/coverage baking.
-- Proland procedural::compile_modules collects multiple independently
-  generated source variants with distinct u64 canonical IDs, normalizes them
-  to **one explicit shared source frame**, and pads the shorter tiers with
-  inert records. Source color, geometry bounds, and conservative culling
-  expansion are retained. Dense GPU index order is explicit; use
-  CompiledModuleBank::model_slot(variant_id) to select one.
+- Proland procedural::compile_modules collects independently generated
+  source-variant forms, normalizes them to **one explicit shared source
+  frame**, and pads shorter tiers with inert records. Multiple seeded forms
+  can share one persistent u64 source variant ID. The dense index order is
+  explicit; use CompiledModuleBank::model_slot_for_seed(source_id, stable_seed)
+  to select a visual form using persistent object/biome context.
+  Source colors, geometry bounds, and conservative culling expansion survive.
+  Neither selected visual slot nor seed changes the canonical source ID.
 - Upload to TreeModules once, not each frame. Each source-space descriptor is
   64 bytes: a typed tapered stem or spatial canopy ellipsoid plus source ID
   and original membership count. GPU expansion emits two crossed cards per
