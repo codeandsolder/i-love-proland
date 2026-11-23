@@ -391,10 +391,53 @@ fn validate_sparse_patches(
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let (candidates, generation_ms) = generate_sample()?;
-    let view = GpuView::unculled(540.0, 32.0, 1.0)?.with_source_center([0.12, 0.4, -0.19])?;
-    let lods = MeshLods::new(vec![
+fn validate_projected_lod_parity(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &CompactionPipeline,
+    candidates: &[PackedInstance],
+    original: &MeshLods,
+) -> Result<(), Box<dyn Error>> {
+    // Camera zoom and physical crown radii must select the same tier on
+    // CPU and GPU. Distance-based authored LOD is exercised above instead.
+    let tiers = original
+        .tiers()
+        .iter()
+        .map(|tier| MeshLod {
+            prefer_mesh: true,
+            ..*tier
+        })
+        .collect::<Vec<_>>();
+    let projected = MeshLods::new(tiers)?.with_projected_diameters(vec![256.0, 96.0, 24.0, 0.0])?;
+    let mut projected_compactor =
+        GpuCompactor::new(pipeline, u32::try_from(candidates.len())?, projected, 6)?;
+    projected_compactor.set_candidates(queue, candidates)?;
+    for focal in [270.0, 540.0, 1080.0] {
+        let projected_view =
+            GpuView::unculled(focal, 32.0, 1.0)?.with_source_center([0.12, 0.4, -0.19])?;
+        let (expected, _) = reference(candidates, projected_view, projected_compactor.mesh_lods());
+        let (draws, _) = gpu_parity(
+            device,
+            queue,
+            &projected_compactor,
+            candidates,
+            projected_view,
+            &expected,
+        )?;
+        println!(
+            "GPU_PROJECTED_LOD_PARITY focal={focal} bins={:?}",
+            draws
+                .iter()
+                .map(|draw| draw.instance_count)
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(())
+}
+
+/// Same original authored-distance fixtures used for GPU parity baselines.
+fn reference_lods() -> Result<MeshLods, Box<dyn Error>> {
+    Ok(MeshLods::new(vec![
         MeshLod {
             start_m: 0.0,
             index_count: 369,
@@ -415,7 +458,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             index_count: 9,
             prefer_mesh: false,
         },
-    ])?;
+    ])?)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let (candidates, generation_ms) = generate_sample()?;
+    let view = GpuView::unculled(540.0, 32.0, 1.0)?.with_source_center([0.12, 0.4, -0.19])?;
+    let lods = reference_lods()?;
     let (expected, canopy) = reference(&candidates, view, &lods);
     let (device, queue) = device()?;
     let pipeline = CompactionPipeline::new(&device);
@@ -478,6 +527,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|d| d.instance_count)
             .collect::<Vec<_>>()
     );
+    validate_projected_lod_parity(
+        &device,
+        &queue,
+        &pipeline,
+        &candidates,
+        compactor.mesh_lods(),
+    )?;
     validate_moving_handoff(&device, &queue, &mut compactor, &candidates, frustum)?;
     let frame_ms = benchmark(&device, &queue, &mut compactor, Some(&candidates), view)?;
     let resident_ms = benchmark(&device, &queue, &mut compactor, None, view)?;

@@ -998,6 +998,27 @@ fn module_grove_candidates(
     Ok(selected)
 }
 
+fn module_submission_stats(
+    objects: &[PackedInstance],
+    view: GpuView,
+    lods: &MeshLods,
+) -> Result<(Vec<u64>, u64), Box<dyn Error>> {
+    let mut counts = vec![0_u64; lods.tiers().len()];
+    for object in objects {
+        if let VisualLod::Mesh(tier) = classify_cpu(object, view, lods) {
+            counts[tier] = counts[tier].checked_add(1).ok_or("module bin overflow")?;
+        }
+    }
+    let tris = counts
+        .iter()
+        .zip(lods.tiers())
+        .try_fold(0_u64, |sum, (&count, tier)| {
+            sum.checked_add(count * u64::from(tier.index_count / 3))
+                .ok_or("submitted triangle count overflow")
+        })?;
+    Ok((counts, tris))
+}
+
 fn assert_all_visual_forms_present(visuals: &[PackedInstance], model_count: usize) {
     let distinct = visuals
         .iter()
@@ -1013,30 +1034,44 @@ fn assert_all_visual_forms_present(visuals: &[PackedInstance], model_count: usiz
 /// Optional full Proland render-pass validation: the exact same GPU compactor
 /// and indirect instance bins drive Lorax-generated module geometry. No
 /// authored Parallax source, canonical placement, or runtime KSP scene changes.
-fn capture_module_forest(
+struct ModuleForestSmoke {
+    renderer: TreeRenderer,
+    visuals: Vec<PackedInstance>,
+    largest_expansion: f32,
+    bin_counts: Vec<u64>,
+    triangles: u64,
+}
+
+/// Compile all visual tiers of one reproducible source variant family.
+fn build_module_forest(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
     pipelines: &TreePipelines,
     atlas: &AtlasTexture,
     white: &wgpu::TextureView,
     candidates: &[PackedInstance],
-    prefix: &str,
-) -> Result<(), Box<dyn Error>> {
+    view: GpuView,
+) -> Result<ModuleForestSmoke, Box<dyn Error>> {
     let plants = module_source_forms()?;
     let shared_frame = SourceFrame::new([0.0, 6.0, 0.0], 16.0)?;
     let mut visuals = Vec::new();
-    let lod_requests = [(0.0, 256.0, 64), (45.0, 96.0, 24), (110.0, 32.0, 8)];
+    // For crowns below 24px use one source canopy aggregate and its root
+    // stem (eight submitted triangles) instead of eight leaf clusters.
+    let lod_requests = [
+        (0.0, 256.0, 64, 0.75),
+        (45.0, 96.0, 24, 0.75),
+        (110.0, 16.0, 1, 16.0),
+    ];
     let mut bank_materials = Vec::new();
     let mut tier_descriptors = Vec::new();
     let mut largest_expansion = 1.0_f32;
-    for (start_m, projected, budget) in lod_requests {
+    for (start_m, projected, budget, stem_error) in lod_requests {
         let model_tiers = plants
             .iter()
             .map(|plant| {
                 Ok((
                     900_u64,
                     plant.module_tier(
-                        ScreenLod::new(projected, 0.75, 0.01)?.with_cluster_budget(budget)?,
+                        ScreenLod::new(projected, stem_error, 0.01)?.with_cluster_budget(budget)?,
                         Species::default().wood_color,
                     )?,
                 ))
@@ -1062,16 +1097,42 @@ fn capture_module_forest(
             wind: None,
         }]);
     }
-    let lods = MeshLods::new(tier_descriptors)?;
-    let mut renderer = TreeRenderer::new(
+    // Procedural near/mid/far geometry follows the projected crown footprint.
+    let lods = MeshLods::new(tier_descriptors)?.with_projected_diameters(vec![80.0, 24.0, 0.0])?;
+    let (bin_counts, triangles) = module_submission_stats(&visuals, view, &lods)?;
+    let renderer = TreeRenderer::new(
         pipelines,
         u32::try_from(candidates.len().min(256))?,
         lods,
         bank_materials,
         atlas,
     )?;
+    Ok(ModuleForestSmoke {
+        renderer,
+        visuals,
+        largest_expansion,
+        bin_counts,
+        triangles,
+    })
+}
+
+fn capture_module_forest(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &TreePipelines,
+    atlas: &AtlasTexture,
+    white: &wgpu::TextureView,
+    candidates: &[PackedInstance],
+    prefix: &str,
+) -> Result<(), Box<dyn Error>> {
     let (camera, view) = pitched_view(0.0)?;
-    renderer.set_camera(queue, camera);
+    let mut fixture = build_module_forest(device, pipelines, atlas, white, candidates, view)?;
+    fixture.renderer.set_camera(queue, camera);
+    let visuals = &fixture.visuals;
+    let renderer = &mut fixture.renderer;
+    let largest_expansion = fixture.largest_expansion;
+    let bin_counts = &fixture.bin_counts;
+    let triangles = fixture.triangles;
     let targets = make_frame_targets(device);
     let background = background_pipeline(device, "fs_main");
     let render = |renderer: &mut TreeRenderer| -> Result<Vec<u8>, Box<dyn Error>> {
@@ -1081,7 +1142,7 @@ fn capture_module_forest(
         let scene = ForestPass {
             queue,
             renderer,
-            candidates: &visuals,
+            candidates: visuals,
             view,
             color: &targets.color_view,
             depth: &targets.depth_view,
@@ -1091,9 +1152,9 @@ fn capture_module_forest(
         capture(device, queue, encoder, &targets.color)
     };
     renderer.set_candidates(queue, &[])?;
-    let empty = render(&mut renderer)?;
-    renderer.set_candidates(queue, &visuals)?;
-    let image = render(&mut renderer)?;
+    let empty = render(renderer)?;
+    renderer.set_candidates(queue, visuals)?;
+    let image = render(renderer)?;
     let changed = empty
         .as_chunks::<4>()
         .0
@@ -1111,9 +1172,13 @@ fn capture_module_forest(
         renderer.set_candidates(queue, &[wrong_model]).is_err(),
         "a render-local module model must never silently differ from the canonical source variant"
     );
-    renderer.set_candidates(queue, &visuals)?;
+    renderer.set_candidates(queue, visuals)?;
+    let tri_per_changed_px_milli = triangles
+        .checked_mul(1000)
+        .ok_or("submitted geometry density overflow")?
+        / u64::try_from(changed)?;
     println!(
-        "FOREST_MODULE_PASS changed_pixels={changed} resident={} module_tiers=3 cull_expansion={largest_expansion:.5} image={prefix}-modules.ppm",
+        "FOREST_MODULE_PASS changed_pixels={changed} resident={} module_tiers=3 screen_thresholds_px=80,24,0 bins={bin_counts:?} submitted_tris={triangles} tri_per_changed_px_milli={tri_per_changed_px_milli} cull_expansion={largest_expansion:.5} image={prefix}-modules.ppm",
         candidates.len(),
     );
     Ok(())

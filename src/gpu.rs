@@ -483,11 +483,15 @@ pub struct MeshLod {
     pub prefer_mesh: bool,
 }
 
-/// Validated, strictly ordered authored mesh tiers. The final mesh tier
-/// extends until the screen-size-based impostor crossover.
+/// Mesh tiers and their explicit selection policy.
+///
+/// Authored distance ranges remain the default, while procedural foliage can
+/// instead select the same tiers by per-object projected crown diameter.
+/// Camera changes only affect visual representation, never source identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MeshLods {
     tiers: Vec<MeshLod>,
+    projected_minimum_px: Option<Vec<f32>>,
 }
 
 impl MeshLods {
@@ -510,7 +514,43 @@ impl MeshLods {
                 "invalid ordered mesh LOD ranges",
             ));
         }
-        Ok(Self { tiers })
+        Ok(Self {
+            tiers,
+            projected_minimum_px: None,
+        })
+    }
+
+    /// Select mesh tiers by the projected diameter of each physical tree
+    /// instead of its distance from the original placement anchor.
+    ///
+    /// Thresholds correspond to near-to-far tier order, strictly decrease,
+    /// and the final tier covers [0, next threshold). For instance, 80,24,0
+    /// selects near detail above 80 pixels, clusters from 24–80 pixels and
+    /// sparse cards below 24. Original mesh/impostor crossover still applies
+    /// unless a tier prefers meshes; canopy handoff remains independent.
+    ///
+    /// # Errors
+    /// Rejects non-finite, negative, unordered or missing thresholds and
+    /// ranges not ending in a zero threshold.
+    pub fn with_projected_diameters(mut self, minimum_px: Vec<f32>) -> Result<Self> {
+        if minimum_px.len() != self.tiers.len()
+            || minimum_px.last().is_none_or(|value| *value != 0.0)
+            || minimum_px
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+            || minimum_px.windows(2).any(|pair| pair[0] <= pair[1])
+        {
+            return Err(Error::InvalidConfiguration(
+                "invalid projected-diameter LOD thresholds",
+            ));
+        }
+        self.projected_minimum_px = Some(minimum_px);
+        Ok(self)
+    }
+
+    #[must_use = "Use this metadata to distinguish projected and distance-tier selection"]
+    pub fn projected_diameters(&self) -> Option<&[f32]> {
+        self.projected_minimum_px.as_deref()
     }
 
     #[must_use = "Use the authored tiers when selecting a visual mesh"]
@@ -528,6 +568,13 @@ impl MeshLods {
         self.tiers
             .partition_point(|t| t.start_m * t.start_m <= distance_squared)
             .saturating_sub(1)
+    }
+
+    /// Compare in homogeneous projected-pixel coordinates, as does WGSL.
+    /// No division or quantized distance conversion can move a boundary.
+    fn tier_for_projection(&self, diameter_times_depth: f32, safe_depth: f32) -> Option<usize> {
+        let minimum = self.projected_minimum_px.as_ref()?;
+        Some(minimum.partition_point(|threshold| diameter_times_depth < threshold * safe_depth))
     }
 }
 
@@ -607,9 +654,13 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods
     if !view.explicit_population && projected_crown < view.impostor_threshold_px * safe_depth {
         return VisualLod::TerrainCanopy;
     }
-    let anchor = source_anchor(object, view, pos);
-    let distance_squared = anchor.iter().map(|x| x * x).sum();
-    let tier = mesh_lods.tier_for_distance_squared(distance_squared);
+    let tier = mesh_lods
+        .tier_for_projection(projected_crown, safe_depth)
+        .unwrap_or_else(|| {
+            let anchor = source_anchor(object, view, pos);
+            let distance_squared = anchor.iter().map(|x| x * x).sum();
+            mesh_lods.tier_for_distance_squared(distance_squared)
+        });
     if mesh_lods.tiers[tier].prefer_mesh || projected_crown >= view.mesh_threshold_px * safe_depth {
         VisualLod::Mesh(tier)
     } else {
@@ -837,15 +888,19 @@ impl GpuCompactor {
         let boundaries = mesh_lods
             .tiers
             .iter()
-            .map(|tier| {
+            .enumerate()
+            .map(|(index, tier)| {
                 [
-                    tier.start_m * tier.start_m,
+                    mesh_lods
+                        .projected_minimum_px
+                        .as_ref()
+                        .map_or(tier.start_m * tier.start_m, |px| px[index]),
                     f32::from(u8::from(tier.prefer_mesh)),
                 ]
             })
             .collect::<Vec<_>>();
         let thresholds = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("i-love-proland authored squared mesh LOD boundaries and preferences"),
+            label: Some("i-love-proland selected LOD boundaries and mesh preferences"),
             contents: bytemuck::cast_slice(&boundaries),
             usage: wgpu::BufferUsages::STORAGE,
         });
@@ -1022,7 +1077,7 @@ impl GpuCompactor {
                 view.source_center[0],
                 view.source_center[1],
                 view.source_center[2],
-                0.0,
+                f32::from(u8::from(self.mesh_lods.projected_minimum_px.is_some())),
             ],
             planes: view.planes,
             eye: [view.eye[0], view.eye[1], view.eye[2], 0.0],
@@ -1356,6 +1411,87 @@ mod tests {
                 assert!(stride >= u64::from(capacity) * INDEX_BYTES);
             }
         }
+    }
+
+    #[test]
+    fn projected_lod_thresholds_validate_and_follow_actual_pixel_footprint() {
+        let template = |metres| MeshLod {
+            start_m: metres,
+            index_count: 12,
+            prefer_mesh: true,
+        };
+        let tiers = MeshLods::new(vec![
+            template(0.0),
+            template(45.0),
+            template(110.0),
+            template(245.0),
+        ])
+        .unwrap();
+        for invalid in [
+            vec![],
+            vec![80.0, 24.0, 0.0],
+            vec![80.0, 24.0, 0.0, -1.0],
+            vec![80.0, 24.0, 2.0, 1.0],
+            vec![80.0, 24.0, 24.0, 0.0],
+            vec![80.0, f32::NAN, 8.0, 0.0],
+            vec![80.0, f32::INFINITY, 8.0, 0.0],
+        ] {
+            assert!(tiers.clone().with_projected_diameters(invalid).is_err());
+        }
+        let lods = tiers
+            .with_projected_diameters(vec![100.0, 40.0, 12.0, 0.0])
+            .unwrap();
+        assert_eq!(
+            lods.projected_diameters(),
+            Some(&[100.0, 40.0, 12.0, 0.0][..])
+        );
+        let view = GpuView::unculled(540.0, 8.0, 0.2).unwrap();
+        let source = PackedInstance {
+            position_radius: [0.0, 0.0, 100.0, 2.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            axis_radii: [2.0, 2.0, 2.0, 0.0],
+            object_id: [1; 4],
+            metadata: [2; 4],
+            render_model: [0; 4],
+            handoff_anchor_rank: [0.0; 4],
+            tint: [1.0; 4],
+        };
+        for (metres, radius, expected) in [
+            (20.0, 2.0, 0),
+            (100.0, 10.0, 0),
+            (100.0, 4.0, 1),
+            (100.0, 2.0, 2),
+            (100.0, 0.7, 3),
+        ] {
+            let mut object = source;
+            object.position_radius[2] = metres;
+            object.position_radius[3] = radius;
+            object.axis_radii = [radius, radius, radius, 0.0];
+            assert_eq!(
+                classify_cpu(&object, view, &lods),
+                VisualLod::Mesh(expected)
+            );
+            let triple_zoom = GpuView::unculled(1620.0, 8.0, 0.2).unwrap();
+            if radius == 4.0 {
+                assert_eq!(
+                    classify_cpu(&object, triple_zoom, &lods),
+                    VisualLod::Mesh(0)
+                );
+            }
+        }
+        let only_one = MeshLods::new(vec![template(0.0)])
+            .unwrap()
+            .with_projected_diameters(vec![0.0])
+            .unwrap();
+        assert_eq!(only_one.projected_diameters(), Some(&[0.0][..]));
+        let mut tiny = source;
+        tiny.position_radius[2] = 10_000.0;
+        tiny.position_radius[3] = 0.1;
+        assert_eq!(classify_cpu(&tiny, view, &lods), VisualLod::TerrainCanopy);
+        assert_eq!(
+            classify_cpu(&tiny, view.with_explicit_population(), &lods),
+            VisualLod::Mesh(3)
+        );
     }
 
     #[test]
