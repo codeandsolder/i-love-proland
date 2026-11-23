@@ -998,6 +998,18 @@ fn module_grove_candidates(
     Ok(selected)
 }
 
+fn assert_all_visual_forms_present(visuals: &[PackedInstance], model_count: usize) {
+    let distinct = visuals
+        .iter()
+        .map(|instance| instance.render_model[0])
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        model_count,
+        "all visual forms need forest representation"
+    );
+}
+
 /// Optional full Proland render-pass validation: the exact same GPU compactor
 /// and indirect instance bins drive Lorax-generated module geometry. No
 /// authored Parallax source, canonical placement, or runtime KSP scene changes.
@@ -1034,15 +1046,7 @@ fn capture_module_forest(
         largest_expansion = largest_expansion.max(compiled.culling_expansion);
         if visuals.is_empty() {
             visuals = module_grove_candidates(candidates, &compiled)?;
-            let distinct = visuals
-                .iter()
-                .map(|instance| instance.render_model[0])
-                .collect::<std::collections::BTreeSet<_>>();
-            assert_eq!(
-                distinct.len(),
-                plants.len(),
-                "all visual forms need forest representation"
-            );
+            assert_all_visual_forms_present(&visuals, plants.len());
         }
         let modules = compiled.upload(device)?;
         tier_descriptors.push(MeshLod {
