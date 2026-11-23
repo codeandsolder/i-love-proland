@@ -1034,15 +1034,23 @@ fn assert_all_visual_forms_present(visuals: &[PackedInstance], model_count: usiz
 /// Optional full Proland render-pass validation: the exact same GPU compactor
 /// and indirect instance bins drive Lorax-generated module geometry. No
 /// authored Parallax source, canonical placement, or runtime KSP scene changes.
-fn capture_module_forest(
+struct ModuleForestSmoke {
+    renderer: TreeRenderer,
+    visuals: Vec<PackedInstance>,
+    largest_expansion: f32,
+    bin_counts: Vec<u64>,
+    triangles: u64,
+}
+
+/// Compile all visual tiers of one reproducible source variant family.
+fn build_module_forest(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
     pipelines: &TreePipelines,
     atlas: &AtlasTexture,
     white: &wgpu::TextureView,
     candidates: &[PackedInstance],
-    prefix: &str,
-) -> Result<(), Box<dyn Error>> {
+    view: GpuView,
+) -> Result<ModuleForestSmoke, Box<dyn Error>> {
     let plants = module_source_forms()?;
     let shared_frame = SourceFrame::new([0.0, 6.0, 0.0], 16.0)?;
     let mut visuals = Vec::new();
@@ -1091,16 +1099,40 @@ fn capture_module_forest(
     }
     // Procedural near/mid/far geometry follows the projected crown footprint.
     let lods = MeshLods::new(tier_descriptors)?.with_projected_diameters(vec![80.0, 24.0, 0.0])?;
-    let (camera, view) = pitched_view(0.0)?;
     let (bin_counts, triangles) = module_submission_stats(&visuals, view, &lods)?;
-    let mut renderer = TreeRenderer::new(
+    let renderer = TreeRenderer::new(
         pipelines,
         u32::try_from(candidates.len().min(256))?,
         lods,
         bank_materials,
         atlas,
     )?;
-    renderer.set_camera(queue, camera);
+    Ok(ModuleForestSmoke {
+        renderer,
+        visuals,
+        largest_expansion,
+        bin_counts,
+        triangles,
+    })
+}
+
+fn capture_module_forest(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &TreePipelines,
+    atlas: &AtlasTexture,
+    white: &wgpu::TextureView,
+    candidates: &[PackedInstance],
+    prefix: &str,
+) -> Result<(), Box<dyn Error>> {
+    let (camera, view) = pitched_view(0.0)?;
+    let mut fixture = build_module_forest(device, pipelines, atlas, white, candidates, view)?;
+    fixture.renderer.set_camera(queue, camera);
+    let visuals = &fixture.visuals;
+    let renderer = &mut fixture.renderer;
+    let largest_expansion = fixture.largest_expansion;
+    let bin_counts = &fixture.bin_counts;
+    let triangles = fixture.triangles;
     let targets = make_frame_targets(device);
     let background = background_pipeline(device, "fs_main");
     let render = |renderer: &mut TreeRenderer| -> Result<Vec<u8>, Box<dyn Error>> {
@@ -1110,7 +1142,7 @@ fn capture_module_forest(
         let scene = ForestPass {
             queue,
             renderer,
-            candidates: &visuals,
+            candidates: visuals,
             view,
             color: &targets.color_view,
             depth: &targets.depth_view,
@@ -1121,7 +1153,7 @@ fn capture_module_forest(
     };
     renderer.set_candidates(queue, &[])?;
     let empty = render(&mut renderer)?;
-    renderer.set_candidates(queue, &visuals)?;
+    renderer.set_candidates(queue, visuals)?;
     let image = render(&mut renderer)?;
     let changed = empty
         .as_chunks::<4>()
@@ -1140,7 +1172,7 @@ fn capture_module_forest(
         renderer.set_candidates(queue, &[wrong_model]).is_err(),
         "a render-local module model must never silently differ from the canonical source variant"
     );
-    renderer.set_candidates(queue, &visuals)?;
+    renderer.set_candidates(queue, visuals)?;
     let tri_per_changed_px_milli = triangles
         .checked_mul(1000)
         .ok_or("submitted geometry density overflow")?
