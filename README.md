@@ -313,3 +313,15 @@ assert!(!mesh.indices.is_empty());
 
 The renderer adapter requires the gpu feature, but the plant model and LOD
 tessellation do not.
+
+#### Source-fitted foliage normalization
+
+Lorax's SourceFit supplies the original authored SourceFrame independently from
+the fitted geometry's conservative Bounds. Proland now uses that authored
+frame for all normalized TreeVertex positions and retains the source frame on
+every generated mesh. ProceduralMesh::culling_expansion() reports a separate
+visibility bound for generated geometry (typically slightly larger when fitted
+branch cylinders extend outside the original sphere). Apply that factor to
+culling, NOT to instance scale or tree placement, which must remain exactly
+the same at every LOD. Source-card UVs/materials are retained by Lorax but are
+not yet baked into cluster impostors.
