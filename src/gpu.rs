@@ -41,7 +41,7 @@ pub struct PackedInstance {
     pub axis_radii: [f32; 4],
     pub object_id: [u32; 4],
     pub metadata: [u32; 4],
-    /// Dense render-local module bank selection. Canonical variant_id and layer
+    /// Dense render-local module bank selection. Canonical `variant_id` and layer
     /// stay intact in metadata; this index may be remapped without re-seeding
     /// or changing the persistent object identity.
     pub render_model: [u32; 4],

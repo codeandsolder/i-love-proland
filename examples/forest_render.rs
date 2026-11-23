@@ -1047,19 +1047,34 @@ fn capture_module_forest(
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn parse_forest_input() -> Result<(String, SourceImage, bool), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let prefix = args.next().ok_or(
         "usage: cargo run --features gpu --example forest_render -- /path/to/output-prefix",
     )?;
-    let (vertices, indices) = sample_tree()?;
     let remaining = args.collect::<Vec<_>>();
     let module_smoke = remaining.iter().any(|arg| arg == "--module-smoke");
     let source_args = remaining
         .into_iter()
         .filter(|arg| arg != "--module-smoke")
         .collect::<Vec<_>>();
-    let source = load_source_image(&source_args)?;
+    Ok((prefix, load_source_image(&source_args)?, module_smoke))
+}
+
+fn reference_pipelines(device: &wgpu::Device) -> Result<TreePipelines, Box<dyn Error>> {
+    Ok(TreePipelines::new(
+        &CompactionPipeline::new(device),
+        TreeRenderConfig {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            depth_format: wgpu::TextureFormat::Depth24Plus,
+            sample_count: 1,
+        },
+    )?)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let (prefix, source, module_smoke) = parse_forest_input()?;
+    let (vertices, indices) = sample_tree()?;
     // The synthetic source consists of a 10-sided trunk (20 vertices, 60
     // indices), followed by several UV-mapped crowns. They use different
     // source textures and alpha cutoffs but share one physical tree instance.
@@ -1085,14 +1100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (device, queue) = create_device()?;
     let trunk_mesh = TreeMesh::new(&device, trunk_vertices, trunk_indices)?;
     let leaf_mesh = TreeMesh::new(&device, leaf_vertices, &leaf_indices)?;
-    let pipelines = TreePipelines::new(
-        &CompactionPipeline::new(&device),
-        TreeRenderConfig {
-            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            depth_format: wgpu::TextureFormat::Depth24Plus,
-            sample_count: 1,
-        },
-    )?;
+    let pipelines = reference_pipelines(&device)?;
     let lods = example_lods(trunk_mesh.index_count())?;
     let atlas_texture = atlas.upload(&device, &queue)?;
     let bark_texture = bark.upload(&device, &queue)?;

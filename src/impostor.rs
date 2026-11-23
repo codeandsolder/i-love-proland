@@ -102,9 +102,9 @@ impl TreeMesh {
 /// float4 records contain normalized geometry, and the third is linear RGBA.
 ///
 /// Kind 0 = an inert padding slot, 1 = tapered branch, 2 = canopy.
-/// For branches, origin_radius is (start XYZ, base radius), extent_radius
-/// is (end XYZ, tip radius). For canopy, origin_radius is (center XYZ, half
-/// width X), extent_radius is (half height Y, half depth Z, 0, 0).
+/// For branches, `origin_radius` is (start XYZ, base radius), `extent_radius`
+/// is (end XYZ, tip radius). For canopy, `origin_radius` is (center XYZ, half
+/// width X), `extent_radius` is (half height Y, half depth Z, 0, 0).
 /// Metadata contains kind, immutable source component ID, original card count
 /// for canopy, and one reserved zero word. GPU reads the complete value; all
 /// records occupy 64 bytes even when different variants have varying lengths.
@@ -118,8 +118,9 @@ pub struct GpuModule {
 }
 
 /// Resident, padded collection of physical source variants at one mesh LOD.
-/// All instances reference stable local variant slots in PackedInstance's
-/// render_model field; source instance variant and object IDs are independent.
+///
+/// All instances reference stable local variant slots in `PackedInstance`'s
+/// `render_model` field; source variant and object IDs are independent.
 #[derive(Clone)]
 pub struct TreeModules {
     buffer: wgpu::Buffer,
@@ -161,7 +162,7 @@ impl TreeModules {
                 .any(|(i, id)| variant_ids[..i].contains(id))
             || modules_per_variant == 0
             || usize::try_from(size).ok() != Some(data.len())
-            || bytes > u64::from(limits.max_storage_buffer_binding_size)
+            || bytes > limits.max_storage_buffer_binding_size
             || bytes > limits.max_buffer_size
             || indices == 0
             || data.iter().any(|m| {
@@ -172,9 +173,11 @@ impl TreeModules {
                     || !TreeVertex::valid_color(m.color)
                     || match m.metadata[0] {
                         0 => {
-                            m.origin_radius != [0.0; 4]
-                                || m.extent_radius != [0.0; 4]
-                                || m.color != [0.0; 4]
+                            m.origin_radius
+                                .iter()
+                                .chain(m.extent_radius.iter())
+                                .chain(m.color.iter())
+                                .any(|v| v.to_bits() != 0)
                                 || m.metadata != [0; 4]
                         }
                         1 => m.origin_radius[3] <= 0.0 || m.extent_radius[3] <= 0.0,
@@ -892,25 +895,22 @@ fn new_uniform(device: &wgpu::Device) -> wgpu::Buffer {
 }
 
 fn build_mesh_draw(
-    device: &wgpu::Device,
+    pipelines: &TreePipelines,
     tier: (usize, &CompactedBin<'_>),
     source: TreeMaterial<'_>,
-    layout: &wgpu::BindGroupLayout,
     atlas: &AtlasTexture,
-    atlas_sampler: &wgpu::Sampler,
-    source_sampler: &wgpu::Sampler,
-    module_layout: &wgpu::BindGroupLayout,
 ) -> MeshDraw {
+    let device = pipelines.device();
     let uniforms = new_uniform(device);
     let bind = make_draw_bind(
         device,
-        layout,
+        &pipelines.material_layout,
         &uniforms,
         &MaterialBindings {
             atlas,
-            atlas_sampler,
+            atlas_sampler: &pipelines.atlas_sampler,
             source_view: source.source_view,
-            source_sampler,
+            source_sampler: &pipelines.source_sampler,
             wind_view: source
                 .wind
                 .as_ref()
@@ -922,7 +922,7 @@ fn build_mesh_draw(
         TreeGeometry::Modules(modules) => {
             Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("i-love-proland compact module vertices and stride"),
-                layout: module_layout,
+                layout: &pipelines.module_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1012,14 +1012,20 @@ impl TreePipelines {
         let instance_layout = instance_layout(device);
         let module_layout = module_layout(device);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("i-love-proland tree render pipeline layout"),
-            bind_group_layouts: &[
-                Some(&material_layout),
-                Some(&instance_layout),
-                Some(&module_layout),
-            ],
+            label: Some("i-love-proland standard tree and impostor layout"),
+            bind_group_layouts: &[Some(&material_layout), Some(&instance_layout)],
             immediate_size: 0,
         });
+        let module_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("i-love-proland source module expansion layout"),
+                bind_group_layouts: &[
+                    Some(&material_layout),
+                    Some(&instance_layout),
+                    Some(&module_layout),
+                ],
+                immediate_size: 0,
+            });
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: core::mem::size_of::<TreeVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -1035,7 +1041,7 @@ impl TreePipelines {
         );
         let modules = render_pipeline(
             device,
-            &pipeline_layout,
+            &module_pipeline_layout,
             &shader,
             PassKind::Module,
             &[],
@@ -1171,18 +1177,11 @@ impl TreeRenderer {
             let bin = compactor
                 .bin(tier)
                 .ok_or(Error::InvalidConfiguration("missing mesh LOD bin"))?;
-            mesh_draws.extend(materials.into_iter().map(|source| {
-                build_mesh_draw(
-                    device,
-                    (tier, &bin),
-                    source,
-                    &pipelines.material_layout,
-                    atlas,
-                    &pipelines.atlas_sampler,
-                    &pipelines.source_sampler,
-                    &pipelines.module_layout,
-                )
-            }));
+            mesh_draws.extend(
+                materials
+                    .into_iter()
+                    .map(|source| build_mesh_draw(pipelines, (tier, &bin), source, atlas)),
+            );
         }
         let impostor_uniforms = new_uniform(device);
         let impostor_bind = make_draw_bind(
