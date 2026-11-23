@@ -1147,6 +1147,7 @@ fn compare_impostor_visual_forms(
     visuals: &[PackedInstance],
     view: GpuView,
     render: &impl Fn(&mut TreeRenderer) -> Result<Vec<u8>, Box<dyn Error>>,
+    prefix: &str,
 ) -> Result<usize, Box<dyn Error>> {
     let impostor_candidates = visuals
         .iter()
@@ -1175,6 +1176,18 @@ fn compare_impostor_visual_forms(
     let image_zero = render(renderer)?;
     renderer.set_candidates(queue, &seed_one)?;
     let image_one = render(renderer)?;
+    write_ppm(
+        &format!("{prefix}-impostor-seed0.ppm"),
+        WIDTH,
+        HEIGHT,
+        &image_zero,
+    )?;
+    write_ppm(
+        &format!("{prefix}-impostor-seed1.ppm"),
+        WIDTH,
+        HEIGHT,
+        &image_one,
+    )?;
     let different_form_pixels = image_zero
         .as_chunks::<4>()
         .0
@@ -1230,7 +1243,7 @@ fn capture_module_forest(
     renderer.set_candidates(queue, visuals)?;
     let image = render(renderer)?;
     let different_form_pixels =
-        compare_impostor_visual_forms(queue, renderer, visuals, view, &render)?;
+        compare_impostor_visual_forms(queue, renderer, visuals, view, &render, prefix)?;
     let changed = empty
         .as_chunks::<4>()
         .0
