@@ -193,7 +193,10 @@ fn create_device() -> Result<(wgpu::Device, wgpu::Queue), Box<dyn Error>> {
     ))?)
 }
 
-fn pitched_view(pitch: f32) -> Result<(TreeCamera, GpuView), Box<dyn Error>> {
+fn pitched_view(
+    pitch: f32,
+    mesh_threshold_px: f32,
+) -> Result<(TreeCamera, GpuView), Box<dyn Error>> {
     // Camera aims along +Z when pitch=0, directly downward at pitch=PI/2.
     // The world-up vector stays +Y for both mesh orientation and atlas lookup.
     let (sin_pitch, cos_pitch) = pitch.sin_cos();
@@ -214,7 +217,7 @@ fn pitched_view(pitch: f32) -> Result<(TreeCamera, GpuView), Box<dyn Error>> {
     let ny = 2.0_f32.sqrt();
     let view = GpuView::new(
         360.0,
-        30.0,
+        mesh_threshold_px,
         3.5,
         [0.0, -sin_pitch, cos_pitch],
         [
@@ -516,7 +519,7 @@ fn render_overhead(
     prefix: &str,
 ) -> Result<(), Box<dyn Error>> {
     // Same resident canonical objects, with the eye moved 480m upward.
-    let (overhead_camera, overhead_view) = pitched_view(core::f32::consts::FRAC_PI_2)?;
+    let (overhead_camera, overhead_view) = pitched_view(core::f32::consts::FRAC_PI_2, 30.0)?;
     let eye = [0.0, 480.0, 0.0];
     let overhead_camera = overhead_camera.with_eye(eye)?;
     let overhead_view = overhead_view.with_eye(eye)?;
@@ -624,7 +627,7 @@ fn validate_source_billboards(
         handoff_anchor_rank: [0.0; 4],
         tint: [1.0; 4],
     }];
-    let (camera, view) = pitched_view(0.0)?;
+    let (camera, view) = pitched_view(0.0, 30.0)?;
     let render = |billboard| -> Result<usize, Box<dyn Error>> {
         let lods = MeshLods::new(vec![MeshLod {
             start_m: 0.0,
@@ -1002,21 +1005,26 @@ fn module_submission_stats(
     objects: &[PackedInstance],
     view: GpuView,
     lods: &MeshLods,
-) -> Result<(Vec<u64>, u64), Box<dyn Error>> {
+) -> Result<(Vec<u64>, u64, u64), Box<dyn Error>> {
     let mut counts = vec![0_u64; lods.tiers().len()];
+    let mut impostors = 0_u64;
     for object in objects {
-        if let VisualLod::Mesh(tier) = classify_cpu(object, view, lods) {
-            counts[tier] = counts[tier].checked_add(1).ok_or("module bin overflow")?;
+        match classify_cpu(object, view, lods) {
+            VisualLod::Mesh(tier) => {
+                counts[tier] = counts[tier].checked_add(1).ok_or("module bin overflow")?;
+            }
+            VisualLod::Impostor => impostors += 1,
+            VisualLod::TerrainCanopy | VisualLod::OutsideFrustum => {}
         }
     }
     let tris = counts
         .iter()
         .zip(lods.tiers())
-        .try_fold(0_u64, |sum, (&count, tier)| {
+        .try_fold(impostors * 2, |sum, (&count, tier)| {
             sum.checked_add(count * u64::from(tier.index_count / 3))
                 .ok_or("submitted triangle count overflow")
         })?;
-    Ok((counts, tris))
+    Ok((counts, impostors, tris))
 }
 
 fn assert_all_visual_forms_present(visuals: &[PackedInstance], model_count: usize) {
@@ -1094,7 +1102,7 @@ fn build_module_forest(
         tier_descriptors.push(MeshLod {
             start_m,
             index_count: modules.index_count(),
-            prefer_mesh: true,
+            prefer_mesh: budget != 1,
         });
         bank_materials.push(vec![TreeMaterial {
             geometry: TreeGeometry::Modules(modules),
@@ -1106,7 +1114,7 @@ fn build_module_forest(
     }
     // Procedural near/mid/far geometry follows the projected crown footprint.
     let lods = MeshLods::new(tier_descriptors)?.with_projected_diameters(vec![80.0, 24.0, 0.0])?;
-    let (bin_counts, triangles) = module_submission_stats(&visuals, view, &lods)?;
+    let (bin_counts, impostors, triangles) = module_submission_stats(&visuals, view, &lods)?;
     let atlas_images = atlas_images.ok_or("missing procedural impostor atlas forms")?;
     let variant_atlases = atlas_images
         .iter()
@@ -1127,7 +1135,57 @@ fn build_module_forest(
         largest_expansion,
         bin_counts,
         triangles,
+        impostors,
     })
+}
+
+fn compare_impostor_visual_forms(
+    queue: &wgpu::Queue,
+    renderer: &mut TreeRenderer,
+    visuals: &[PackedInstance],
+    view: GpuView,
+    render: &impl Fn(&mut TreeRenderer) -> Result<Vec<u8>, Box<dyn Error>>,
+) -> Result<usize, Box<dyn Error>> {
+    let impostor_candidates = visuals
+        .iter()
+        .filter(|object| {
+            matches!(
+                classify_cpu(object, view, renderer.compactor().mesh_lods()),
+                VisualLod::Impostor
+            )
+        })
+        .take(1024)
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(
+        !impostor_candidates.is_empty(),
+        "expected real impostor bin members"
+    );
+    let seed_zero = impostor_candidates
+        .iter()
+        .map(|object| object.with_render_model(0))
+        .collect::<Vec<_>>();
+    let seed_one = impostor_candidates
+        .iter()
+        .map(|object| object.with_render_model(1))
+        .collect::<Vec<_>>();
+    renderer.set_candidates(queue, &seed_zero)?;
+    let image_zero = render(renderer)?;
+    renderer.set_candidates(queue, &seed_one)?;
+    let image_one = render(renderer)?;
+    let different_form_pixels = image_zero
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(image_one.as_chunks::<4>().0)
+        .filter(|(a, b)| a[..3] != b[..3])
+        .count();
+    assert!(
+        different_form_pixels > 0,
+        "per-form impostor atlas must change the image when seeded model changes"
+    );
+    renderer.set_candidates(queue, visuals)?;
+    Ok(different_form_pixels)
 }
 
 fn capture_module_forest(
@@ -1138,7 +1196,7 @@ fn capture_module_forest(
     candidates: &[PackedInstance],
     prefix: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let (camera, view) = pitched_view(0.0)?;
+    let (camera, view) = pitched_view(0.0, 8.0)?;
     let mut fixture = build_module_forest(device, pipelines, queue, white, candidates, view)?;
     fixture.renderer.set_camera(queue, camera);
     let visuals = &fixture.visuals;
@@ -1146,6 +1204,7 @@ fn capture_module_forest(
     let largest_expansion = fixture.largest_expansion;
     let bin_counts = &fixture.bin_counts;
     let triangles = fixture.triangles;
+    let impostors = fixture.impostors;
     let targets = make_frame_targets(device);
     let background = background_pipeline(device, "fs_main");
     let render = |renderer: &mut TreeRenderer| -> Result<Vec<u8>, Box<dyn Error>> {
@@ -1168,6 +1227,8 @@ fn capture_module_forest(
     let empty = render(renderer)?;
     renderer.set_candidates(queue, visuals)?;
     let image = render(renderer)?;
+    let different_form_pixels =
+        compare_impostor_visual_forms(queue, renderer, visuals, view, &render)?;
     let changed = empty
         .as_chunks::<4>()
         .0
@@ -1191,7 +1252,7 @@ fn capture_module_forest(
         .ok_or("submitted geometry density overflow")?
         / u64::try_from(changed)?;
     println!(
-        "FOREST_MODULE_PASS changed_pixels={changed} resident={} module_tiers=3 screen_thresholds_px=80,24,0 bins={bin_counts:?} submitted_tris={triangles} tri_per_changed_px_milli={tri_per_changed_px_milli} cull_expansion={largest_expansion:.5} image={prefix}-modules.ppm",
+        "FOREST_MODULE_PASS changed_pixels={changed} resident={} module_tiers=3 screen_thresholds_px=80,24,0 bins={bin_counts:?} impostors={impostors} variant_impostor_changed_px={different_form_pixels} submitted_tris={triangles} tri_per_changed_px_milli={tri_per_changed_px_milli} cull_expansion={largest_expansion:.5} image={prefix}-modules.ppm",
         candidates.len(),
     );
     Ok(())
@@ -1269,7 +1330,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             wind: wind_texture.view(),
         },
     )?;
-    let (low_camera, view) = pitched_view(0.0)?;
+    let (low_camera, view) = pitched_view(0.0, 30.0)?;
     renderer.set_camera(&queue, low_camera);
     let targets = make_frame_targets(&device);
     let color = &targets.color;

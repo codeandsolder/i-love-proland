@@ -1,4 +1,4 @@
-//! Raster-exact angular atlas generation from the compact GPU module bank.
+//! Source-geometry-consistent angular atlas generation from the compact GPU module bank.
 //!
 //! Use the same tapered branch quads, source-ID-oriented canopy cards, source
 //! texture and radial cutout as the module vertex/fragment shaders. Every
@@ -13,7 +13,7 @@ use crate::{
     procedural::CompiledModuleBank,
 };
 
-fn module_hash(mut value: u32) -> u32 {
+const fn module_hash(mut value: u32) -> u32 {
     value = (value ^ (value >> 16)).wrapping_mul(0x7feb_352d);
     value = (value ^ (value >> 15)).wrapping_mul(0x846c_a68b);
     value ^ (value >> 16)
@@ -39,7 +39,7 @@ fn unit(vector: [f32; 3]) -> Result<[f32; 3]> {
 }
 
 /// Build exactly the four source-space corners of one GPU module card.
-fn quad(module: &GpuModule, side: u32) -> Result<[TreeVertex; 4]> {
+fn quad(module: &GpuModule, side: u8) -> Result<[TreeVertex; 4]> {
     let color = module.color;
     let positions = match module.metadata[0] {
         1 => {
@@ -58,26 +58,45 @@ fn quad(module: &GpuModule, side: u32) -> Result<[TreeVertex; 4]> {
                 cross(tangent, normal_a)
             };
             [
-                std::array::from_fn(|i| start[i] - normal[i] * start[3]),
-                std::array::from_fn(|i| start[i] + normal[i] * start[3]),
-                std::array::from_fn(|i| end[i] - normal[i] * end[3]),
-                std::array::from_fn(|i| end[i] + normal[i] * end[3]),
+                std::array::from_fn(|i| normal[i].mul_add(-start[3], start[i])),
+                std::array::from_fn(|i| normal[i].mul_add(start[3], start[i])),
+                std::array::from_fn(|i| normal[i].mul_add(-end[3], end[i])),
+                std::array::from_fn(|i| normal[i].mul_add(end[3], end[i])),
             ]
         }
         2 => {
-            let theta = (module_hash(module.metadata[1]) & 65535) as f32
-                * (core::f32::consts::TAU / 65536.0)
-                + side as f32 * core::f32::consts::FRAC_PI_2;
+            let azimuth_bits = u16::try_from(module_hash(module.metadata[1]) & 65535)
+                .map_err(|_| Error::IndexOverflow)?;
+            let theta = f32::from(side).mul_add(
+                core::f32::consts::FRAC_PI_2,
+                f32::from(azimuth_bits) * (core::f32::consts::TAU / 65536.0),
+            );
             let (sin, cos) = theta.sin_cos();
             let x = module.origin_radius[3];
             let y = module.extent_radius[0];
             let z = module.extent_radius[1];
             let center = &module.origin_radius;
             [
-                [center[0] - cos * x, center[1] - y, center[2] - sin * z],
-                [center[0] + cos * x, center[1] - y, center[2] + sin * z],
-                [center[0] - cos * x, center[1] + y, center[2] - sin * z],
-                [center[0] + cos * x, center[1] + y, center[2] + sin * z],
+                [
+                    cos.mul_add(-x, center[0]),
+                    center[1] - y,
+                    sin.mul_add(-z, center[2]),
+                ],
+                [
+                    cos.mul_add(x, center[0]),
+                    center[1] - y,
+                    sin.mul_add(z, center[2]),
+                ],
+                [
+                    cos.mul_add(-x, center[0]),
+                    center[1] + y,
+                    sin.mul_add(-z, center[2]),
+                ],
+                [
+                    cos.mul_add(x, center[0]),
+                    center[1] + y,
+                    sin.mul_add(z, center[2]),
+                ],
             ]
         }
         _ => {
@@ -122,19 +141,22 @@ impl QuadMesh {
 }
 
 fn masked_canopy_texture(source: &SourceImage, tile_size: u32) -> Result<SourceImage> {
-    let size = tile_size.max(128);
+    let size = u16::try_from(tile_size.max(128)).map_err(|_| Error::IndexOverflow)?;
     let texels = source.linear_texels();
-    let capacity =
-        usize::try_from(u64::from(size) * u64::from(size) * 4).map_err(|_| Error::IndexOverflow)?;
+    let capacity = usize::from(size)
+        .checked_mul(usize::from(size))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(Error::IndexOverflow)?;
     let mut bytes = Vec::with_capacity(capacity);
+    let inverse = f32::from(size).recip();
     for y in 0..size {
         for x in 0..size {
             let uv = [
-                (x as f32 + 0.5) / size as f32,
-                (y as f32 + 0.5) / size as f32,
+                (f32::from(x) + 0.5) * inverse,
+                (f32::from(y) + 0.5) * inverse,
             ];
             let texel = source.sample(&texels, uv);
-            let distance = (2.0 * uv[0] - 1.0).hypot(2.0 * uv[1] - 1.0);
+            let distance = (2.0_f32.mul_add(uv[0], -1.0)).hypot(2.0_f32.mul_add(uv[1], -1.0));
             let shape = ((1.025 - distance) / 0.05).clamp(0.0, 1.0);
             bytes.extend_from_slice(&[
                 to_byte(linear_to_srgb(texel[0])),
@@ -144,13 +166,13 @@ fn masked_canopy_texture(source: &SourceImage, tile_size: u32) -> Result<SourceI
             ]);
         }
     }
-    SourceImage::new(size, size, bytes)
+    SourceImage::new(u32::from(size), u32::from(size), bytes)
 }
 
 impl CompiledModuleBank {
     /// Bake a 32-angle impostor per dense visual model, including the same
     /// source-index-dependent card orientation as the GPU module shader.
-    /// The output is in precisely the same order as self.variant_ids.
+    /// The output has the same order as the original dense visual-model catalog.
     ///
     /// For an exact match, use the same source image for GPU module materials;
     /// the baker adds the module canopy's radial alpha envelope while keeping
@@ -166,6 +188,14 @@ impl CompiledModuleBank {
         tile_size: u32,
         gutter: u32,
     ) -> Result<Vec<AtlasImage>> {
+        if !(8..=512).contains(&tile_size)
+            || gutter == 0
+            || u64::from(gutter) * 4 >= u64::from(tile_size)
+        {
+            return Err(Error::InvalidConfiguration(
+                "invalid procedural atlas dimensions",
+            ));
+        }
         let mask = masked_canopy_texture(source, tile_size)?;
         let stride = usize::try_from(self.modules_per_variant).map_err(|_| Error::IndexOverflow)?;
         if self.variant_ids.is_empty()
@@ -188,7 +218,7 @@ impl CompiledModuleBank {
                         2 => &mut leaves,
                         _ => return Err(Error::InvalidConfiguration("invalid module kind")),
                     };
-                    for side in [0, 1] {
+                    for side in [0_u8, 1] {
                         dest.push(quad(module, side)?)?;
                     }
                 }
