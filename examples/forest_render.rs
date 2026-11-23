@@ -1063,7 +1063,7 @@ fn build_module_forest(
     let plants = module_source_forms()?;
     let shared_frame = SourceFrame::new([0.0, 6.0, 0.0], 16.0)?;
     let mut visuals = Vec::new();
-    let mut atlas_images: Option<Vec<AtlasImage>> = None;
+    let mut variant_atlas = None;
     // For crowns below 24px use one source canopy aggregate and its root
     // stem (eight submitted triangles) instead of eight leaf clusters.
     let lod_requests = [
@@ -1096,7 +1096,13 @@ fn build_module_forest(
         // Only the lowest source geometry tier borders the impostor regime.
         // Bake its 32 view angles once per visual seed, not for every tier.
         if budget == 1 {
-            atlas_images = Some(compiled.bake_variant_atlases(&SourceImage::white(), 64, 2)?);
+            variant_atlas = Some(compiled.upload_variant_atlases(
+                device,
+                queue,
+                &SourceImage::white(),
+                64,
+                2,
+            )?);
         }
         let modules = compiled.upload(device)?;
         tier_descriptors.push(MeshLod {
@@ -1115,12 +1121,7 @@ fn build_module_forest(
     // Procedural near/mid/far geometry follows the projected crown footprint.
     let lods = MeshLods::new(tier_descriptors)?.with_projected_diameters(vec![80.0, 24.0, 0.0])?;
     let (bin_counts, impostors, triangles) = module_submission_stats(&visuals, view, &lods)?;
-    let atlas_images = atlas_images.ok_or("missing procedural impostor atlas forms")?;
-    let variant_atlases = atlas_images
-        .iter()
-        .map(|image| (900_u64, image))
-        .collect::<Vec<_>>();
-    let variant_atlas = AtlasImage::upload_variants(device, queue, &variant_atlases)?;
+    let variant_atlas = variant_atlas.ok_or("missing procedural impostor atlas forms")?;
     let renderer = TreeRenderer::new(
         pipelines,
         u32::try_from(candidates.len().min(256))?,

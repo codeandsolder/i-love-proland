@@ -8,7 +8,7 @@
 use crate::{
     Error, Result,
     atlas_bake::{BakeSurface, bake_scene, to_byte},
-    impostor::{AtlasImage, GpuModule, TreeVertex},
+    impostor::{AtlasImage, AtlasTexture, GpuModule, TreeVertex},
     material::{SourceImage, linear_to_srgb},
     procedural::CompiledModuleBank,
 };
@@ -182,6 +182,30 @@ impl CompiledModuleBank {
     /// # Errors
     /// Rejects geometry outside the common frame, invalid module geometry,
     /// inconsistent variant strides, and invalid angular atlas parameters.
+    /// Bake and upload the complete per-seed atlas in the exact canonical
+    /// catalog order owned by this module bank. The caller cannot swap the
+    /// images of repeated canonical IDs when using this entry point.
+    ///
+    /// # Errors
+    /// Propagates invalid geometry and device texture-array limitations.
+    pub fn upload_variant_atlases(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &SourceImage,
+        tile_size: u32,
+        gutter: u32,
+    ) -> Result<AtlasTexture> {
+        let images = self.bake_variant_atlases(source, tile_size, gutter)?;
+        let catalog = self
+            .variant_ids
+            .iter()
+            .copied()
+            .zip(&images)
+            .collect::<Vec<_>>();
+        AtlasImage::upload_variants(device, queue, &catalog)
+    }
+
     pub fn bake_variant_atlases(
         &self,
         source: &SourceImage,
