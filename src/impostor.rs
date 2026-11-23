@@ -119,8 +119,9 @@ pub struct GpuModule {
 
 /// Resident, padded collection of physical source variants at one mesh LOD.
 ///
-/// All instances reference stable local variant slots in `PackedInstance`'s
-/// `render_model` field; source variant and object IDs are independent.
+/// Multiple visual seed variants may share the same persistent source variant
+/// ID. The selected dense slot in `PackedInstance::render_model` must map
+/// back to its source ID; the object's original ID and placement never change.
 #[derive(Clone)]
 pub struct TreeModules {
     buffer: wgpu::Buffer,
@@ -156,10 +157,6 @@ impl TreeModules {
             .ok_or(Error::IndexOverflow)?;
         let limits = device.limits();
         if variants == 0
-            || variant_ids
-                .iter()
-                .enumerate()
-                .any(|(i, id)| variant_ids[..i].contains(id))
             || modules_per_variant == 0
             || usize::try_from(size).ok() != Some(data.len())
             || bytes > limits.max_storage_buffer_binding_size

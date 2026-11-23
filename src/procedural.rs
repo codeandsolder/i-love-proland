@@ -228,12 +228,33 @@ pub struct CompiledModuleBank {
 }
 
 impl CompiledModuleBank {
-    #[must_use = "Look up a canonical variant ID before writing the GPU render slot"]
-    pub fn model_slot(&self, canonical_variant: u64) -> Option<u32> {
+    /// Deterministically pick one of many visual forms belonging to this
+    /// persistent source variant. The caller supplies a stable tree/biome seed,
+    /// never a camera-dependent or frame-dependent key.
+    ///
+    /// A source catalog may contain repeated IDs because different
+    /// procedural seeds can represent the same logical source asset.
+    #[must_use = "Use this local GPU slot without changing the persistent source ID"]
+    pub fn model_slot_for_seed(&self, canonical_variant: u64, variation_seed: u64) -> Option<u32> {
+        let forms = self
+            .variant_ids
+            .iter()
+            .filter(|&&id| id == canonical_variant)
+            .count();
+        if forms == 0 {
+            return None;
+        }
+        let mut hash = variation_seed ^ 0x9e37_79b9_7f4a_7c15;
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        let chosen = usize::try_from(hash % u64::try_from(forms).ok()?).ok()?;
         self.variant_ids
             .iter()
-            .position(|&id| id == canonical_variant)
-            .and_then(|index| u32::try_from(index).ok())
+            .enumerate()
+            .filter(|(_, id)| **id == canonical_variant)
+            .nth(chosen)
+            .and_then(|(index, _)| u32::try_from(index).ok())
     }
 
     /// Upload the validated CPU module bank without regenerating triangles.
@@ -363,15 +384,16 @@ fn module_radius(
 
 /// Normalize and pad arbitrary Lorax source variants into one GPU module bank.
 ///
-/// Source model IDs may be any distinct u64 values; the caller maps those
-/// values onto explicit dense render slots without losing canonical metadata.
+/// Source IDs may repeat: one canonical species/asset variant may have many
+/// different seed-generated visual forms, all preserving source identity.
+/// Select the dense GPU slot using a stable seed independent from the camera.
 /// Padding is inert, allowing species with different counts of branches and
 /// foliage to share an indirect draw. Every module retains original source
 /// indices so source-textured cluster atlases can be produced separately.
 ///
 /// # Errors
-/// Rejects missing or repeated model IDs, degenerate source frames, non-finite
-/// transformed extents, or module/index overflow.
+/// Rejects missing models, degenerate source frames, non-finite transformed
+/// extents, or module/index overflow.
 pub fn compile_modules(
     variants: &[(u64, lorax_rs::ModuleTier)],
     shared_frame: SourceFrame,
@@ -402,11 +424,7 @@ pub fn compile_modules(
     data.try_reserve(total)
         .map_err(|_| FoliageError::TooLarge)?;
     let mut largest_radius = frame.radius;
-    let mut unique = std::collections::BTreeSet::new();
     for (id, tier) in variants {
-        if !unique.insert(*id) {
-            return Err(FoliageError::Invalid("duplicate source variant"));
-        }
         ids.push(*id);
         largest_radius = largest_radius.max(module_radius(tier, frame)?);
         for module in &tier.modules {
@@ -465,10 +483,10 @@ mod module_tests {
         })
         .collect::<std::result::Result<Vec<_>, FoliageError>>()?;
         let bank = compile_modules(&variants, frame)?;
-        assert_eq!(bank.model_slot(0xdead_beef), Some(0));
-        assert_eq!(bank.model_slot(2), Some(1));
-        assert_eq!(bank.model_slot(99999), Some(2));
-        assert_eq!(bank.model_slot(0), None);
+        assert_eq!(bank.model_slot_for_seed(0xdead_beef, 12), Some(0));
+        assert_eq!(bank.model_slot_for_seed(2, 12), Some(1));
+        assert_eq!(bank.model_slot_for_seed(99999, 12), Some(2));
+        assert_eq!(bank.model_slot_for_seed(0, 12), None);
         assert_eq!(
             bank.data.len(),
             usize::try_from(bank.modules_per_variant)? * variants.len()
@@ -489,14 +507,58 @@ mod module_tests {
     }
 
     #[test]
-    fn duplicate_and_missing_models_rejected() -> std::result::Result<(), Box<dyn std::error::Error>>
-    {
+    fn canonical_source_id_can_have_many_distinct_visual_seed_forms()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let species = Species::default();
+        let mut variants = Vec::new();
+        for seed in 3..11_u64 {
+            let plant = Plant::generate(&species, seed)?;
+            variants.push((
+                900,
+                plant.module_tier(
+                    ScreenLod::new(96.0, 0.75, 0.01)?.with_cluster_budget(24)?,
+                    species.wood_color,
+                )?,
+            ));
+        }
+        let shared_frame = SourceFrame::new([0.0, 4.0, 0.0], 15.0)?;
+        let bank = compile_modules(&variants, shared_frame)?;
+        assert_eq!(bank.variant_ids, vec![900; 8]);
+        let slots = (0..300_u64)
+            .map(|seed| bank.model_slot_for_seed(900, seed))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slots,
+            (0..300_u64)
+                .map(|seed| bank.model_slot_for_seed(900, seed))
+                .collect::<Vec<_>>()
+        );
+        assert!(slots.iter().all(|slot| slot.is_some_and(|index| index < 8)));
+        assert!(slots.windows(2).any(|pair| pair[0] != pair[1]));
+        assert_eq!(bank.model_slot_for_seed(901, 5), None);
+        let stride = usize::try_from(bank.modules_per_variant)?;
+        assert_ne!(bank.data[0..stride], bank.data[stride..2 * stride]);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_models_and_invalid_frame_rejected()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let species = Species::default();
         let plant = Plant::generate(&species, 5)?;
         let tier = plant.module_tier(ScreenLod::new(40.0, 0.5, 12.0)?, species.wood_color)?;
         let frame = tier.source_frame;
         assert!(compile_modules(&[], frame).is_err());
-        assert!(compile_modules(&[(12, tier.clone()), (12, tier)], frame).is_err());
+        let bank = compile_modules(&[(12, tier.clone()), (12, tier)], frame)?;
+        assert_eq!(bank.variant_ids, vec![12, 12]);
+        for seed in 0..100 {
+            assert!(matches!(bank.model_slot_for_seed(12, seed), Some(0 | 1)));
+            assert_eq!(
+                bank.model_slot_for_seed(12, seed),
+                bank.model_slot_for_seed(12, seed)
+            );
+        }
+        assert_eq!(bank.model_slot_for_seed(13, 0), None);
         assert!(
             compile_modules(
                 &[(

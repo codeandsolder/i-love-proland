@@ -949,6 +949,67 @@ fn bake_reference_atlas(
     Ok((atlas, atlas_ms))
 }
 
+fn module_source_forms() -> Result<Vec<Plant>, Box<dyn Error>> {
+    let broadleaf = Species::default();
+    let mut conifer = broadleaf;
+    conifer.height *= 1.7;
+    conifer.crown_radius *= 0.55;
+    conifer.levels = 2;
+    let mut shrub = broadleaf;
+    shrub.height *= 0.48;
+    shrub.crown_radius *= 1.2;
+    let variants = [(broadleaf, 900), (conifer, 901), (shrub, 902)];
+    variants
+        .into_iter()
+        .map(|(species, seed)| Ok(Plant::generate(&species, seed)?))
+        .collect()
+}
+
+/// Spatially coherent *visual* groves are chosen by coarse world cells.
+/// Stable source variant ID 900 and 128-bit world IDs remain untouched.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the finite reference forest is explicitly bounded to a safe signed-coordinate range"
+)]
+fn module_grove_candidates(
+    candidates: &[PackedInstance],
+    bank: &i_love_proland::procedural::CompiledModuleBank,
+) -> Result<Vec<PackedInstance>, Box<dyn Error>> {
+    let mut selected = Vec::with_capacity(candidates.len());
+    for object in candidates {
+        let [x, _, z, radius] = object.position_radius;
+        if !x.is_finite()
+            || !z.is_finite()
+            || radius <= 0.0
+            || x.abs() > 1_000_000.0
+            || z.abs() > 1_000_000.0
+        {
+            return Err("invalid reference grove source coordinates".into());
+        }
+        let cell_x = (x / 65.0).floor() as i32;
+        let cell_z = (z / 65.0).floor() as i32;
+        let grove_seed = u64::from(cell_x.cast_unsigned()).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from(cell_z.cast_unsigned()).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let slot = bank
+            .model_slot_for_seed(object.variant_id(), grove_seed)
+            .ok_or("missing visual source variant slot")?;
+        selected.push(object.with_render_model(slot));
+    }
+    Ok(selected)
+}
+
+fn assert_all_visual_forms_present(visuals: &[PackedInstance], model_count: usize) {
+    let distinct = visuals
+        .iter()
+        .map(|instance| instance.render_model[0])
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        model_count,
+        "all visual forms need forest representation"
+    );
+}
+
 /// Optional full Proland render-pass validation: the exact same GPU compactor
 /// and indirect instance bins drive Lorax-generated module geometry. No
 /// authored Parallax source, canonical placement, or runtime KSP scene changes.
@@ -961,20 +1022,32 @@ fn capture_module_forest(
     candidates: &[PackedInstance],
     prefix: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let species = Species::default();
-    let plant = Plant::generate(&species, 900)?;
+    let plants = module_source_forms()?;
     let shared_frame = SourceFrame::new([0.0, 6.0, 0.0], 16.0)?;
+    let mut visuals = Vec::new();
     let lod_requests = [(0.0, 256.0, 64), (45.0, 96.0, 24), (110.0, 32.0, 8)];
     let mut bank_materials = Vec::new();
     let mut tier_descriptors = Vec::new();
     let mut largest_expansion = 1.0_f32;
     for (start_m, projected, budget) in lod_requests {
-        let tier = plant.module_tier(
-            ScreenLod::new(projected, 0.75, 0.01)?.with_cluster_budget(budget)?,
-            species.wood_color,
-        )?;
-        let compiled = compile_modules(&[(900_u64, tier)], shared_frame)?;
+        let model_tiers = plants
+            .iter()
+            .map(|plant| {
+                Ok((
+                    900_u64,
+                    plant.module_tier(
+                        ScreenLod::new(projected, 0.75, 0.01)?.with_cluster_budget(budget)?,
+                        Species::default().wood_color,
+                    )?,
+                ))
+            })
+            .collect::<std::result::Result<Vec<_>, i_love_proland::foliage::Error>>()?;
+        let compiled = compile_modules(&model_tiers, shared_frame)?;
         largest_expansion = largest_expansion.max(compiled.culling_expansion);
+        if visuals.is_empty() {
+            visuals = module_grove_candidates(candidates, &compiled)?;
+            assert_all_visual_forms_present(&visuals, plants.len());
+        }
         let modules = compiled.upload(device)?;
         tier_descriptors.push(MeshLod {
             start_m,
@@ -1008,7 +1081,7 @@ fn capture_module_forest(
         let scene = ForestPass {
             queue,
             renderer,
-            candidates,
+            candidates: &visuals,
             view,
             color: &targets.color_view,
             depth: &targets.depth_view,
@@ -1019,7 +1092,7 @@ fn capture_module_forest(
     };
     renderer.set_candidates(queue, &[])?;
     let empty = render(&mut renderer)?;
-    renderer.set_candidates(queue, candidates)?;
+    renderer.set_candidates(queue, &visuals)?;
     let image = render(&mut renderer)?;
     let changed = empty
         .as_chunks::<4>()
@@ -1033,13 +1106,12 @@ fn capture_module_forest(
         "GPU module bank should add visible forest pixels"
     );
     write_ppm(&format!("{prefix}-modules.ppm"), WIDTH, HEIGHT, &image)?;
-    let old = candidates[0];
-    let wrong_model = old.with_render_model(1);
+    let wrong_model = visuals[0].with_render_model(3);
     assert!(
         renderer.set_candidates(queue, &[wrong_model]).is_err(),
         "a render-local module model must never silently differ from the canonical source variant"
     );
-    renderer.set_candidates(queue, candidates)?;
+    renderer.set_candidates(queue, &visuals)?;
     println!(
         "FOREST_MODULE_PASS changed_pixels={changed} resident={} module_tiers=3 cull_expansion={largest_expansion:.5} image={prefix}-modules.ppm",
         candidates.len(),
