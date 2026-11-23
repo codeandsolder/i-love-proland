@@ -786,7 +786,7 @@ impl TreePipelines {
     }
 
     /// Build a diagnostic pipeline that writes primitive IDs instead of color.
-    /// Requires the wgpu PRIMITIVE_INDEX feature and a single-sample target.
+    /// Requires the `wgpu::Features::PRIMITIVE_INDEX` feature and a single-sample target.
     ///
     /// # Errors
     /// Rejects unsupported sample settings or a device without the feature.
