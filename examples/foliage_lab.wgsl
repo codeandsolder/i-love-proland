@@ -21,30 +21,42 @@ fn hash(value:u32)->u32 {
 fn random(seed:u32, salt:u32)->f32 {
  return f32(hash(seed^salt)&0xffffu)/65536.0;
 }
-fn describe(seed:u32,part:u32,kind:u32)->Patch {
- var patch:Patch;
+fn describe(seed:u32,part:u32,kind:u32,clumps:u32)->Patch {
+ var module_data:Patch;
  if part==0u {
-   patch.center_radius=vec4f(0.,0.45,0.,0.065);
-   patch.orient=vec4f(0.,0.90,1.,1.);
-   return patch;
+   module_data.center_radius=vec4f(0.,0.45,0.,0.065);
+   module_data.orient=vec4f(0.,0.90,1.,1.);
+   return module_data;
  }
  let cluster=(part-1u)/2u;
  let side=(part-1u)%2u;
- let a=random(seed,cluster*0x9e3779b9u+21u);
- let b=random(seed,cluster*0x85ebca6bu+77u);
- let c=random(seed,cluster*0xc2b2ae35u+135u);
- let d=random(seed,cluster*0x27d4eb2fu+389u);
+ let parent=cluster%8u;
+ let children=(clumps+7u-parent)/8u;
+ let a=random(seed,parent*0x9e3779b9u+21u);
+ let b=random(seed,parent*0x85ebca6bu+77u);
+ let c=random(seed,parent*0xc2b2ae35u+135u);
+ let d=random(seed,parent*0x27d4eb2fu+389u);
  let angle=6.283185307*a;
  let cone=select(0.,1.,kind==1u);
  let shrub=select(0.,1.,kind==2u);
  let radial=mix(0.48*sqrt(b),0.48*(1.0-c),cone);
  let altitude=mix(0.64+0.5*(c-0.5),0.19+0.68*c,cone);
  let r=mix(radial,0.44*sqrt(b),shrub);
- let y=mix(altitude,0.27+0.36*c,shrub);
- let card_radius=mix(0.17+0.075*d,0.13+0.045*d,cone);
- patch.center_radius=vec4f(r*cos(angle),y,r*sin(angle),card_radius);
- patch.orient=vec4f(angle+f32(side)*1.5707963,card_radius*(1.5+0.45*d),0.78+0.34*b,0.);
- return patch;
+ let y_base=mix(altitude,0.27+0.36*c,shrub);
+ var pos=vec3f(r*cos(angle),y_base,r*sin(angle));
+ let base_radius=select(0.36,0.235,kind==1u);
+ if children>1u {
+    let a2=6.283185307*random(seed,cluster*0xbf58476du+531u);
+    let step=base_radius*0.5*sqrt(random(seed,cluster*0x94d049bbu+227u));
+    pos.x+=step*cos(a2);
+    pos.z+=step*sin(a2);
+    pos.y+=step*0.35*(random(seed,cluster*0x87f53u+155u)-0.5);
+ }
+ let coverage_scale=select(select(1.,1.45,children>1u),2.20,children>3u);
+ let radius=base_radius*inverseSqrt(f32(children))*coverage_scale;
+ module_data.center_radius=vec4f(pos,radius);
+ module_data.orient=vec4f(angle+f32(side)*1.5707963,radius*(1.5+0.45*d),0.78+0.34*b,0.);
+ return module_data;
 }
 struct Output {
  @builtin(position) position:vec4<f32>,
@@ -74,26 +86,26 @@ fn write_vertex(local:vec3<f32>,uv:vec2<f32>,brightness:f32,trunk:bool,tree:Tree
  out.trunk=select(0u,1u,trunk);
  return out;
 }
-fn expand(patch:Patch,i:u32,tree:Tree)->Output {
+fn expand(module_data:Patch,i:u32,tree:Tree)->Output {
  let uv=corner(i);
- let angle=patch.orient.x;
- let r=patch.center_radius.w;
- let local=patch.center_radius.xyz+vec3f(uv.x*cos(angle)*r,uv.y*patch.orient.y*0.5,uv.x*sin(angle)*r);
- return write_vertex(local,uv,patch.orient.z,patch.orient.w>0.5,tree);
+ let angle=module_data.orient.x;
+ let r=module_data.center_radius.w;
+ let local=module_data.center_radius.xyz+vec3f(uv.x*cos(angle)*r,uv.y*module_data.orient.y*0.5,uv.x*sin(angle)*r);
+ return write_vertex(local,uv,module_data.orient.z,module_data.orient.w>0.5,tree);
 }
 @vertex fn vs_generated(@builtin(vertex_index) vertex:u32,@builtin(instance_index) id:u32)->Output {
  let tree=trees[id];
- return expand(describe(tree.ids.x,vertex/6u,tree.ids.z),vertex%6u,tree);
+ return expand(describe(tree.ids.x,vertex/6u,tree.ids.z,scene.counts.x),vertex%6u,tree);
 }
 @vertex fn vs_limited(@builtin(vertex_index) vertex:u32,@builtin(instance_index) id:u32)->Output {
  let tree=trees[id];
- return expand(describe(tree.ids.y^0x56cb1a93u,vertex/6u,tree.ids.z),vertex%6u,tree);
+ return expand(describe(tree.ids.y^0x56cb1a93u,vertex/6u,tree.ids.z,scene.counts.x),vertex%6u,tree);
 }
 @vertex fn vs_modules(@builtin(vertex_index) vertex:u32,@builtin(instance_index) id:u32)->Output {
  let tree=trees[id];
  let patch_count=scene.counts.x*2u+1u;
- let patch=patches[tree.ids.y*patch_count+vertex/6u];
- return expand(patch,vertex%6u,tree);
+ let module_data=patches[tree.ids.y*patch_count+vertex/6u];
+ return expand(module_data,vertex%6u,tree);
 }
 @vertex fn vs_expanded(@builtin(vertex_index) vertex:u32,@builtin(instance_index) id:u32)->Output {
  let tree=trees[id];

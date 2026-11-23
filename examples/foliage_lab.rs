@@ -1,7 +1,7 @@
 //! Headless Vulkan comparison of procedural vertex synthesis, shared foliage
 //! modules and expanded precomputed variants. This is a geometry/rendering
 //! experiment, not a new live KSP foliage renderer.
-use std::{error::Error, fs, path::Path, sync::mpsc, time::Instant};
+use std::{error::Error, fmt::Write as _, fs, path::Path, sync::mpsc, time::Instant};
 use wgpu::util::DeviceExt;
 
 const W: u32 = 960;
@@ -40,7 +40,7 @@ struct Scene {
     switches: [f32; 4],
 }
 
-fn hash(mut x: u32) -> u32 {
+const fn hash(mut x: u32) -> u32 {
     x = (x ^ (x >> 16)).wrapping_mul(0x7feb_352d);
     x = (x ^ (x >> 15)).wrapping_mul(0x846c_a68b);
     x ^ (x >> 16)
@@ -52,7 +52,7 @@ fn hash(mut x: u32) -> u32 {
 fn random(seed: u32, salt: u32) -> f32 {
     (hash(seed ^ salt) & 0xffff) as f32 / 65_536.0
 }
-fn patch_for(seed: u32, part: u32, kind: u32) -> Patch {
+fn patch_for(seed: u32, part: u32, kind: u32, clumps: u32) -> Patch {
     if part == 0 {
         return Patch {
             center_radius: [0.0, 0.45, 0.0, 0.065],
@@ -61,36 +61,74 @@ fn patch_for(seed: u32, part: u32, kind: u32) -> Patch {
     }
     let cluster = (part - 1) / 2;
     let side = (part - 1) % 2;
-    let a = random(seed, cluster.wrapping_mul(0x9e37_79b9).wrapping_add(21));
-    let b = random(seed, cluster.wrapping_mul(0x85eb_ca6b).wrapping_add(77));
-    let c = random(seed, cluster.wrapping_mul(0xc2b2_ae35).wrapping_add(135));
-    let d = random(seed, cluster.wrapping_mul(0x27d4_eb2f).wrapping_add(389));
-    let angle = core::f32::consts::TAU * a;
-    let (radial, altitude, radius) = if kind == 1 {
+    // The first eight parent clusters survive every LOD. Finer tiers only
+    // split each parent's shape into deterministic, spatially related cards.
+    let parent = cluster % 8;
+    let children = (clumps + 7 - parent) / 8;
+    let azimuth_random = random(seed, parent.wrapping_mul(0x9e37_79b9).wrapping_add(21));
+    let radial_random = random(seed, parent.wrapping_mul(0x85eb_ca6b).wrapping_add(77));
+    let height_random = random(seed, parent.wrapping_mul(0xc2b2_ae35).wrapping_add(135));
+    let size_random = random(seed, parent.wrapping_mul(0x27d4_eb2f).wrapping_add(389));
+    let angle = core::f32::consts::TAU * azimuth_random;
+    let (radial, altitude) = if kind == 1 {
         (
-            0.48 * (1.0 - c),
-            c.mul_add(0.68, 0.19),
-            d.mul_add(0.045, 0.13),
+            0.48 * (1.0 - height_random),
+            height_random.mul_add(0.68, 0.19),
         )
     } else {
         (
-            0.48 * b.sqrt(),
-            c.mul_add(0.5, 0.39),
-            d.mul_add(0.075, 0.17),
+            0.48 * radial_random.sqrt(),
+            height_random.mul_add(0.50, 0.39),
         )
     };
     let (radial, altitude) = if kind == 2 {
-        (0.44 * b.sqrt(), c.mul_add(0.36, 0.27))
+        (
+            0.44 * radial_random.sqrt(),
+            height_random.mul_add(0.36, 0.27),
+        )
     } else {
         (radial, altitude)
     };
     let (sin, cos) = angle.sin_cos();
+    let mut center_x = radial * cos;
+    let mut center_y = altitude;
+    let mut center_z = radial * sin;
+    let base_radius = if kind == 1 { 0.235 } else { 0.36 };
+    if children > 1 {
+        let child_angle = core::f32::consts::TAU
+            * random(seed, cluster.wrapping_mul(0xbf58_476d).wrapping_add(531));
+        let displacement = base_radius
+            * 0.5
+            * random(seed, cluster.wrapping_mul(0x94d0_49bb).wrapping_add(227)).sqrt();
+        let (sin, cos) = child_angle.sin_cos();
+        center_x = displacement.mul_add(cos, center_x);
+        center_z = displacement.mul_add(sin, center_z);
+        center_y = (displacement * 0.35).mul_add(
+            random(seed, cluster.wrapping_mul(0x87f53).wrapping_add(155)) - 0.5,
+            center_y,
+        );
+    }
+    let coverage_scale = match children {
+        1 => 1.0,
+        2..=3 => 1.45,
+        _ => 2.20,
+    };
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the foliage cluster count is capped at 64"
+    )]
+    let radius = base_radius / (children as f32).sqrt() * coverage_scale;
     Patch {
-        center_radius: [radial * cos, altitude, radial * sin, radius],
+        center_radius: [center_x, center_y, center_z, radius],
         orient: [
-            f32::from(side as u16).mul_add(core::f32::consts::FRAC_PI_2, angle),
-            radius * d.mul_add(0.45, 1.5),
-            b.mul_add(0.34, 0.78),
+            angle
+                + if side == 1 {
+                    core::f32::consts::FRAC_PI_2
+                } else {
+                    0.0
+                },
+            radius * size_random.mul_add(0.45, 1.5),
+            radial_random.mul_add(0.34, 0.78),
             0.0,
         ],
     }
@@ -118,8 +156,8 @@ fn make_modules(clumps: u32) -> (Vec<Patch>, Vec<BakedVertex>) {
     let mut models = Vec::new();
     let mut expanded_models = Vec::new();
     for variant in 0..MODELS {
-        for part in 0..(clumps * 2 + 1) {
-            let data = patch_for(variant ^ 0x56cb_1a93, part, variant / VARIANTS);
+        for part in 0..=(clumps * 2) {
+            let data = patch_for(variant ^ 0x56cb_1a93, part, variant / VARIANTS, clumps);
             models.push(data);
             for vertex in 0..6 {
                 expanded_models.push(expanded(data, vertex));
@@ -137,18 +175,23 @@ fn make_trees(count: u32) -> Vec<Tree> {
         .map(|i| {
             let kind = hash(i) % KINDS;
             let model = kind * VARIANTS + hash(i ^ 0x9e37_79b9) % VARIANTS;
-            let x = ((i % 88) as f32 - 44.0) * 1.65 + (random(i, 55) - 0.5) * 0.75;
-            let z = 14.0 + (i / 88) as f32 * 3.4 + random(i, 72) * 1.4;
+            let x = ((i % 88) as f32 - 44.0).mul_add(1.65, (random(i, 55) - 0.5) * 0.75);
+            let z = random(i, 72).mul_add(1.4, ((i / 88) as f32).mul_add(3.4, 14.0));
             let size = if kind == 2 {
                 4.4
             } else {
-                7.5 + random(i, 91) * 5.0
+                random(i, 91).mul_add(5.0, 7.5)
             };
             let tint = random(i, 999);
             Tree {
                 position_scale: [x, 0.0, z, size],
                 ids: [hash(i ^ 0x7f4a_7c15), model, kind, 0],
-                tint: [0.80 + 0.3 * tint, 0.9 + 0.25 * tint, 0.8 + 0.25 * tint, 1.0],
+                tint: [
+                    0.3_f32.mul_add(tint, 0.80),
+                    0.25_f32.mul_add(tint, 0.9),
+                    0.25_f32.mul_add(tint, 0.8),
+                    1.0,
+                ],
             }
         })
         .collect()
@@ -175,28 +218,9 @@ struct Gpu {
     timestamp_supported: bool,
     name: String,
 }
-fn open_gpu() -> AnyResult<Gpu> {
-    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    descriptor.backends = wgpu::Backends::VULKAN;
-    let instance = wgpu::Instance::new(descriptor);
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-    }))?;
-    let info = adapter.get_info();
-    let timestamp_supported = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("foliage procedural benchmark"),
-        required_features: if timestamp_supported {
-            wgpu::Features::TIMESTAMP_QUERY
-        } else {
-            wgpu::Features::empty()
-        },
-        ..Default::default()
-    }))?;
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+/// Scene resources stay uniform or storage-backed across all four draw modes.
+fn foliage_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("foliage scene"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
@@ -240,14 +264,18 @@ fn open_gpu() -> AnyResult<Gpu> {
                 count: None,
             },
         ],
-    });
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("modular GPU foliage"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("foliage_lab.wgsl").into()),
-    });
+    })
+}
+
+/// All paths share exactly the same depth, color and fragment configuration.
+fn foliage_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    shader: &wgpu::ShaderModule,
+) -> Vec<wgpu::RenderPipeline> {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("foliage pipeline layout"),
-        bind_group_layouts: &[Some(&layout)],
+        bind_group_layouts: &[Some(layout)],
         immediate_size: 0,
     });
     let mut pipelines = Vec::new();
@@ -256,7 +284,7 @@ fn open_gpu() -> AnyResult<Gpu> {
             label: Some(entry),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some(entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[],
@@ -275,7 +303,7 @@ fn open_gpu() -> AnyResult<Gpu> {
             }),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("fs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
@@ -289,6 +317,36 @@ fn open_gpu() -> AnyResult<Gpu> {
         });
         pipelines.push(pipeline);
     }
+    pipelines
+}
+
+fn open_gpu() -> AnyResult<Gpu> {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = wgpu::Backends::VULKAN;
+    let instance = wgpu::Instance::new(descriptor);
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))?;
+    let info = adapter.get_info();
+    let timestamp_supported = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("foliage procedural benchmark"),
+        required_features: if timestamp_supported {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        },
+        ..Default::default()
+    }))?;
+    let layout = foliage_layout(&device);
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("modular GPU foliage"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("foliage_lab.wgsl").into()),
+    });
+    let pipelines = foliage_pipelines(&device, &layout, &shader);
     let color = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("foliage offscreen color"),
         size: wgpu::Extent3d {
@@ -341,7 +399,11 @@ struct DrawCase {
     module_bytes: usize,
 }
 impl DrawCase {
-    fn new(gpu: &Gpu, clumps: u32, count: u32, fade: f32, side: u32) -> AnyResult<Self> {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "fixed W=960 and H=600 are exactly representable as f32"
+    )]
+    fn new(gpu: &Gpu, clumps: u32, count: u32, fade: f32, side: u32) -> Self {
         let models = make_modules(clumps);
         let trees = make_trees(count);
         let uniform_data = Scene {
@@ -381,7 +443,7 @@ impl DrawCase {
                 },
             ],
         });
-        Ok(Self {
+        Self {
             _uniform: uniform,
             _trees: trees_buf,
             _modules: module_buf,
@@ -391,7 +453,7 @@ impl DrawCase {
             trees_count: count,
             geometry_bytes: models.1.len() * size_of::<BakedVertex>(),
             module_bytes: models.0.len() * size_of::<Patch>(),
-        })
+        }
     }
 }
 fn draw(
@@ -504,7 +566,7 @@ fn capture(gpu: &Gpu, pieces: &[(&DrawCase, usize)], path: &Path) -> AnyResult<V
     let rgba = map_read(gpu, &staging)?;
     let mut ppm = format!("P6\n{W} {H}\n255\n").into_bytes();
     ppm.reserve(usize::try_from(W)? * usize::try_from(H)? * 3);
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         ppm.extend_from_slice(&pixel[..3]);
     }
     fs::write(path, ppm)?;
@@ -512,10 +574,14 @@ fn capture(gpu: &Gpu, pieces: &[(&DrawCase, usize)], path: &Path) -> AnyResult<V
 }
 #[derive(Clone, Copy)]
 struct Timing {
-    min_ms: f64,
-    median_ms: f64,
-    p90_ms: f64,
+    min: f64,
+    median: f64,
+    p90: f64,
 }
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "timestamp interval is bounded to a short GPU render pass, well within 2^53 integer ticks"
+)]
 fn measure(gpu: &Gpu, case: &DrawCase, mode: usize) -> AnyResult<Timing> {
     const FRAMES: usize = 16;
     const WARMUP: usize = 4;
@@ -543,7 +609,8 @@ fn measure(gpu: &Gpu, case: &DrawCase, mode: usize) -> AnyResult<Timing> {
         })
     });
     for frame in 0..FRAMES {
-        let marker = qset.as_ref().map(|q| (q, frame as u32 * 2));
+        let frame_index = u32::try_from(frame)? * 2;
+        let marker = qset.as_ref().map(|q| (q, frame_index));
         draw(gpu, &mut encoder, case, mode, true, marker);
     }
     let mapping = qset.as_ref().map(|qs| {
@@ -566,16 +633,20 @@ fn measure(gpu: &Gpu, case: &DrawCase, mode: usize) -> AnyResult<Timing> {
     });
     gpu.queue.submit([encoder.finish()]);
     gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
-    let cpu_ms = start.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
+    let cpu_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(u32::try_from(FRAMES)?);
     let mut times = if let Some((_, host)) = mapping {
         let bytes = map_read(gpu, &host)?;
         let ticks: Vec<u64> = bytes
-            .chunks_exact(8)
-            .map(|eight| u64::from_le_bytes(eight.try_into().unwrap_or([0; 8])))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|eight| u64::from_le_bytes(*eight))
             .collect();
         let period = f64::from(gpu.queue.get_timestamp_period()) * 1.0e-6;
         ticks
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| pair[1].saturating_sub(pair[0]) as f64 * period)
             .collect::<Vec<_>>()
     } else {
@@ -583,15 +654,17 @@ fn measure(gpu: &Gpu, case: &DrawCase, mode: usize) -> AnyResult<Timing> {
     };
     times.sort_unstable_by(f64::total_cmp);
     Ok(Timing {
-        min_ms: times[0],
-        median_ms: times[FRAMES / 2],
-        p90_ms: times[FRAMES * 9 / 10],
+        min: times[0],
+        median: times[FRAMES / 2],
+        p90: times[FRAMES * 9 / 10],
     })
 }
 fn image_difference(a: &[u8], b: &[u8]) -> f64 {
     let total = a
-        .chunks_exact(4)
-        .zip(b.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0.iter())
         .map(|(left, right)| {
             left[..3]
                 .iter()
@@ -603,10 +676,16 @@ fn image_difference(a: &[u8], b: &[u8]) -> f64 {
     total / (f64::from(W) * f64::from(H) * 3.0)
 }
 fn green_pixels(data: &[u8]) -> usize {
-    data.chunks_exact(4)
+    data.as_chunks::<4>()
+        .0
+        .iter()
         .filter(|rgba| rgba[1] > rgba[0] && rgba[1] > rgba[2])
         .count()
 }
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "captured pixel count is limited to W*H=576000"
+)]
 fn run() -> AnyResult<()> {
     let output = std::env::args()
         .nth(1)
@@ -630,7 +709,7 @@ fn run() -> AnyResult<()> {
     ];
     for trees in [1024, 4096] {
         for clumps in [8, 24, 64] {
-            let case = DrawCase::new(&gpu, clumps, trees, 0.0, 0)?;
+            let case = DrawCase::new(&gpu, clumps, trees, 0.0, 0);
             for (mode, name) in modes.iter().enumerate() {
                 let sample = measure(&gpu, &case, mode)?;
                 let bytes = match mode {
@@ -641,22 +720,23 @@ fn run() -> AnyResult<()> {
                 println!(
                     "FOLIAGE_BENCH mode={name} trees={trees} clumps={clumps} triangles={} gpu_ms_p50={:.5} p90={:.5} geometry_bytes={bytes}",
                     (clumps * 4 + 2) * trees,
-                    sample.median_ms,
-                    sample.p90_ms
+                    sample.median,
+                    sample.p90
                 );
-                report += &format!(
-                    "{name},{trees},{clumps},{},{bytes},{},{:.6},{:.6},{:.6}\n",
+                writeln!(
+                    &mut report,
+                    "{name},{trees},{clumps},{},{bytes},{},{:.6},{:.6},{:.6}",
                     (clumps * 4 + 2) * trees,
                     case.module_bytes,
-                    sample.min_ms,
-                    sample.median_ms,
-                    sample.p90_ms
-                );
+                    sample.min,
+                    sample.median,
+                    sample.p90
+                )?;
             }
         }
     }
     fs::write(output.join("timings.csv"), &report)?;
-    let case = DrawCase::new(&gpu, 24, 2048, 0.0, 0)?;
+    let case = DrawCase::new(&gpu, 24, 2048, 0.0, 0);
     let mut pictures = Vec::new();
     for (mode, name) in modes.iter().enumerate() {
         let path = output.join(format!("{name}.ppm"));
@@ -678,8 +758,8 @@ fn run() -> AnyResult<()> {
     let mut transition = String::from("fade,green_pixels,coverage_ratio_to_near\n");
     let mut near_count = 0;
     for fade in [0.0_f32, 0.20, 0.40, 0.60, 0.80, 1.0] {
-        let near = DrawCase::new(&gpu, 24, 2048, fade, 1)?;
-        let far = DrawCase::new(&gpu, 8, 2048, fade, 2)?;
+        let near = DrawCase::new(&gpu, 24, 2048, fade, 1);
+        let far = DrawCase::new(&gpu, 8, 2048, fade, 2);
         let path = output.join(format!("transition-{fade:.2}.ppm"));
         let rgba = capture(&gpu, &[(&near, 0), (&far, 0)], &path)?;
         let count = green_pixels(&rgba);
@@ -690,7 +770,7 @@ fn run() -> AnyResult<()> {
         println!(
             "FOLIAGE_TRANSITION fade={fade:.2} green_pixels={count} ratio_to_near={relative:.5}"
         );
-        transition += &format!("{fade:.2},{count},{relative:.6}\n");
+        writeln!(&mut transition, "{fade:.2},{count},{relative:.6}")?;
     }
     fs::write(output.join("transitions.csv"), transition)?;
     Ok(())
