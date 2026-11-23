@@ -271,6 +271,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "lorax-rs",
+ "naga",
  "pollster",
  "wgpu",
 ]

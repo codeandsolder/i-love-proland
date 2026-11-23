@@ -1174,6 +1174,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn primitive_identity_shader_parses_and_validates_with_production_entries() {
+        let source = format!(
+            "enable primitive_index;\n{SHADER}\n{}",
+            include_str!("triangle_ids.wgsl")
+        );
+        let module =
+            naga::front::wgsl::parse_str(&source).expect("primitive-ID shader WGSL must parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("production and primitive-ID shader entries must validate");
+    }
+
+    #[test]
     fn atlas_size_validation() {
         let len = 8 * 4 * 16 * 16 * 4;
         let image = AtlasImage::new(16, 2, vec![0; len]).unwrap();

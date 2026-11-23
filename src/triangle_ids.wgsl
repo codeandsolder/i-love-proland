@@ -27,7 +27,7 @@ fn mesh_ids_fs(input: MeshOutput, @builtin(primitive_index) primitive:u32) -> @l
 }
 @fragment
 fn impostor_ids_fs(input: ImpostorOutput, @builtin(primitive_index) primitive:u32) -> @location(0) vec4<f32> {
-    let alpha=angular_sample(atlas_texture,input).a * input.tint.a;
+    let alpha=impostor_angular_color(input).a * input.tint.a;
     if (alpha<=0.0){discard;}
     if (camera.material.y<0.5){
         let x=u32(input.clip.x)&3u;

@@ -197,8 +197,9 @@ fn atlas_sample(tile: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
     return textureSample(atlas_texture, atlas_sampler, uv, layer);
 }
 
-@fragment
-fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
+// Share the exact angular atlas interpolation between production shading
+// and optional primitive-ID instrumentation, including mip/angle filtering.
+fn impostor_angular_color(input: ImpostorOutput) -> vec4<f32> {
     let a0 = input.view_indices.x;
     let a1 = input.view_indices.y;
     let e0 = input.view_indices.z;
@@ -213,7 +214,12 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
         atlas_sample(vec2<f32>(a1, e1), input.uv),
         input.blend.x
     );
-    let color = mix(lower, upper, input.blend.y);
+    return mix(lower, upper, input.blend.y);
+}
+
+@fragment
+fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
+    let color = impostor_angular_color(input);
     let alpha = color.a * input.tint.a;
     if (alpha <= 0.0) {
         discard;
