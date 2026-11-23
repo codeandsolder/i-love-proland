@@ -28,6 +28,8 @@ pub mod impostor;
 #[cfg(feature = "gpu")]
 pub mod material;
 #[cfg(feature = "gpu")]
+pub mod procedural;
+#[cfg(feature = "gpu")]
 pub mod wind;
 
 mod domain;
