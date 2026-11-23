@@ -1,8 +1,8 @@
 //! Generate one stable species model and report the real GPU-compatible mesh
 //! counts at multiple projected crown diameters, without requiring a device.
 
+use i_love_proland::foliage::{Plant, ScreenLod, Species};
 use i_love_proland::procedural::bake;
-use lorax_rs::{Plant, ScreenLod, Species};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let species = Species::default();

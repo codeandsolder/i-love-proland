@@ -296,3 +296,20 @@ available. Upload with ProceduralMesh::upload(device) and reuse source_frame()
 for the entire tier family. The renderer's source shader currently consumes
 position/color/UV but not Lorax normals; deferred procedural relighting and
 view-specific GPU tessellation are explicit future work.
+
+The pure generator is available as i_love_proland::foliage with or without
+the gpu feature:
+
+~~~rust
+use i_love_proland::foliage::{Plant, ScreenLod, Species};
+
+let oak = Species::default();
+let plant = Plant::generate(&oak, 42)?;
+let target = ScreenLod::new(24.0, 0.75, 12.0)?;
+let mesh = plant.mesh(target, oak.wood_color)?;
+assert!(!mesh.indices.is_empty());
+# Ok::<(), Box<dyn std::error::Error>>(())
+~~~
+
+The renderer adapter requires the gpu feature, but the plant model and LOD
+tessellation do not.

@@ -31,6 +31,8 @@ pub mod material;
 pub mod procedural;
 #[cfg(feature = "gpu")]
 pub mod wind;
+/// Renderer-independent procedural species and hierarchical foliage geometry.
+pub use lorax_rs as foliage;
 
 mod domain;
 mod error;
