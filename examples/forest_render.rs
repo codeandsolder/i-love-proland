@@ -1152,9 +1152,9 @@ fn capture_module_forest(
         capture(device, queue, encoder, &targets.color)
     };
     renderer.set_candidates(queue, &[])?;
-    let empty = render(&mut renderer)?;
+    let empty = render(renderer)?;
     renderer.set_candidates(queue, visuals)?;
-    let image = render(&mut renderer)?;
+    let image = render(renderer)?;
     let changed = empty
         .as_chunks::<4>()
         .0

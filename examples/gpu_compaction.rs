@@ -435,10 +435,9 @@ fn validate_projected_lod_parity(
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let (candidates, generation_ms) = generate_sample()?;
-    let view = GpuView::unculled(540.0, 32.0, 1.0)?.with_source_center([0.12, 0.4, -0.19])?;
-    let lods = MeshLods::new(vec![
+/// Same original authored-distance fixtures used for GPU parity baselines.
+fn reference_lods() -> Result<MeshLods, Box<dyn Error>> {
+    Ok(MeshLods::new(vec![
         MeshLod {
             start_m: 0.0,
             index_count: 369,
@@ -459,7 +458,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             index_count: 9,
             prefer_mesh: false,
         },
-    ])?;
+    ])?)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let (candidates, generation_ms) = generate_sample()?;
+    let view = GpuView::unculled(540.0, 32.0, 1.0)?.with_source_center([0.12, 0.4, -0.19])?;
+    let lods = reference_lods()?;
     let (expected, canopy) = reference(&candidates, view, &lods);
     let (device, queue) = device()?;
     let pipeline = CompactionPipeline::new(&device);
