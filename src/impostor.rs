@@ -538,6 +538,7 @@ fn render_pipeline(
     pass_kind: PassKind,
     vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     config: TreeRenderConfig,
+    triangle_ids: bool,
 ) -> wgpu::RenderPipeline {
     let (name, vertex_entry, fragment_entry, alpha_to_coverage) = match pass_kind {
         PassKind::Mesh => (
@@ -552,6 +553,14 @@ fn render_pipeline(
             "impostor_fs",
             config.sample_count > 1,
         ),
+    };
+    let fragment_entry = if triangle_ids {
+        match pass_kind {
+            PassKind::Mesh => "mesh_ids_fs",
+            PassKind::Impostor => "impostor_ids_fs",
+        }
+    } else {
+        fragment_entry
     };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(name),
@@ -859,6 +868,36 @@ impl TreePipelines {
     /// # Errors
     /// Rejects an invalid multisample count.
     pub fn new(compaction: &CompactionPipeline, config: TreeRenderConfig) -> Result<Self> {
+        Self::compile(compaction, config, false)
+    }
+
+    /// Build a diagnostic pipeline that writes primitive IDs instead of color.
+    /// Requires the wgpu PRIMITIVE_INDEX feature and a single-sample target.
+    ///
+    /// # Errors
+    /// Rejects unsupported sample settings or a device without the feature.
+    pub fn new_triangle_ids(
+        compaction: &CompactionPipeline,
+        config: TreeRenderConfig,
+    ) -> Result<Self> {
+        if config.sample_count != 1
+            || !compaction
+                .device()
+                .features()
+                .contains(wgpu::Features::PRIMITIVE_INDEX)
+        {
+            return Err(Error::InvalidConfiguration(
+                "triangle identity capture requires one sample and PRIMITIVE_INDEX",
+            ));
+        }
+        Self::compile(compaction, config, true)
+    }
+
+    fn compile(
+        compaction: &CompactionPipeline,
+        config: TreeRenderConfig,
+        triangle_ids: bool,
+    ) -> Result<Self> {
         if config.sample_count == 0 || !config.sample_count.is_power_of_two() {
             return Err(Error::InvalidConfiguration("invalid tree sample count"));
         }
@@ -871,9 +910,17 @@ impl TreePipelines {
             ..Default::default()
         });
         let source_sampler = make_source_sampler(device);
+        let source = if triangle_ids {
+            format!(
+                "enable primitive_index;\n{SHADER}\n{}",
+                include_str!("triangle_ids.wgsl")
+            )
+        } else {
+            SHADER.to_owned()
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("i-love-proland mesh and 32-angle impostor shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let material_layout = render_layout(device);
         let instance_layout = instance_layout(device);
@@ -894,6 +941,7 @@ impl TreePipelines {
             PassKind::Mesh,
             &vertex_layout,
             config,
+            triangle_ids,
         );
         let impostor = render_pipeline(
             device,
@@ -902,6 +950,7 @@ impl TreePipelines {
             PassKind::Impostor,
             &[],
             config,
+            triangle_ids,
         );
         let quad_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("i-love-proland billboard quad 6 indices"),

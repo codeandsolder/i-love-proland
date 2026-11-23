@@ -44,6 +44,7 @@ struct MeshOutput {
     @location(1) uv: vec2<f32>,
     @location(2) normal: vec3<f32>,
     @location(3) @interpolate(flat) up: vec3<f32>,
+    @location(4) @interpolate(flat) triangle_seed: u32,
 }
 
 // Quaternion XYZW rotation without constructing a matrix per vertex.
@@ -138,6 +139,8 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
     out.up = rotate(object.rotation,vec3<f32>(0.0,1.0,0.0));
     let local_normal = select(input.normal.xyz,vec3<f32>(0.0,1.0,0.0),source.w>0.0);
     out.normal = rotate(object.rotation, safe_normal(local_normal/object.axis_radii.xyz,vec3<f32>(0.0,1.0,0.0)));
+    out.triangle_seed = object.object_id.x ^ (object.object_id.y * 0x9e3779b9u) ^
+        (object.object_id.z * 0x85ebca6bu) ^ (object.object_id.w * 0xc2b2ae35u);
     return out;
 }
 
@@ -168,6 +171,7 @@ struct ImpostorOutput {
     @location(3) tint: vec4<f32>,
     @location(4) @interpolate(flat) rotation: vec4<f32>,
     @location(5) @interpolate(flat) axis_radii: vec3<f32>,
+    @location(6) @interpolate(flat) triangle_seed: u32,
 }
 
 @vertex
@@ -221,6 +225,8 @@ fn impostor_vs(
     out.tint = vec4<f32>(object.tint.rgb * variation, object.tint.a);
     out.rotation = object.rotation;
     out.axis_radii = object.axis_radii.xyz;
+    out.triangle_seed = object.object_id.x ^ (object.object_id.y * 0x9e3779b9u) ^
+        (object.object_id.z * 0x85ebca6bu) ^ (object.object_id.w * 0xc2b2ae35u);
     return out;
 }
 
