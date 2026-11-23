@@ -32,3 +32,7 @@ required-features = ["gpu"]
 [[example]]
 name = "forest_render"
 required-features = ["gpu"]
+
+[[example]]
+name = "foliage_lab"
+required-features = ["gpu"]
