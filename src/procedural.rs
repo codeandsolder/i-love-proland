@@ -24,7 +24,7 @@ pub struct ProceduralMesh {
 impl ProceduralMesh {
     /// Upload the prepared mesh to the existing Proland tree GPU renderer.
     ///
-    /// The material may use SourceImage::white() to display the generated
+    /// The material may use `SourceImage::white()` to display the generated
     /// vertex colors, or a more detailed foliage texture supplied by the host.
     ///
     /// # Errors
@@ -44,7 +44,7 @@ impl ProceduralMesh {
 /// Convert an immutable Lorax plant into the existing Proland mesh vertex layout.
 ///
 /// Generated normals remain in the original Lorax Mesh; this adapter emits
-/// the current Proland TreeVertex layout (position/color/UV), which does not yet
+/// the current Proland `TreeVertex` layout (position/color/UV), which does not yet
 /// carry vertex normals. Relightable procedural-material support is a separate
 /// renderer change, not an undocumented change to the source shader.
 ///
