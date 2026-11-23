@@ -1036,6 +1036,7 @@ fn assert_all_visual_forms_present(visuals: &[PackedInstance], model_count: usiz
 /// authored Parallax source, canonical placement, or runtime KSP scene changes.
 struct ModuleForestSmoke {
     renderer: TreeRenderer,
+    _variant_atlas: AtlasTexture,
     visuals: Vec<PackedInstance>,
     largest_expansion: f32,
     bin_counts: Vec<u64>,
@@ -1046,7 +1047,7 @@ struct ModuleForestSmoke {
 fn build_module_forest(
     device: &wgpu::Device,
     pipelines: &TreePipelines,
-    atlas: &AtlasTexture,
+    queue: &wgpu::Queue,
     white: &wgpu::TextureView,
     candidates: &[PackedInstance],
     view: GpuView,
@@ -1054,6 +1055,7 @@ fn build_module_forest(
     let plants = module_source_forms()?;
     let shared_frame = SourceFrame::new([0.0, 6.0, 0.0], 16.0)?;
     let mut visuals = Vec::new();
+    let mut atlas_images: Option<Vec<AtlasImage>> = None;
     // For crowns below 24px use one source canopy aggregate and its root
     // stem (eight submitted triangles) instead of eight leaf clusters.
     let lod_requests = [
@@ -1083,6 +1085,11 @@ fn build_module_forest(
             visuals = module_grove_candidates(candidates, &compiled)?;
             assert_all_visual_forms_present(&visuals, plants.len());
         }
+        // Only the lowest source geometry tier borders the impostor regime.
+        // Bake its 32 view angles once per visual seed, not for every tier.
+        if budget == 1 {
+            atlas_images = Some(compiled.bake_variant_atlases(&SourceImage::white(), 64, 2)?);
+        }
         let modules = compiled.upload(device)?;
         tier_descriptors.push(MeshLod {
             start_m,
@@ -1100,15 +1107,22 @@ fn build_module_forest(
     // Procedural near/mid/far geometry follows the projected crown footprint.
     let lods = MeshLods::new(tier_descriptors)?.with_projected_diameters(vec![80.0, 24.0, 0.0])?;
     let (bin_counts, triangles) = module_submission_stats(&visuals, view, &lods)?;
+    let atlas_images = atlas_images.ok_or("missing procedural impostor atlas forms")?;
+    let variant_atlases = atlas_images
+        .iter()
+        .map(|image| (900_u64, image))
+        .collect::<Vec<_>>();
+    let variant_atlas = AtlasImage::upload_variants(device, queue, &variant_atlases)?;
     let renderer = TreeRenderer::new(
         pipelines,
         u32::try_from(candidates.len().min(256))?,
         lods,
         bank_materials,
-        atlas,
+        &variant_atlas,
     )?;
     Ok(ModuleForestSmoke {
         renderer,
+        _variant_atlas: variant_atlas,
         visuals,
         largest_expansion,
         bin_counts,
@@ -1120,13 +1134,12 @@ fn capture_module_forest(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     pipelines: &TreePipelines,
-    atlas: &AtlasTexture,
     white: &wgpu::TextureView,
     candidates: &[PackedInstance],
     prefix: &str,
 ) -> Result<(), Box<dyn Error>> {
     let (camera, view) = pitched_view(0.0)?;
-    let mut fixture = build_module_forest(device, pipelines, atlas, white, candidates, view)?;
+    let mut fixture = build_module_forest(device, pipelines, queue, white, candidates, view)?;
     fixture.renderer.set_camera(queue, camera);
     let visuals = &fixture.visuals;
     let renderer = &mut fixture.renderer;
@@ -1304,7 +1317,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             &device,
             &queue,
             &pipelines,
-            &atlas_texture,
             bark_texture.view(),
             &candidates,
             &prefix,

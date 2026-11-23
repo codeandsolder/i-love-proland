@@ -97,3 +97,35 @@ temporal fade, TAA, shadows and terrain canopy handoff are benchmarked in
 a real KSP scene. Production distance LOD bins do not yet implement the
 benchmark's complementary crossfade. Retain existing authored source trees
 until that visual acceptance.
+
+## Per-form angular impostor atlas (seed-coherent LOD)
+
+The angular impostor atlas must correspond to the selected visual model.
+A single authored source atlas cannot depict three distinct source plants:
+using it after a module LOD switch changes the canopy silhouette, color and
+species regardless of correct instance persistence.
+
+For module families, compile the required near/mid/far `CompiledModuleBank`
+tiers in the same dense source-form order. Bake the tier adjoining the
+impostor handoff using `CompiledModuleBank::bake_variant_atlases` and the
+same `SourceImage` used in the GPU near module material. The source's tapered
+branch quads, original-ID-stable two-sided foliage cards, colors, normalized
+geometry, and radial canopy coverage are rasterized in 8x4 source-relative
+view directions. Upload the results using
+`AtlasImage::upload_variants(device, queue, &[(canonical_id, &image), ...])`.
+Preserve catalog order even when a canonical ID occurs more than once due to
+distinct procedural seeds. The `TreeRenderer` checks that the atlas catalog
+matches the module model bank.
+
+The GPU atlas texture stores 32 independently filtered layers per visual
+model and selects its view group from `PackedInstance.render_model`.
+Ordinary single-model authored source atlases retain their original 32 layers.
+No per-frame atlas generation, device readback, camera-dependent model
+reseed or change to the original stable world ID is necessary.
+
+The CPU atlas is an approximation of the shaded GPU module: its alpha mask
+is baked at a fixed source-sampling resolution, then area filtered per view,
+whereas GPU near foliage uses projected-derivative edges and sample coverage.
+Matching silhouette at the actual KSP LOD crossover remains a visual
+acceptance gate; the source must have enough normalization radius to
+conservatively contain all baked card corners.
