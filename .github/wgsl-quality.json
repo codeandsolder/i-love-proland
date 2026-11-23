@@ -1,0 +1,9 @@
+{
+  "format": 1,
+  "modules": [
+    {"name": "visibility and LOD compaction", "sources": ["src/gpu_instance.wgsl", "src/compact.wgsl"]},
+    {"name": "impostor rendering", "sources": ["src/gpu_instance.wgsl", "src/impostor.wgsl", "src/module.wgsl"]},
+    {"name": "candidate patching", "sources": ["src/gpu_instance.wgsl", "src/patch_candidates.wgsl"]}
+  ],
+  "negative_tests": []
+}
