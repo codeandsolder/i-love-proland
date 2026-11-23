@@ -21,7 +21,8 @@ fn mesh_ids_fs(input: MeshOutput, @builtin(primitive_index) primitive:u32) -> @l
     let texel = textureSample(source_texture, source_sampler, input.uv);
     let alpha=texel.a*input.color.a;
     if (camera.material.x>0.0 && alpha<camera.material.x){discard;}
-    return triangle_id_color(input.triangle_seed,primitive);
+    return triangle_id_color(input.triangle_seed ^
+        (bitcast<u32>(camera.material.z) * 0xd8163841u),primitive);
 }
 @fragment
 fn impostor_ids_fs(input: ImpostorOutput, @builtin(primitive_index) primitive:u32) -> @location(0) vec4<f32> {
@@ -34,5 +35,6 @@ fn impostor_ids_fs(input: ImpostorOutput, @builtin(primitive_index) primitive:u3
                                3u,11u,1u,9u,15u,7u,13u,5u);
         if (alpha<(f32(bayer[y*4u+x])+0.5)/16.0){discard;}
     }
-    return triangle_id_color(input.triangle_seed,primitive);
+    return triangle_id_color(input.triangle_seed ^
+        (bitcast<u32>(camera.material.z) * 0xd8163841u),primitive);
 }
