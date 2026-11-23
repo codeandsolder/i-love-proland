@@ -39,6 +39,7 @@ struct MeshOutput {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) @interpolate(flat) triangle_seed: u32,
 }
 
 // Quaternion XYZW rotation without constructing a matrix per vertex.
@@ -114,6 +115,8 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
     out.clip = camera.projection * vec4<f32>(displaced, 1.0);
     out.color = input.color * object.tint;
     out.uv = input.uv;
+    out.triangle_seed = object.object_id.x ^ (object.object_id.y * 0x9e3779b9u) ^
+        (object.object_id.z * 0x85ebca6bu) ^ (object.object_id.w * 0xc2b2ae35u);
     return out;
 }
 
@@ -132,6 +135,7 @@ struct ImpostorOutput {
     @location(1) view_indices: vec4<f32>, // azimuth0, azimuth1, elevation0, elevation1
     @location(2) blend: vec2<f32>,
     @location(3) tint: vec4<f32>,
+    @location(4) @interpolate(flat) triangle_seed: u32,
 }
 
 @vertex
@@ -183,6 +187,8 @@ fn impostor_vs(
     // Tiny deterministic visual variation without redefining the world ID.
     let variation = 0.90 + object.axis_radii.w * 0.10;
     out.tint = vec4<f32>(object.tint.rgb * variation, object.tint.a);
+    out.triangle_seed = object.object_id.x ^ (object.object_id.y * 0x9e3779b9u) ^
+        (object.object_id.z * 0x85ebca6bu) ^ (object.object_id.w * 0xc2b2ae35u);
     return out;
 }
 
