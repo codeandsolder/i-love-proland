@@ -93,3 +93,23 @@ Outputs include aerial-timings.csv, four aerial comparison PPMs and separate
 24-to-8 and 64-to-24 six-frame crossfade sequences with coverage CSVs.
 Aerial and ground captures share the same four WGSL vertex methods and
 fragment code. They are still alpha-card proxies, not finished foliage art.
+
+## Interleaved, clock-bias-resistant performance check
+
+The standard benchmark executes whole methods sequentially. On a variable-
+frequency GPU, method order and the 16-frame measurement window may bias
+the results. Run the additional interleaved aerial timing mode:
+
+~~~sh
+cargo +nightly run --locked -j 2 --features gpu --example foliage_lab \
+  --target-dir /home/jan/build/i-love-proland-foliage-lab-20261123/target \
+  -- /home/jan/build/i-love-proland-foliage-lab-20261123/stability \
+  --repeat-aerial
+~~~
+
+For each 8/24/64-clump tier, seven rounds rotate the order of all four modes;
+the first two rounds are discarded, and the remaining five median GPU
+timestamps are summarized with median-of-medians and range. Every sample
+still uses the same triangles and shader. This isolates the GPU measurement
+from the compositional screenshot and morphology tests; it does **not**
+remove external GPU interference or thermal throttling.

@@ -856,6 +856,43 @@ fn population_summary(trees: &[Tree]) {
     );
 }
 
+/// Rotate method order between rounds to limit GPU clock/thermal ordering
+/// artifacts. First two rounds stabilize the driver; five later runs feed
+/// median-of-medians. All geometry, pixel shaders and instances are shared.
+fn benchmark_aerial_interleaved(gpu: &Gpu, output: &Path) -> AnyResult<()> {
+    let mut csv = String::from("clumps,round,mode,min_ms,p50_ms,p90_ms\n");
+    for clumps in [8_u32, 24, 64] {
+        let case = DrawCase::new(gpu, clumps, 4096, 0.0, 0, Camera::Aerial);
+        let mut times: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+        for round in 0..7_usize {
+            for order in 0..4 {
+                let mode = (order + round * 3) % 4;
+                let timing = measure(gpu, &case, mode)?;
+                writeln!(
+                    &mut csv,
+                    "{clumps},{round},{},{:.6},{:.6},{:.6}",
+                    MODES[mode], timing.min, timing.median, timing.p90
+                )?;
+                if round >= 2 {
+                    times[mode].push(timing.median);
+                }
+            }
+        }
+        for (mode, values) in times.iter_mut().enumerate() {
+            values.sort_unstable_by(f64::total_cmp);
+            let median = values[values.len() / 2];
+            let min = values[0];
+            let max = values[values.len() - 1];
+            println!(
+                "FOLIAGE_INTERLEAVED clumps={clumps} mode={} p50_of_runs_ms={median:.6} min_round_ms={min:.6} max_round_ms={max:.6}",
+                MODES[mode]
+            );
+        }
+    }
+    fs::write(output.join("aerial-interleaved.csv"), csv)?;
+    Ok(())
+}
+
 fn run_aerial(gpu: &Gpu, output: &Path) -> AnyResult<()> {
     let trees = make_trees(4096, Camera::Aerial);
     population_summary(&trees);
@@ -901,6 +938,9 @@ fn run() -> AnyResult<()> {
         "FOLIAGE_GPU name={:?} gpu_timestamps={}",
         gpu.name, gpu.timestamp_supported
     );
+    if std::env::args().nth(2).as_deref() == Some("--repeat-aerial") {
+        return benchmark_aerial_interleaved(&gpu, output);
+    }
     let mut report = format!(
         "gpu={}\nmode,trees,clumps,triangles,geometry_bytes,patch_bytes,min_ms,p50_ms,p90_ms\n",
         gpu.name
