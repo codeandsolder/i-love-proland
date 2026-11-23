@@ -271,3 +271,45 @@ objects without any inter-worker coordination.
 MIT OR Apache-2.0 for the new Rust implementation. Proland is an independent
 INRIA project; its official code and data have their own licensing and are
 not bundled here.
+
+### Procedural foliage (lorax-rs)
+
+The independent [lorax-rs](https://github.com/codeandsolder/lorax-rs)
+library creates deterministic stem and foliage hierarchies, then approximates
+them using projected-size LOD. Source bounds and seeds remain unchanged as the
+view moves; generation is independent of the scatter/cell system. The
+gpu-feature adapter in src/procedural.rs converts its mesh output into the same
+normalized TreeVertex/TreeMesh format used by our existing instanced renderer.
+
+The initial output uses stem cylinders and conservative octahedral foliage
+volumes; these are **new procedural trees**, not replacements for Parallax
+OakTree source art, wind or physical collisions. Fit the existing authored
+asset and compare appearance before routing KSP's existing families through
+the new path.
+
+Run a deterministic mesh-tier inspection without a GPU:
+
+    cargo run --features gpu --example procedural_lod
+
+Use a 1x1 white SourceImage with the mesh if no authored material texture is
+available. Upload with ProceduralMesh::upload(device) and reuse source_frame()
+for the entire tier family. The renderer's source shader currently consumes
+position/color/UV but not Lorax normals; deferred procedural relighting and
+view-specific GPU tessellation are explicit future work.
+
+The pure generator is available as i_love_proland::foliage with or without
+the gpu feature:
+
+~~~rust
+use i_love_proland::foliage::{Plant, ScreenLod, Species};
+
+let oak = Species::default();
+let plant = Plant::generate(&oak, 42)?;
+let target = ScreenLod::new(24.0, 0.75, 12.0)?;
+let mesh = plant.mesh(target, oak.wood_color)?;
+assert!(!mesh.indices.is_empty());
+# Ok::<(), Box<dyn std::error::Error>>(())
+~~~
+
+The renderer adapter requires the gpu feature, but the plant model and LOD
+tessellation do not.

@@ -270,6 +270,7 @@ name = "i-love-proland"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "lorax-rs",
  "pollster",
  "wgpu",
 ]
@@ -382,6 +383,11 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "lorax-rs"
+version = "0.1.0"
+source = "git+https://github.com/codeandsolder/lorax-rs?rev=8e04b27d2dde8074d02d416cdc5ee81ade097453#8e04b27d2dde8074d02d416cdc5ee81ade097453"
 
 [[package]]
 name = "naga"
