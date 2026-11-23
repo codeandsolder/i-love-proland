@@ -170,18 +170,6 @@ fn masked_canopy_texture(source: &SourceImage, tile_size: u32) -> Result<SourceI
 }
 
 impl CompiledModuleBank {
-    /// Bake a 32-angle impostor per dense visual model, including the same
-    /// source-index-dependent card orientation as the GPU module shader.
-    /// The output has the same order as the original dense visual-model catalog.
-    ///
-    /// For an exact match, use the same source image for GPU module materials;
-    /// the baker adds the module canopy's radial alpha envelope while keeping
-    /// source-sampled linear RGB. A common source normalization frame must
-    /// conservatively enclose every branch/card endpoint.
-    ///
-    /// # Errors
-    /// Rejects geometry outside the common frame, invalid module geometry,
-    /// inconsistent variant strides, and invalid angular atlas parameters.
     /// Bake and upload the complete per-seed atlas in the exact canonical
     /// catalog order owned by this module bank. The caller cannot swap the
     /// images of repeated canonical IDs when using this entry point.
@@ -206,6 +194,18 @@ impl CompiledModuleBank {
         AtlasImage::upload_variants(device, queue, &catalog)
     }
 
+    /// Bake a 32-angle impostor per dense visual model, including the same
+    /// source-index-dependent card orientation as the GPU module shader.
+    /// The output has the same order as the original dense visual-model catalog.
+    ///
+    /// For an exact match, use the same source image for GPU module materials;
+    /// the baker adds the module canopy's radial alpha envelope while keeping
+    /// source-sampled linear RGB. A common source normalization frame must
+    /// conservatively enclose every branch/card endpoint.
+    ///
+    /// # Errors
+    /// Rejects geometry outside the common frame, invalid module geometry,
+    /// inconsistent variant strides, and invalid angular atlas parameters.
     pub fn bake_variant_atlases(
         &self,
         source: &SourceImage,
