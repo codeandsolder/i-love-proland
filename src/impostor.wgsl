@@ -39,6 +39,8 @@ struct MeshOutput {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) @interpolate(flat) kind: u32,
+    @location(3) @interpolate(flat) stable_id: u32,
 }
 
 // Quaternion XYZW rotation without constructing a matrix per vertex.
@@ -114,6 +116,8 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
     out.clip = camera.projection * vec4<f32>(displaced, 1.0);
     out.color = input.color * object.tint;
     out.uv = input.uv;
+    out.kind = 0u;
+    out.stable_id = 0u;
     return out;
 }
 

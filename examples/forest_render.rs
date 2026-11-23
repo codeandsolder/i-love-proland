@@ -3,15 +3,17 @@
 //! external conversion tools without adding runtime dependencies to the library.
 
 use i_love_proland::atlas_bake::{BakeSurface, bake_scene};
+use i_love_proland::foliage::{Plant, ScreenLod, SourceFrame, Species};
 use i_love_proland::gpu::{
     CompactionPipeline, GpuView, MeshLod, MeshLods, PackedInstance, RenderPose, VisualLod,
     classify_cpu,
 };
 use i_love_proland::impostor::{
-    AtlasImage, AtlasTexture, TreeCamera, TreeMaterial, TreeMesh, TreePipelines, TreeRenderConfig,
-    TreeRenderer, TreeVertex,
+    AtlasImage, AtlasTexture, TreeCamera, TreeGeometry, TreeMaterial, TreeMesh, TreePipelines,
+    TreeRenderConfig, TreeRenderer, TreeVertex,
 };
 use i_love_proland::material::SourceImage;
+use i_love_proland::procedural::compile_modules;
 use i_love_proland::{Distribution, Domain, Generator, GeneratorConfig, Layer, TileKey, Variant};
 use std::error::Error;
 use std::fs;
@@ -618,6 +620,7 @@ fn validate_source_billboards(
         axis_radii: [1.4, 0.8, 1.7, 1.0],
         object_id: [1; 4],
         metadata: [2; 4],
+        render_model: [0; 4],
         handoff_anchor_rank: [0.0; 4],
         tint: [1.0; 4],
     }];
@@ -633,7 +636,7 @@ fn validate_source_billboards(
             1,
             lods,
             vec![vec![TreeMaterial {
-                mesh: card.clone(),
+                geometry: TreeGeometry::Mesh(card.clone()),
                 source_view: white,
                 alpha_cutoff: 0.0,
                 wind: None,
@@ -739,14 +742,14 @@ fn make_source_renderer(
         .map(|_| {
             vec![
                 TreeMaterial {
-                    mesh: trunk_mesh.clone(),
+                    geometry: TreeGeometry::Mesh(trunk_mesh.clone()),
                     source_view: views.bark,
                     alpha_cutoff: 0.0,
                     billboard: None,
                     wind: None,
                 },
                 TreeMaterial {
-                    mesh: leaf_mesh.clone(),
+                    geometry: TreeGeometry::Mesh(leaf_mesh.clone()),
                     source_view: views.foliage,
                     alpha_cutoff: 0.45,
                     billboard: None,
@@ -856,6 +859,7 @@ fn validate_capacity_growth(
         axis_radii: [8.0, 8.0, 8.0, 1.0],
         object_id: [1; 4],
         metadata: [2; 4],
+        render_model: [0; 4],
         handoff_anchor_rank: [0.0; 4],
         tint: [1.0; 4],
     });
@@ -945,13 +949,132 @@ fn bake_reference_atlas(
     Ok((atlas, atlas_ms))
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+/// Optional full Proland render-pass validation: the exact same GPU compactor
+/// and indirect instance bins drive Lorax-generated module geometry. No
+/// authored Parallax source, canonical placement, or runtime KSP scene changes.
+fn capture_module_forest(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipelines: &TreePipelines,
+    atlas: &AtlasTexture,
+    white: &wgpu::TextureView,
+    candidates: &[PackedInstance],
+    prefix: &str,
+) -> Result<(), Box<dyn Error>> {
+    let species = Species::default();
+    let plant = Plant::generate(&species, 900)?;
+    let shared_frame = SourceFrame::new([0.0, 6.0, 0.0], 16.0)?;
+    let lod_requests = [(0.0, 256.0, 64), (45.0, 96.0, 24), (110.0, 32.0, 8)];
+    let mut bank_materials = Vec::new();
+    let mut tier_descriptors = Vec::new();
+    let mut largest_expansion = 1.0_f32;
+    for (start_m, projected, budget) in lod_requests {
+        let tier = plant.module_tier(
+            ScreenLod::new(projected, 0.75, 0.01)?.with_cluster_budget(budget)?,
+            species.wood_color,
+        )?;
+        let compiled = compile_modules(&[(900_u64, tier)], shared_frame)?;
+        largest_expansion = largest_expansion.max(compiled.culling_expansion);
+        let modules = compiled.upload(device)?;
+        tier_descriptors.push(MeshLod {
+            start_m,
+            index_count: modules.index_count(),
+            prefer_mesh: true,
+        });
+        bank_materials.push(vec![TreeMaterial {
+            geometry: TreeGeometry::Modules(modules),
+            source_view: white,
+            alpha_cutoff: 0.35,
+            billboard: None,
+            wind: None,
+        }]);
+    }
+    let lods = MeshLods::new(tier_descriptors)?;
+    let mut renderer = TreeRenderer::new(
+        pipelines,
+        u32::try_from(candidates.len().min(256))?,
+        lods,
+        bank_materials,
+        atlas,
+    )?;
+    let (camera, view) = pitched_view(0.0)?;
+    renderer.set_camera(queue, camera);
+    let targets = make_frame_targets(device);
+    let background = background_pipeline(device, "fs_main");
+    let render = |renderer: &mut TreeRenderer| -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Lorax real module render/compaction test"),
+        });
+        let scene = ForestPass {
+            queue,
+            renderer,
+            candidates,
+            view,
+            color: &targets.color_view,
+            depth: &targets.depth_view,
+            background: &background,
+        };
+        render_frame(&mut encoder, &scene)?;
+        capture(device, queue, encoder, &targets.color)
+    };
+    renderer.set_candidates(queue, &[])?;
+    let empty = render(&mut renderer)?;
+    renderer.set_candidates(queue, candidates)?;
+    let image = render(&mut renderer)?;
+    let changed = empty
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(image.as_chunks::<4>().0)
+        .filter(|(a, b)| a[..3] != b[..3])
+        .count();
+    assert!(
+        changed > 1000,
+        "GPU module bank should add visible forest pixels"
+    );
+    write_ppm(&format!("{prefix}-modules.ppm"), WIDTH, HEIGHT, &image)?;
+    let old = candidates[0];
+    let wrong_model = old.with_render_model(1);
+    assert!(
+        renderer.set_candidates(queue, &[wrong_model]).is_err(),
+        "a render-local module model must never silently differ from the canonical source variant"
+    );
+    renderer.set_candidates(queue, candidates)?;
+    println!(
+        "FOREST_MODULE_PASS changed_pixels={changed} resident={} module_tiers=3 cull_expansion={largest_expansion:.5} image={prefix}-modules.ppm",
+        candidates.len(),
+    );
+    Ok(())
+}
+
+fn parse_forest_input() -> Result<(String, SourceImage, bool), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let prefix = args.next().ok_or(
         "usage: cargo run --features gpu --example forest_render -- /path/to/output-prefix",
     )?;
+    let remaining = args.collect::<Vec<_>>();
+    let module_smoke = remaining.iter().any(|arg| arg == "--module-smoke");
+    let source_args = remaining
+        .into_iter()
+        .filter(|arg| arg != "--module-smoke")
+        .collect::<Vec<_>>();
+    Ok((prefix, load_source_image(&source_args)?, module_smoke))
+}
+
+fn reference_pipelines(device: &wgpu::Device) -> Result<TreePipelines, Box<dyn Error>> {
+    Ok(TreePipelines::new(
+        &CompactionPipeline::new(device),
+        TreeRenderConfig {
+            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            depth_format: wgpu::TextureFormat::Depth24Plus,
+            sample_count: 1,
+        },
+    )?)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let (prefix, source, module_smoke) = parse_forest_input()?;
     let (vertices, indices) = sample_tree()?;
-    let source = load_source_image(&args.collect::<Vec<_>>())?;
     // The synthetic source consists of a 10-sided trunk (20 vertices, 60
     // indices), followed by several UV-mapped crowns. They use different
     // source textures and alpha cutoffs but share one physical tree instance.
@@ -977,14 +1100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (device, queue) = create_device()?;
     let trunk_mesh = TreeMesh::new(&device, trunk_vertices, trunk_indices)?;
     let leaf_mesh = TreeMesh::new(&device, leaf_vertices, &leaf_indices)?;
-    let pipelines = TreePipelines::new(
-        &CompactionPipeline::new(&device),
-        TreeRenderConfig {
-            color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            depth_format: wgpu::TextureFormat::Depth24Plus,
-            sample_count: 1,
-        },
-    )?;
+    let pipelines = reference_pipelines(&device)?;
     let lods = example_lods(trunk_mesh.index_count())?;
     let atlas_texture = atlas.upload(&device, &queue)?;
     let bark_texture = bark.upload(&device, &queue)?;
@@ -1046,6 +1162,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         &atlas_texture,
         bark_texture.view(),
     )?;
+    if module_smoke {
+        capture_module_forest(
+            &device,
+            &queue,
+            &pipelines,
+            &atlas_texture,
+            bark_texture.view(),
+            &candidates,
+            &prefix,
+        )?;
+    }
     println!(
         "FOREST_RENDER_PASS candidates={} mesh_indices={} atlas_ms={atlas_ms:.2} canonical_ms={generation_ms:.2} capture_green_pixels={greens} gpu_compact_and_indirect_render_ms={frame_ms:.3} images={prefix}-scene.ppm,{prefix}-atlas.ppm",
         candidates.len(),

@@ -19,7 +19,8 @@ pub const ELEVATION_VIEWS: u32 = 4;
 
 const SHADER: &str = concat!(
     include_str!("gpu_instance.wgsl"),
-    include_str!("impostor.wgsl")
+    include_str!("impostor.wgsl"),
+    include_str!("module.wgsl")
 );
 
 /// Source geometry normalized to a unit-radius sphere at the object center.
@@ -94,6 +95,166 @@ impl TreeMesh {
     #[must_use = "Use the index count when issuing indexed draws"]
     pub const fn index_count(&self) -> u32 {
         self.index_count
+    }
+}
+
+/// One 64-byte source-space module for vertex expansion. The first two
+/// float4 records contain normalized geometry, and the third is linear RGBA.
+///
+/// Kind 0 = an inert padding slot, 1 = tapered branch, 2 = canopy.
+/// For branches, `origin_radius` is (start XYZ, base radius), `extent_radius`
+/// is (end XYZ, tip radius). For canopy, `origin_radius` is (center XYZ, half
+/// width X), `extent_radius` is (half height Y, half depth Z, 0, 0).
+/// Metadata contains kind, immutable source component ID, original card count
+/// for canopy, and one reserved zero word. GPU reads the complete value; all
+/// records occupy 64 bytes even when different variants have varying lengths.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuModule {
+    pub origin_radius: [f32; 4],
+    pub extent_radius: [f32; 4],
+    pub color: [f32; 4],
+    pub metadata: [u32; 4],
+}
+
+/// Resident, padded collection of physical source variants at one mesh LOD.
+///
+/// All instances reference stable local variant slots in `PackedInstance`'s
+/// `render_model` field; source variant and object IDs are independent.
+#[derive(Clone)]
+pub struct TreeModules {
+    buffer: wgpu::Buffer,
+    index: wgpu::Buffer,
+    index_count: u32,
+    variant_count: u32,
+    variant_ids: Vec<u64>,
+    modules_per_variant: u32,
+    uniforms: wgpu::Buffer,
+}
+
+impl TreeModules {
+    /// Upload an already compiled, equally padded per-variant module bank.
+    ///
+    /// # Errors
+    /// Rejects mismatched dimensions, invalid module records and device
+    /// storage or indirect index limits.
+    pub fn new(
+        device: &wgpu::Device,
+        data: &[GpuModule],
+        variant_ids: Vec<u64>,
+        modules_per_variant: u32,
+    ) -> Result<Self> {
+        let variants = u32::try_from(variant_ids.len()).map_err(|_| Error::IndexOverflow)?;
+        let size = u64::from(variants)
+            .checked_mul(u64::from(modules_per_variant))
+            .ok_or(Error::IndexOverflow)?;
+        let indices = modules_per_variant
+            .checked_mul(12)
+            .ok_or(Error::IndexOverflow)?;
+        let bytes = size
+            .checked_mul(core::mem::size_of::<GpuModule>() as u64)
+            .ok_or(Error::IndexOverflow)?;
+        let limits = device.limits();
+        if variants == 0
+            || variant_ids
+                .iter()
+                .enumerate()
+                .any(|(i, id)| variant_ids[..i].contains(id))
+            || modules_per_variant == 0
+            || usize::try_from(size).ok() != Some(data.len())
+            || bytes > limits.max_storage_buffer_binding_size
+            || bytes > limits.max_buffer_size
+            || indices == 0
+            || data.iter().any(|m| {
+                m.metadata[0] > 2
+                    || m.metadata[3] != 0
+                    || !m.origin_radius.iter().all(|v| v.is_finite())
+                    || !m.extent_radius.iter().all(|v| v.is_finite())
+                    || !TreeVertex::valid_color(m.color)
+                    || match m.metadata[0] {
+                        0 => {
+                            m.origin_radius
+                                .iter()
+                                .chain(m.extent_radius.iter())
+                                .chain(m.color.iter())
+                                .any(|v| v.to_bits() != 0)
+                                || m.metadata != [0; 4]
+                        }
+                        1 => m.origin_radius[3] <= 0.0 || m.extent_radius[3] <= 0.0,
+                        2 => {
+                            m.origin_radius[3] <= 0.0
+                                || m.extent_radius[0] <= 0.0
+                                || m.extent_radius[1] <= 0.0
+                                || m.metadata[2] == 0
+                        }
+                        _ => true,
+                    }
+            })
+        {
+            return Err(Error::InvalidConfiguration(
+                "invalid padded foliage module bank or GPU storage limit",
+            ));
+        }
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("i-love-proland immutable procedural module bank"),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let vertex_indices = (0..indices).collect::<Vec<_>>();
+        let index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("i-love-proland procedural module topology indices"),
+            contents: bytemuck::cast_slice(&vertex_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("i-love-proland procedural module stride"),
+            contents: bytemuck::cast_slice(&[modules_per_variant, variants, 0_u32, 0]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        Ok(Self {
+            buffer,
+            index,
+            index_count: indices,
+            variant_count: variants,
+            variant_ids,
+            modules_per_variant,
+            uniforms,
+        })
+    }
+
+    #[must_use = "Use the module bank variant count to validate resident instances"]
+    pub const fn variant_count(&self) -> u32 {
+        self.variant_count
+    }
+    #[must_use = "Match every GPU render slot to its canonical source variant"]
+    pub fn variant_ids(&self) -> &[u64] {
+        &self.variant_ids
+    }
+    #[must_use = "Use module count when preparing compatible indexed LOD draws"]
+    pub const fn index_count(&self) -> u32 {
+        self.index_count
+    }
+    #[must_use = "Use compact descriptors for GPU storage accounting"]
+    pub const fn modules_per_variant(&self) -> u32 {
+        self.modules_per_variant
+    }
+}
+
+/// One physical material has either authored triangles or a compact procedural
+/// module bank. Both use the same canonical candidate list and LOD compactor.
+#[derive(Clone)]
+pub enum TreeGeometry {
+    Mesh(TreeMesh),
+    Modules(TreeModules),
+}
+
+impl TreeGeometry {
+    #[must_use = "Use the selected geometry's indexed draw count"]
+    pub const fn index_count(&self) -> u32 {
+        match self {
+            Self::Mesh(mesh) => mesh.index_count(),
+            Self::Modules(modules) => modules.index_count(),
+        }
     }
 }
 
@@ -393,6 +554,7 @@ pub struct TreeRenderConfig {
 #[derive(Clone, Copy)]
 enum PassKind {
     Mesh,
+    Module,
     Impostor,
 }
 
@@ -427,9 +589,10 @@ impl MeshWind<'_> {
     }
 }
 
-/// One textured source mesh. The renderer takes ownership of its GPU mesh.
+/// One source material can be authored triangles or GPU-expanded modules.
+/// Both use the same canonical candidate list and GPU compactor.
 pub struct TreeMaterial<'a> {
-    pub mesh: TreeMesh,
+    pub geometry: TreeGeometry,
     pub source_view: &'a wgpu::TextureView,
     pub alpha_cutoff: f32,
     pub wind: Option<MeshWind<'a>>,
@@ -437,7 +600,8 @@ pub struct TreeMaterial<'a> {
 }
 
 struct MeshDraw {
-    mesh: TreeMesh,
+    geometry: TreeGeometry,
+    module_bind: Option<wgpu::BindGroup>,
     bind: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     indirect: wgpu::Buffer,
@@ -453,6 +617,7 @@ struct MeshDraw {
 pub struct TreeRenderer {
     pipelines: TreePipelines,
     mesh_draws: Vec<MeshDraw>,
+    module_variant_ids: Option<Vec<u64>>,
     impostor_bind: wgpu::BindGroup,
     impostor_uniforms: wgpu::Buffer,
     instance_bindings: Vec<wgpu::BindGroup>,
@@ -474,6 +639,12 @@ fn render_pipeline(
             "mesh_vs",
             "mesh_fs",
             false,
+        ),
+        PassKind::Module => (
+            "i-love-proland GPU-expanded tapered branches and canopy modules",
+            "module_vs",
+            "module_fs",
+            config.sample_count > 1,
         ),
         PassKind::Impostor => (
             "i-love-proland instanced textured impostors",
@@ -577,6 +748,34 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn module_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("i-love-proland compact GPU module bank bindings"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
                 count: None,
             },
@@ -696,34 +895,51 @@ fn new_uniform(device: &wgpu::Device) -> wgpu::Buffer {
 }
 
 fn build_mesh_draw(
-    device: &wgpu::Device,
+    pipelines: &TreePipelines,
     tier: (usize, &CompactedBin<'_>),
     source: TreeMaterial<'_>,
-    layout: &wgpu::BindGroupLayout,
     atlas: &AtlasTexture,
-    atlas_sampler: &wgpu::Sampler,
-    source_sampler: &wgpu::Sampler,
 ) -> MeshDraw {
+    let device = pipelines.device();
     let uniforms = new_uniform(device);
     let bind = make_draw_bind(
         device,
-        layout,
+        &pipelines.material_layout,
         &uniforms,
         &MaterialBindings {
             atlas,
-            atlas_sampler,
+            atlas_sampler: &pipelines.atlas_sampler,
             source_view: source.source_view,
-            source_sampler,
+            source_sampler: &pipelines.source_sampler,
             wind_view: source
                 .wind
                 .as_ref()
                 .map_or(source.source_view, |wind| wind.map),
         },
     );
+    let module_bind = match &source.geometry {
+        TreeGeometry::Mesh(_) => None,
+        TreeGeometry::Modules(modules) => {
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("i-love-proland compact module vertices and stride"),
+                layout: &pipelines.module_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: modules.buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: modules.uniforms.as_entire_binding(),
+                    },
+                ],
+            }))
+        }
+    };
     let indirect = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("i-love-proland material indirect arguments"),
         contents: bytemuck::bytes_of(&IndexedDraw {
-            index_count: source.mesh.index_count(),
+            index_count: source.geometry.index_count(),
             instance_count: 0,
             first_index: 0,
             base_vertex: 0,
@@ -732,7 +948,8 @@ fn build_mesh_draw(
         usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
     });
     MeshDraw {
-        mesh: source.mesh,
+        geometry: source.geometry,
+        module_bind,
         bind,
         uniforms,
         indirect,
@@ -758,9 +975,11 @@ pub struct TreePipelines {
     compaction: CompactionPipeline,
     config: TreeRenderConfig,
     mesh: wgpu::RenderPipeline,
+    modules: wgpu::RenderPipeline,
     impostor: wgpu::RenderPipeline,
     material_layout: wgpu::BindGroupLayout,
     instance_layout: wgpu::BindGroupLayout,
+    module_layout: wgpu::BindGroupLayout,
     atlas_sampler: wgpu::Sampler,
     source_sampler: wgpu::Sampler,
     placeholder: wgpu::TextureView,
@@ -791,11 +1010,22 @@ impl TreePipelines {
         });
         let material_layout = render_layout(device);
         let instance_layout = instance_layout(device);
+        let module_layout = module_layout(device);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("i-love-proland tree render pipeline layout"),
+            label: Some("i-love-proland standard tree and impostor layout"),
             bind_group_layouts: &[Some(&material_layout), Some(&instance_layout)],
             immediate_size: 0,
         });
+        let module_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("i-love-proland source module expansion layout"),
+                bind_group_layouts: &[
+                    Some(&material_layout),
+                    Some(&instance_layout),
+                    Some(&module_layout),
+                ],
+                immediate_size: 0,
+            });
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: core::mem::size_of::<TreeVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -807,6 +1037,14 @@ impl TreePipelines {
             &shader,
             PassKind::Mesh,
             &vertex_layout,
+            config,
+        );
+        let modules = render_pipeline(
+            device,
+            &module_pipeline_layout,
+            &shader,
+            PassKind::Module,
+            &[],
             config,
         );
         let impostor = render_pipeline(
@@ -842,9 +1080,11 @@ impl TreePipelines {
             compaction: compaction.clone(),
             config,
             mesh,
+            modules,
             impostor,
             material_layout,
             instance_layout,
+            module_layout,
             atlas_sampler,
             source_sampler,
             placeholder,
@@ -880,7 +1120,7 @@ fn validate_material_tiers(
     for (tier, source) in sources.iter().enumerate() {
         if compactor
             .bin(tier)
-            .is_none_or(|bin| bin.index_count != source[0].mesh.index_count())
+            .is_none_or(|bin| bin.index_count != source[0].geometry.index_count())
         {
             return Err(Error::InvalidConfiguration(
                 "incompatible mesh LOD draw indexes",
@@ -914,6 +1154,20 @@ impl TreeRenderer {
         let device = pipelines.device();
         let compactor = GpuCompactor::new(&pipelines.compaction, capacity, lods, 6)?;
         validate_material_tiers(&compactor, &sources)?;
+        let mut module_variant_ids: Option<Vec<u64>> = None;
+        for source in sources.iter().flatten() {
+            if let TreeGeometry::Modules(modules) = &source.geometry {
+                match &module_variant_ids {
+                    Some(ids) if ids != modules.variant_ids() => {
+                        return Err(Error::InvalidConfiguration(
+                            "all module tiers must use the same source variant catalog",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => module_variant_ids = Some(modules.variant_ids().to_vec()),
+                }
+            }
+        }
         let impostor_bin = compactor
             .bin(compactor.mesh_lods().impostor_bin())
             .ok_or(Error::InvalidConfiguration("missing impostor bin"))?;
@@ -923,17 +1177,11 @@ impl TreeRenderer {
             let bin = compactor
                 .bin(tier)
                 .ok_or(Error::InvalidConfiguration("missing mesh LOD bin"))?;
-            mesh_draws.extend(materials.into_iter().map(|source| {
-                build_mesh_draw(
-                    device,
-                    (tier, &bin),
-                    source,
-                    &pipelines.material_layout,
-                    atlas,
-                    &pipelines.atlas_sampler,
-                    &pipelines.source_sampler,
-                )
-            }));
+            mesh_draws.extend(
+                materials
+                    .into_iter()
+                    .map(|source| build_mesh_draw(pipelines, (tier, &bin), source, atlas)),
+            );
         }
         let impostor_uniforms = new_uniform(device);
         let impostor_bind = make_draw_bind(
@@ -951,6 +1199,7 @@ impl TreeRenderer {
         Ok(Self {
             pipelines: pipelines.clone(),
             mesh_draws,
+            module_variant_ids,
             impostor_bind,
             impostor_uniforms,
             instance_bindings,
@@ -971,6 +1220,29 @@ impl TreeRenderer {
         &self.compactor
     }
 
+    /// Require the render-local dense slot to point at the same canonical
+    /// source variant as the persistent GPU metadata; never silently render
+    /// a different species when a source variant is missing from the bank.
+    fn validate_render_models<'a>(
+        &self,
+        candidates: impl IntoIterator<Item = &'a PackedInstance>,
+    ) -> Result<()> {
+        let Some(ids) = &self.module_variant_ids else {
+            return Ok(());
+        };
+        if candidates.into_iter().any(|object| {
+            usize::try_from(object.render_model[0])
+                .ok()
+                .and_then(|index| ids.get(index))
+                .is_none_or(|&id| id != object.variant_id())
+        }) {
+            return Err(Error::InvalidConfiguration(
+                "module visual model does not match canonical source variant",
+            ));
+        }
+        Ok(())
+    }
+
     /// Replace the resident candidate batch, growing only capacity-dependent
     /// instance storage and bindings when necessary.
     ///
@@ -981,6 +1253,7 @@ impl TreeRenderer {
         queue: &wgpu::Queue,
         candidates: &[PackedInstance],
     ) -> Result<bool> {
+        self.validate_render_models(candidates.iter())?;
         if self.compactor.set_candidates(queue, candidates)? {
             self.instance_bindings = instance_bindings(
                 self.pipelines.device(),
@@ -1005,6 +1278,7 @@ impl TreeRenderer {
         count: u32,
         patches: &[CandidatePatch],
     ) -> Result<()> {
+        self.validate_render_models(patches.iter().map(CandidatePatch::candidate))?;
         self.compactor
             .patch_candidates(queue, encoder, count, patches)
     }
@@ -1084,12 +1358,23 @@ impl TreeRenderer {
     /// Draw every mesh tier's materials with its compacted instance set,
     /// then emit precisely one composite middle-distance impostor draw.
     pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
-        pass.set_pipeline(&self.pipelines.mesh);
         for material in &self.mesh_draws {
             pass.set_bind_group(0, &material.bind, &[]);
             pass.set_bind_group(1, &self.instance_bindings[material.tier], &[]);
-            pass.set_vertex_buffer(0, material.mesh.vertex.slice(..));
-            pass.set_index_buffer(material.mesh.index.slice(..), wgpu::IndexFormat::Uint32);
+            match &material.geometry {
+                TreeGeometry::Mesh(mesh) => {
+                    pass.set_pipeline(&self.pipelines.mesh);
+                    pass.set_vertex_buffer(0, mesh.vertex.slice(..));
+                    pass.set_index_buffer(mesh.index.slice(..), wgpu::IndexFormat::Uint32);
+                }
+                TreeGeometry::Modules(modules) => {
+                    pass.set_pipeline(&self.pipelines.modules);
+                    if let Some(bind) = &material.module_bind {
+                        pass.set_bind_group(2, bind, &[]);
+                    }
+                    pass.set_index_buffer(modules.index.slice(..), wgpu::IndexFormat::Uint32);
+                }
+            }
             pass.draw_indexed_indirect(&material.indirect, 0);
         }
         pass.set_pipeline(&self.pipelines.impostor);

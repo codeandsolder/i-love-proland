@@ -211,3 +211,305 @@ mod tests {
         Ok(())
     }
 }
+
+/// Compact, source-independent GPU representation for one visual LOD tier.
+///
+/// The caller passes an explicit common frame so variants of different height
+/// and crown size are not accidentally normalized into identical silhouettes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledModuleBank {
+    pub data: Vec<crate::impostor::GpuModule>,
+    pub source_frame: SourceFrame,
+    /// Source variant IDs in dense GPU module-slot order, never rehashed.
+    pub variant_ids: Vec<u64>,
+    pub modules_per_variant: u32,
+    /// Expand the shared source-frame sphere by this multiplier for culling.
+    pub culling_expansion: f32,
+}
+
+impl CompiledModuleBank {
+    #[must_use = "Look up a canonical variant ID before writing the GPU render slot"]
+    pub fn model_slot(&self, canonical_variant: u64) -> Option<u32> {
+        self.variant_ids
+            .iter()
+            .position(|&id| id == canonical_variant)
+            .and_then(|index| u32::try_from(index).ok())
+    }
+
+    /// Upload the validated CPU module bank without regenerating triangles.
+    ///
+    /// # Errors
+    /// Returns a GPU/device error when the immutable bank exceeds its limits.
+    pub fn upload(&self, device: &wgpu::Device) -> Result<crate::impostor::TreeModules> {
+        crate::impostor::TreeModules::new(
+            device,
+            &self.data,
+            self.variant_ids.clone(),
+            self.modules_per_variant,
+        )
+    }
+}
+
+/// Normalize a single Lorax branch or spatial canopy group into the
+/// shared source frame, retaining original component identity.
+fn pack_module(
+    module: &lorax_rs::Module,
+    frame: SourceFrame,
+) -> std::result::Result<crate::impostor::GpuModule, FoliageError> {
+    let normalize = |point: [f32; 3]| {
+        std::array::from_fn::<_, 3, _>(|i| (point[i] - frame.center[i]) / frame.radius)
+    };
+    let packed = match module {
+        lorax_rs::Module::Stem {
+            source_index,
+            start,
+            end,
+            base_radius,
+            tip_radius,
+            color,
+        } => {
+            let mut a = [0.0_f32; 4];
+            let mut b = [0.0_f32; 4];
+            a[..3].copy_from_slice(&normalize(*start));
+            b[..3].copy_from_slice(&normalize(*end));
+            a[3] = base_radius / frame.radius;
+            b[3] = tip_radius / frame.radius;
+            crate::impostor::GpuModule {
+                origin_radius: a,
+                extent_radius: b,
+                color: *color,
+                metadata: [1, *source_index, 0, 0],
+            }
+        }
+        lorax_rs::Module::Canopy {
+            source_index,
+            source_ids,
+            bounds,
+            color,
+        } => {
+            let center = bounds.center();
+            let mut a = [0.0_f32; 4];
+            a[..3].copy_from_slice(&normalize(center));
+            a[3] = (bounds.max[0] - center[0]) / frame.radius;
+            crate::impostor::GpuModule {
+                origin_radius: a,
+                extent_radius: [
+                    (bounds.max[1] - center[1]) / frame.radius,
+                    (bounds.max[2] - center[2]) / frame.radius,
+                    0.0,
+                    0.0,
+                ],
+                color: *color,
+                metadata: [
+                    2,
+                    *source_index,
+                    u32::try_from(source_ids.len()).map_err(|_| FoliageError::TooLarge)?,
+                    0,
+                ],
+            }
+        }
+    };
+    let coordinates = packed
+        .origin_radius
+        .iter()
+        .chain(packed.extent_radius.iter());
+    if !coordinates.clone().all(|v| v.is_finite())
+        || packed.origin_radius[3] <= 0.0
+        || (packed.metadata[0] == 1 && packed.extent_radius[3] <= 0.0)
+        || (packed.metadata[0] == 2
+            && (packed.extent_radius[0] <= 0.0 || packed.extent_radius[1] <= 0.0))
+    {
+        return Err(FoliageError::Invalid("unrepresentable normalized module"));
+    }
+    Ok(packed)
+}
+
+/// Conservative radius in the shared model frame, including protruding
+/// fitted branch and foliage proxies outside original source spheres.
+fn module_radius(
+    tier: &lorax_rs::ModuleTier,
+    frame: SourceFrame,
+) -> std::result::Result<f32, FoliageError> {
+    SourceFrame::new(tier.source_frame.center, tier.source_frame.radius)?;
+    if !tier.required_culling_radius.is_finite() || tier.required_culling_radius <= 0.0 {
+        return Err(FoliageError::Invalid("invalid source variant cull radius"));
+    }
+    let b = tier.source_bounds;
+    if !b.valid() {
+        return Err(FoliageError::Invalid("invalid module source bounds"));
+    }
+    let farthest = std::array::from_fn::<_, 3, _>(|i| {
+        (b.max[i] - frame.center[i])
+            .abs()
+            .max((b.min[i] - frame.center[i]).abs())
+    });
+    let outer = farthest.into_iter().map(|v| v * v).sum::<f32>().sqrt();
+    let delta = tier
+        .source_frame
+        .center
+        .iter()
+        .zip(frame.center)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f32>()
+        .sqrt();
+    let radius = outer.max(delta + tier.required_culling_radius);
+    if !radius.is_finite() {
+        return Err(FoliageError::Invalid(
+            "unrepresentable variant culling bound",
+        ));
+    }
+    Ok(radius)
+}
+
+/// Normalize and pad arbitrary Lorax source variants into one GPU module bank.
+///
+/// Source model IDs may be any distinct u64 values; the caller maps those
+/// values onto explicit dense render slots without losing canonical metadata.
+/// Padding is inert, allowing species with different counts of branches and
+/// foliage to share an indirect draw. Every module retains original source
+/// indices so source-textured cluster atlases can be produced separately.
+///
+/// # Errors
+/// Rejects missing or repeated model IDs, degenerate source frames, non-finite
+/// transformed extents, or module/index overflow.
+pub fn compile_modules(
+    variants: &[(u64, lorax_rs::ModuleTier)],
+    shared_frame: SourceFrame,
+) -> std::result::Result<CompiledModuleBank, FoliageError> {
+    let frame = SourceFrame::new(shared_frame.center, shared_frame.radius)?;
+    if variants.is_empty() {
+        return Err(FoliageError::Invalid("missing module variants"));
+    }
+    let max_modules = variants
+        .iter()
+        .map(|(_, t)| t.modules.len())
+        .max()
+        .ok_or(FoliageError::Invalid("missing module variants"))?;
+    if max_modules == 0 {
+        return Err(FoliageError::Invalid("empty module geometry"));
+    }
+    let module_count = u32::try_from(max_modules).map_err(|_| FoliageError::TooLarge)?;
+    let total = variants
+        .len()
+        .checked_mul(max_modules)
+        .ok_or(FoliageError::TooLarge)?;
+    u32::try_from(variants.len()).map_err(|_| FoliageError::TooLarge)?;
+    module_count.checked_mul(12).ok_or(FoliageError::TooLarge)?;
+    let mut ids = Vec::new();
+    let mut data = Vec::new();
+    ids.try_reserve(variants.len())
+        .map_err(|_| FoliageError::TooLarge)?;
+    data.try_reserve(total)
+        .map_err(|_| FoliageError::TooLarge)?;
+    let mut largest_radius = frame.radius;
+    let mut unique = std::collections::BTreeSet::new();
+    for (id, tier) in variants {
+        if !unique.insert(*id) {
+            return Err(FoliageError::Invalid("duplicate source variant"));
+        }
+        ids.push(*id);
+        largest_radius = largest_radius.max(module_radius(tier, frame)?);
+        for module in &tier.modules {
+            data.push(pack_module(module, frame)?);
+        }
+        data.resize(
+            data.len()
+                .checked_add(max_modules - tier.modules.len())
+                .ok_or(FoliageError::TooLarge)?,
+            crate::impostor::GpuModule::default(),
+        );
+    }
+    if !largest_radius.is_finite() {
+        return Err(FoliageError::Invalid(
+            "unrepresentable variant culling bound",
+        ));
+    }
+    Ok(CompiledModuleBank {
+        data,
+        source_frame: frame,
+        variant_ids: ids,
+        modules_per_variant: module_count,
+        culling_expansion: largest_radius / frame.radius,
+    })
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+    use lorax_rs::Species;
+
+    #[test]
+    fn heterogeneous_species_share_explicit_frame_and_padded_gpu_stride()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let broadleaf = Species::default();
+        let mut conifer = broadleaf;
+        conifer.height *= 1.7;
+        conifer.crown_radius *= 0.55;
+        conifer.levels = 2;
+        let frame = SourceFrame::new([0.0, 8.0, 0.0], 22.0)?;
+        let variants = [
+            (&broadleaf, 0xdead_beef_u64),
+            (&conifer, 2_u64),
+            (&broadleaf, 99999_u64),
+        ]
+        .into_iter()
+        .map(|(species, seed)| {
+            let tree = Plant::generate(species, seed)?;
+            Ok((
+                seed,
+                tree.module_tier(
+                    ScreenLod::new(80.0, 0.75, 0.01)?.with_cluster_budget(24)?,
+                    species.wood_color,
+                )?,
+            ))
+        })
+        .collect::<std::result::Result<Vec<_>, FoliageError>>()?;
+        let bank = compile_modules(&variants, frame)?;
+        assert_eq!(bank.model_slot(0xdead_beef), Some(0));
+        assert_eq!(bank.model_slot(2), Some(1));
+        assert_eq!(bank.model_slot(99999), Some(2));
+        assert_eq!(bank.model_slot(0), None);
+        assert_eq!(
+            bank.data.len(),
+            usize::try_from(bank.modules_per_variant)? * variants.len()
+        );
+        assert!(bank.culling_expansion >= 1.0);
+        assert_eq!(bank.source_frame, frame);
+        assert!(bank.data.iter().any(|record| record.metadata[0] == 0));
+        assert!(bank.data.iter().any(|record| record.metadata[0] == 1));
+        assert!(bank.data.iter().any(|record| record.metadata[0] == 2));
+        assert!(bank.data.iter().all(|record| {
+            record
+                .origin_radius
+                .iter()
+                .chain(record.extent_radius.iter())
+                .all(|v| v.is_finite())
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_and_missing_models_rejected() -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let species = Species::default();
+        let plant = Plant::generate(&species, 5)?;
+        let tier = plant.module_tier(ScreenLod::new(40.0, 0.5, 12.0)?, species.wood_color)?;
+        let frame = tier.source_frame;
+        assert!(compile_modules(&[], frame).is_err());
+        assert!(compile_modules(&[(12, tier.clone()), (12, tier)], frame).is_err());
+        assert!(
+            compile_modules(
+                &[(
+                    4,
+                    plant.module_tier(ScreenLod::new(40.0, 0.5, 12.0)?, species.wood_color)?
+                )],
+                SourceFrame {
+                    center: [0.0; 3],
+                    radius: 0.0
+                }
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+}

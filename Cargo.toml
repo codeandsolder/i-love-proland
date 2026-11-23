@@ -11,7 +11,7 @@ keywords = ["procedural", "scatter", "terrain", "planet", "deterministic"]
 categories = ["game-development", "graphics", "algorithms"]
 
 [dependencies]
-lorax-rs = { git = "https://github.com/codeandsolder/lorax-rs", rev = "6dc8223257ef03fe2380757a3ee35311a26e4f7c" }
+lorax-rs = { git = "https://github.com/codeandsolder/lorax-rs", rev = "2b7f913f899ab42625df0403161557bbee3df659" }
 bytemuck = { version = "1.23", features = ["derive"], optional = true }
 wgpu = { version = "30.0.2", optional = true }
 
