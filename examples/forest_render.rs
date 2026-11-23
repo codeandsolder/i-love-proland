@@ -1046,18 +1046,24 @@ fn capture_module_forest(
     let plants = module_source_forms()?;
     let shared_frame = SourceFrame::new([0.0, 6.0, 0.0], 16.0)?;
     let mut visuals = Vec::new();
-    let lod_requests = [(0.0, 256.0, 64), (45.0, 96.0, 24), (110.0, 32.0, 8)];
+    // For crowns below 24px use one source canopy aggregate and its root
+    // stem (eight submitted triangles) instead of eight leaf clusters.
+    let lod_requests = [
+        (0.0, 256.0, 64, 0.75),
+        (45.0, 96.0, 24, 0.75),
+        (110.0, 16.0, 1, 16.0),
+    ];
     let mut bank_materials = Vec::new();
     let mut tier_descriptors = Vec::new();
     let mut largest_expansion = 1.0_f32;
-    for (start_m, projected, budget) in lod_requests {
+    for (start_m, projected, budget, stem_error) in lod_requests {
         let model_tiers = plants
             .iter()
             .map(|plant| {
                 Ok((
                     900_u64,
                     plant.module_tier(
-                        ScreenLod::new(projected, 0.75, 0.01)?.with_cluster_budget(budget)?,
+                        ScreenLod::new(projected, stem_error, 0.01)?.with_cluster_budget(budget)?,
                         Species::default().wood_color,
                     )?,
                 ))
