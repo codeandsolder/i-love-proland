@@ -19,6 +19,9 @@ use std::error::Error;
 use std::fs;
 use std::time::Instant;
 
+#[path = "forest_render/impostor_bench.rs"]
+mod impostor_bench;
+
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 
@@ -174,7 +177,9 @@ fn generate_forest() -> Result<(Vec<PackedInstance>, f64), Box<dyn Error>> {
     Ok((packed, start.elapsed().as_secs_f64() * 1000.0))
 }
 
-fn create_device() -> Result<(wgpu::Device, wgpu::Queue), Box<dyn Error>> {
+fn create_device(
+    required_features: wgpu::Features,
+) -> Result<(wgpu::Device, wgpu::Queue), Box<dyn Error>> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(descriptor);
@@ -188,6 +193,7 @@ fn create_device() -> Result<(wgpu::Device, wgpu::Queue), Box<dyn Error>> {
     Ok(pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("i-love-proland reference forest image capture"),
+            required_features,
             ..Default::default()
         },
     ))?)
@@ -343,9 +349,23 @@ struct ForestPass<'a> {
     background: &'a wgpu::RenderPipeline,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ForestQueries<'a> {
+    timestamps: Option<(&'a wgpu::QuerySet, u32)>,
+    fragments: Option<(&'a wgpu::QuerySet, u32)>,
+}
+
 fn render_frame(
     encoder: &mut wgpu::CommandEncoder,
     scene: &ForestPass<'_>,
+) -> Result<(), Box<dyn Error>> {
+    render_frame_with_queries(encoder, scene, ForestQueries::default())
+}
+
+fn render_frame_with_queries(
+    encoder: &mut wgpu::CommandEncoder,
+    scene: &ForestPass<'_>,
+    queries: ForestQueries<'_>,
 ) -> Result<(), Box<dyn Error>> {
     scene.renderer.encode(scene.queue, encoder, scene.view)?;
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -368,12 +388,24 @@ fn render_frame(
             stencil_ops: None,
         }),
         occlusion_query_set: None,
-        timestamp_writes: None,
+        timestamp_writes: queries.timestamps.map(|(query_set, start)| {
+            wgpu::RenderPassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(start),
+                end_of_pass_write_index: Some(start + 1),
+            }
+        }),
         multiview_mask: None,
     });
     pass.set_pipeline(scene.background);
     pass.draw(0..3, 0..1);
+    if let Some((set, index)) = queries.fragments {
+        pass.begin_pipeline_statistics_query(set, index);
+    }
     scene.renderer.draw(&mut pass);
+    if queries.fragments.is_some() {
+        pass.end_pipeline_statistics_query();
+    }
     Ok(())
 }
 
@@ -1163,11 +1195,23 @@ fn compare_impostor_visual_forms(
     renderer: &mut TreeRenderer,
     visuals: &[PackedInstance],
     view: GpuView,
+    largest_expansion: f32,
     render: &impl Fn(&mut TreeRenderer) -> Result<Vec<u8>, Box<dyn Error>>,
     prefix: &str,
 ) -> Result<usize, Box<dyn Error>> {
     let impostor_candidates = visuals
         .iter()
+        .copied()
+        .map(|mut object| {
+            // Both substituted forms must fit the same conservative bound
+            // and remain in the impostor bin when comparing their images.
+            object.position_radius[3] = object.axis_radii[..3]
+                .iter()
+                .copied()
+                .fold(0.0_f32, f32::max)
+                * largest_expansion;
+            object
+        })
         .filter(|object| {
             matches!(
                 classify_cpu(object, view, renderer.compactor().mesh_lods()),
@@ -1175,7 +1219,6 @@ fn compare_impostor_visual_forms(
             )
         })
         .take(1024)
-        .copied()
         .collect::<Vec<_>>();
     assert!(
         !impostor_candidates.is_empty(),
@@ -1259,8 +1302,15 @@ fn capture_module_forest(
     let empty = render(renderer)?;
     renderer.set_candidates(queue, visuals)?;
     let image = render(renderer)?;
-    let different_form_pixels =
-        compare_impostor_visual_forms(queue, renderer, visuals, view, &render, prefix)?;
+    let different_form_pixels = compare_impostor_visual_forms(
+        queue,
+        renderer,
+        visuals,
+        view,
+        largest_expansion,
+        &render,
+        prefix,
+    )?;
     let changed = empty
         .as_chunks::<4>()
         .0
@@ -1277,6 +1327,12 @@ fn capture_module_forest(
     assert!(
         renderer.set_candidates(queue, &[wrong_model]).is_err(),
         "a render-local module model must never silently differ from the canonical source variant"
+    );
+    let mut underbounded = visuals[0];
+    underbounded.position_radius[3] = f32::MIN_POSITIVE;
+    assert!(
+        renderer.set_candidates(queue, &[underbounded]).is_err(),
+        "the conservative classifier must enclose the physical impostor quad"
     );
     renderer.set_candidates(queue, visuals)?;
     let tri_per_changed_px_milli = triangles
@@ -1316,7 +1372,20 @@ fn reference_pipelines(device: &wgpu::Device) -> Result<TreePipelines, Box<dyn E
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if let [prefix, mode] = std::env::args().skip(1).collect::<Vec<_>>().as_slice()
+        && mode == "--impostor-bench"
+    {
+        return impostor_bench::run(prefix);
+    }
     let (prefix, source, module_smoke) = parse_forest_input()?;
+    run_forest_capture(&prefix, &source, module_smoke)
+}
+
+fn run_forest_capture(
+    prefix: &str,
+    source: &SourceImage,
+    module_smoke: bool,
+) -> Result<(), Box<dyn Error>> {
     let (vertices, indices) = sample_tree()?;
     // The synthetic source consists of a 10-sided trunk (20 vertices, 60
     // indices), followed by several UV-mapped crowns. They use different
@@ -1335,12 +1404,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         leaf_vertices,
         &leaf_indices,
         &bark,
-        &source,
+        source,
     )?;
     write_atlas_preview(&format!("{prefix}-atlas.ppm"), &atlas)?;
 
     let (candidates, generation_ms) = generate_forest()?;
-    let (device, queue) = create_device()?;
+    let (device, queue) = create_device(wgpu::Features::empty())?;
     let trunk_mesh = TreeMesh::new(&device, trunk_vertices, trunk_indices)?;
     let leaf_mesh = TreeMesh::new(&device, leaf_vertices, &leaf_indices)?;
     let pipelines = reference_pipelines(&device)?;
@@ -1386,7 +1455,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         depth: &targets.depth_view,
         background: &background,
     };
-    let greens = capture_initial_forest(&device, &scene, color, &prefix)?;
+    let greens = capture_initial_forest(&device, &scene, color, prefix)?;
 
     render_overhead(
         &device,
@@ -1394,7 +1463,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         low_camera,
         &overhead_background,
         color,
-        &prefix,
+        prefix,
     )?;
 
     let frame_ms = validate_and_benchmark(
@@ -1412,7 +1481,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &pipelines,
             bark_texture.view(),
             &candidates,
-            &prefix,
+            prefix,
         )?;
     }
     println!(

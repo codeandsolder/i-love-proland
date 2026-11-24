@@ -264,6 +264,15 @@ pub struct AtlasImage {
     rgba: Vec<u8>,
 }
 
+/// An angular image and its physical scale relative to the common mesh
+/// normalization frame. The anchor remains shared across every visual tier.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelAtlas {
+    pub variant_id: u64,
+    pub image: AtlasImage,
+    pub radius_scale: f32,
+}
+
 impl AtlasImage {
     /// # Errors
     /// Rejects inconsistent image byte lengths and inadequate tile padding.
@@ -321,7 +330,7 @@ impl AtlasImage {
     /// # Errors
     /// Rejects a device that cannot hold all angular views.
     pub fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<AtlasTexture> {
-        Self::upload_layers(device, queue, &[self], None)
+        Self::upload_layers(device, queue, &[self], None, vec![1.0])
     }
 
     /// Upload one independently baked angular atlas per dense visual form.
@@ -334,14 +343,21 @@ impl AtlasImage {
     pub fn upload_variants(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        variants: &[(u64, &Self)],
+        variants: &[ModelAtlas],
     ) -> Result<AtlasTexture> {
-        if variants.is_empty() {
-            return Err(Error::InvalidConfiguration("empty impostor variant atlas"));
-        }
-        let images = variants.iter().map(|(_, image)| *image).collect::<Vec<_>>();
-        let ids = variants.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        Self::upload_layers(device, queue, &images, Some(ids))
+        let images = variants
+            .iter()
+            .map(|model| &model.image)
+            .collect::<Vec<_>>();
+        let ids = variants
+            .iter()
+            .map(|model| model.variant_id)
+            .collect::<Vec<_>>();
+        let scales = variants
+            .iter()
+            .map(|model| model.radius_scale)
+            .collect::<Vec<_>>();
+        Self::upload_layers(device, queue, &images, Some(ids), scales)
     }
 
     fn upload_layers(
@@ -349,6 +365,7 @@ impl AtlasImage {
         queue: &wgpu::Queue,
         images: &[&Self],
         variant_ids: Option<Vec<u64>>,
+        radius_scales: Vec<f32>,
     ) -> Result<AtlasTexture> {
         let first = images
             .first()
@@ -363,6 +380,10 @@ impl AtlasImage {
         if images
             .iter()
             .any(|image| image.tile_size != first.tile_size || image.gutter != first.gutter)
+            || radius_scales.len() != images.len()
+            || radius_scales
+                .iter()
+                .any(|scale| !scale.is_finite() || *scale <= 0.0)
             || side > limits.max_texture_dimension_2d
             || layers > limits.max_texture_array_layers
         {
@@ -404,10 +425,17 @@ impl AtlasImage {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
+        let scale_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("i-love-proland per-model impostor radius scales"),
+            contents: bytemuck::cast_slice(&radius_scales),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         Ok(AtlasTexture {
             _texture: texture,
             view,
             variant_ids,
+            radius_scales,
+            scale_buffer,
         })
     }
 
@@ -495,6 +523,8 @@ pub struct AtlasTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     variant_ids: Option<Vec<u64>>,
+    radius_scales: Vec<f32>,
+    scale_buffer: wgpu::Buffer,
 }
 
 /// Explicit camera-relative projection. The application owns view rotation.
@@ -667,7 +697,8 @@ struct MeshDraw {
 pub struct TreeRenderer {
     pipelines: TreePipelines,
     mesh_draws: Vec<MeshDraw>,
-    module_variant_ids: Option<Vec<u64>>,
+    atlas_variant_ids: Option<Vec<u64>>,
+    atlas_radius_scales: Vec<f32>,
     impostor_bind: wgpu::BindGroup,
     impostor_uniforms: wgpu::Buffer,
     instance_bindings: Vec<wgpu::BindGroup>,
@@ -801,6 +832,16 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -918,6 +959,10 @@ fn make_draw_bind(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::TextureView(materials.wind_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: materials.atlas.scale_buffer.as_entire_binding(),
             },
         ],
     })
@@ -1257,7 +1302,8 @@ impl TreeRenderer {
         Ok(Self {
             pipelines: pipelines.clone(),
             mesh_draws,
-            module_variant_ids,
+            atlas_variant_ids: atlas.variant_ids.clone(),
+            atlas_radius_scales: atlas.radius_scales.clone(),
             impostor_bind,
             impostor_uniforms,
             instance_bindings,
@@ -1285,18 +1331,40 @@ impl TreeRenderer {
         &self,
         candidates: impl IntoIterator<Item = &'a PackedInstance>,
     ) -> Result<()> {
-        let Some(ids) = &self.module_variant_ids else {
-            return Ok(());
-        };
-        if candidates.into_iter().any(|object| {
-            usize::try_from(object.render_model[0])
-                .ok()
-                .and_then(|index| ids.get(index))
-                .is_none_or(|&id| id != object.variant_id())
-        }) {
-            return Err(Error::InvalidConfiguration(
-                "module visual model does not match canonical source variant",
-            ));
+        for object in candidates {
+            let index =
+                usize::try_from(object.render_model[0]).map_err(|_| Error::IndexOverflow)?;
+            if self
+                .atlas_variant_ids
+                .as_ref()
+                .is_some_and(|ids| ids.get(index).is_none_or(|&id| id != object.variant_id()))
+            {
+                return Err(Error::InvalidConfiguration(
+                    "impostor visual model does not match canonical source variant",
+                ));
+            }
+            let scale = *self
+                .atlas_radius_scales
+                .get(index)
+                .ok_or(Error::InvalidConfiguration(
+                    "missing impostor visual model scale",
+                ))?;
+            let required = object.axis_radii[..3]
+                .iter()
+                .copied()
+                .fold(0.0_f32, f32::max)
+                * scale;
+            let physical = object.position_radius[3];
+            if !required.is_finite()
+                || required <= 0.0
+                || !physical.is_finite()
+                || physical <= 0.0
+                || required > physical * 8.0_f32.mul_add(f32::EPSILON, 1.0)
+            {
+                return Err(Error::InvalidConfiguration(
+                    "impostor exceeds physical culling radius",
+                ));
+            }
         }
         Ok(())
     }

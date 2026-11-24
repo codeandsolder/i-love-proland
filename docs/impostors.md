@@ -84,7 +84,11 @@ coverage. Fragment shading blends the two neighbouring azimuths and two
 neighbouring elevations in premultiplied space, then unpremultiplies
 before alpha-to-coverage or ordered dithering.
 The quad faces the camera; its dimensions are derived from the projected
-source ellipsoid, conservatively covering nonuniform XYZ scale. Its right/up
+source ellipsoid and the model atlas's radius scale, conservatively covering
+nonuniform XYZ scale. Procedural model atlases are baked about the same
+source anchor but with a tight radius enclosing the actual module corners.
+Only the billboard and its atlas normalization change; physical mesh
+transforms remain unchanged. Authored single-source atlases use scale one. Its right/up
 axes follow the source orientation, including a stable overhead fallback.
 
 `atlas_bake::bake_scene()` accepts a slice of `BakeSurface` records containing

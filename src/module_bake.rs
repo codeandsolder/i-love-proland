@@ -8,7 +8,7 @@
 use crate::{
     Error, Result,
     atlas_bake::{BakeSurface, bake_scene, to_byte},
-    impostor::{AtlasImage, AtlasTexture, GpuModule, TreeVertex},
+    impostor::{AtlasImage, AtlasTexture, GpuModule, ModelAtlas, TreeVertex},
     material::{SourceImage, linear_to_srgb},
     procedural::CompiledModuleBank,
 };
@@ -185,13 +185,7 @@ impl CompiledModuleBank {
         gutter: u32,
     ) -> Result<AtlasTexture> {
         let images = self.bake_variant_atlases(source, tile_size, gutter)?;
-        let catalog = self
-            .variant_ids
-            .iter()
-            .copied()
-            .zip(&images)
-            .collect::<Vec<_>>();
-        AtlasImage::upload_variants(device, queue, &catalog)
+        AtlasImage::upload_variants(device, queue, &images)
     }
 
     /// Bake a 32-angle impostor per dense visual model, including the same
@@ -200,18 +194,19 @@ impl CompiledModuleBank {
     ///
     /// For an exact match, use the same source image for GPU module materials;
     /// the baker adds the module canopy's radial alpha envelope while keeping
-    /// source-sampled linear RGB. A common source normalization frame must
-    /// conservatively enclose every branch/card endpoint.
+    /// source-sampled linear RGB. Each model is rebaked within its own
+    /// tight sphere about the common source anchor. Its atlas scale restores
+    /// the exact original projected physical dimensions at render time.
     ///
     /// # Errors
-    /// Rejects geometry outside the common frame, invalid module geometry,
-    /// inconsistent variant strides, and invalid angular atlas parameters.
+    /// Rejects geometry outside its physical culling bound, invalid module
+    /// geometry, inconsistent strides, and invalid angular atlas parameters.
     pub fn bake_variant_atlases(
         &self,
         source: &SourceImage,
         tile_size: u32,
         gutter: u32,
-    ) -> Result<Vec<AtlasImage>> {
+    ) -> Result<Vec<ModelAtlas>> {
         if !(8..=512).contains(&tile_size)
             || gutter == 0
             || u64::from(gutter) * 4 >= u64::from(tile_size)
@@ -224,6 +219,7 @@ impl CompiledModuleBank {
         let stride = usize::try_from(self.modules_per_variant).map_err(|_| Error::IndexOverflow)?;
         if self.variant_ids.is_empty()
             || stride == 0
+            || self.variant_ids.len() != self.variant_culling_radii.len()
             || self.variant_ids.len().checked_mul(stride) != Some(self.data.len())
         {
             return Err(Error::InvalidConfiguration(
@@ -232,7 +228,8 @@ impl CompiledModuleBank {
         }
         self.data
             .chunks_exact(stride)
-            .map(|modules| {
+            .zip(self.variant_ids.iter().zip(&self.variant_culling_radii))
+            .map(|(modules, (&variant_id, &bound))| {
                 let mut branches = QuadMesh::default();
                 let mut leaves = QuadMesh::default();
                 for module in modules {
@@ -246,9 +243,37 @@ impl CompiledModuleBank {
                         dest.push(quad(module, side)?)?;
                     }
                 }
+                let radius_scale = branches
+                    .vertices
+                    .iter()
+                    .chain(&leaves.vertices)
+                    .map(|v| v.position[..3].iter().map(|x| x * x).sum::<f32>())
+                    .fold(0.0_f32, f32::max)
+                    .sqrt()
+                    .next_up();
+                let max_scale = bound / self.source_frame.radius;
+                if !radius_scale.is_finite()
+                    || radius_scale <= 0.0
+                    || !max_scale.is_finite()
+                    || max_scale <= 0.0
+                    || radius_scale > max_scale * 8.0_f32.mul_add(f32::EPSILON, 1.0)
+                {
+                    return Err(Error::InvalidConfiguration(
+                        "module atlas exceeds physical source bound",
+                    ));
+                }
+                for vertex in branches.vertices.iter_mut().chain(&mut leaves.vertices) {
+                    for component in &mut vertex.position[..3] {
+                        *component /= radius_scale;
+                    }
+                }
                 let materials = [branches.surface(source, 0.35), leaves.surface(&mask, 0.5)];
                 let surfaces = materials.into_iter().flatten().collect::<Vec<_>>();
-                bake_scene(&surfaces, tile_size, gutter)
+                Ok(ModelAtlas {
+                    variant_id,
+                    radius_scale,
+                    image: bake_scene(&surfaces, tile_size, gutter)?,
+                })
             })
             .collect()
     }
@@ -287,14 +312,66 @@ mod tests {
         .map_err(|_| Error::InvalidConfiguration("module compilation"))?;
         let atlases = bank.bake_variant_atlases(&SourceImage::white(), 16, 2)?;
         assert_eq!(atlases.len(), sources.len());
-        assert_ne!(atlases[0].rgba(), atlases[1].rgba());
-        assert!(
-            atlases
-                .iter()
-                .all(|atlas| atlas.rgba().chunks_exact(4).any(|pixel| pixel[3] != 0))
-        );
+        assert_ne!(atlases[0].image.rgba(), atlases[1].image.rgba());
+        assert!(atlases.iter().all(|atlas| {
+            atlas
+                .image
+                .rgba()
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] != 0)
+        }));
         assert!(
             bank.bake_variant_atlases(&SourceImage::white(), 4, 2)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scaled_forms_reuse_full_atlas_resolution_without_changing_physical_size() -> Result<()> {
+        let branch = GpuModule {
+            origin_radius: [0.0, 0.0, 0.0, 0.02],
+            extent_radius: [0.0, 0.5, 0.0, 0.01],
+            color: [0.2, 0.1, 0.05, 1.0],
+            metadata: [1, 0, 0, 0],
+        };
+        let leaf = GpuModule {
+            origin_radius: [0.0, 0.4, 0.0, 0.15],
+            extent_radius: [0.15, 0.15, 0.0, 0.0],
+            color: [0.1, 0.2, 0.05, 1.0],
+            metadata: [2, 1, 1, 0],
+        };
+        let small = |mut module: GpuModule| {
+            for component in module
+                .origin_radius
+                .iter_mut()
+                .chain(&mut module.extent_radius)
+            {
+                *component *= 0.25;
+            }
+            module
+        };
+        let mut bank = CompiledModuleBank {
+            data: vec![branch, leaf, small(branch), small(leaf)],
+            source_frame: SourceFrame::new([0.0; 3], 10.0)
+                .map_err(|_| Error::InvalidConfiguration("source frame"))?,
+            variant_ids: vec![900, 900],
+            modules_per_variant: 2,
+            variant_culling_radii: vec![6.0, 1.5],
+        };
+        let atlases = bank.bake_variant_atlases(&SourceImage::white(), 32, 2)?;
+        let [large, small] = atlases.as_slice() else {
+            return Err(Error::InvalidConfiguration("expected two model atlases"));
+        };
+        assert_eq!(large.variant_id, small.variant_id);
+        assert_eq!(small.radius_scale, large.radius_scale * 0.25);
+        assert_eq!(large.image, small.image);
+        assert!(large.radius_scale < 0.6 && small.radius_scale < 0.15);
+        // Equal normalized alpha coverage now represents 1/16 as much
+        // physical area, and uses 1/16 as much billboard raster area.
+        bank.variant_culling_radii[1] = 0.01;
+        assert!(
+            bank.bake_variant_atlases(&SourceImage::white(), 32, 2)
                 .is_err()
         );
         Ok(())
