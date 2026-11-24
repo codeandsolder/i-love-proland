@@ -1089,7 +1089,14 @@ fn build_module_forest(
             })
             .collect::<std::result::Result<Vec<_>, i_love_proland::foliage::Error>>()?;
         let compiled = compile_modules(&model_tiers, shared_frame)?;
-        largest_expansion = largest_expansion.max(compiled.culling_expansion);
+        largest_expansion = largest_expansion.max(
+            compiled
+                .variant_culling_radii
+                .iter()
+                .copied()
+                .fold(shared_frame.radius, f32::max)
+                / shared_frame.radius,
+        );
         if visuals.is_empty() {
             visuals = module_grove_candidates(candidates, &compiled)?;
             assert_all_visual_forms_present(&visuals, plants.len());

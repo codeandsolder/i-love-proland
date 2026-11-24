@@ -223,8 +223,13 @@ pub struct CompiledModuleBank {
     /// Source variant IDs in dense GPU module-slot order, never rehashed.
     pub variant_ids: Vec<u64>,
     pub modules_per_variant: u32,
-    /// Expand the shared source-frame sphere by this multiplier for culling.
-    pub culling_expansion: f32,
+    /// Conservative local physical culling radii, indexed by the same dense
+    /// visual form slot as \`variant_ids\`. Bounds are measured about the
+    /// *shared source frame center*, not each plant's private center, so
+    /// instances keep one immutable physical anchor through all LOD tiers.
+    /// Each value also encloses the full source geometry under this module
+    /// tier, including tapered stems and crossed canopy card corners.
+    pub variant_culling_radii: Vec<f32>,
 }
 
 impl CompiledModuleBank {
@@ -419,14 +424,17 @@ pub fn compile_modules(
     module_count.checked_mul(12).ok_or(FoliageError::TooLarge)?;
     let mut ids = Vec::new();
     let mut data = Vec::new();
+    let mut variant_culling_radii = Vec::new();
     ids.try_reserve(variants.len())
         .map_err(|_| FoliageError::TooLarge)?;
     data.try_reserve(total)
         .map_err(|_| FoliageError::TooLarge)?;
-    let mut largest_radius = frame.radius;
+    variant_culling_radii
+        .try_reserve(variants.len())
+        .map_err(|_| FoliageError::TooLarge)?;
     for (id, tier) in variants {
         ids.push(*id);
-        largest_radius = largest_radius.max(module_radius(tier, frame)?);
+        variant_culling_radii.push(module_radius(tier, frame)?);
         for module in &tier.modules {
             data.push(pack_module(module, frame)?);
         }
@@ -437,17 +445,12 @@ pub fn compile_modules(
             crate::impostor::GpuModule::default(),
         );
     }
-    if !largest_radius.is_finite() {
-        return Err(FoliageError::Invalid(
-            "unrepresentable variant culling bound",
-        ));
-    }
     Ok(CompiledModuleBank {
         data,
         source_frame: frame,
         variant_ids: ids,
         modules_per_variant: module_count,
-        culling_expansion: largest_radius / frame.radius,
+        variant_culling_radii,
     })
 }
 
@@ -491,8 +494,27 @@ mod module_tests {
             bank.data.len(),
             usize::try_from(bank.modules_per_variant)? * variants.len()
         );
-        assert!(bank.culling_expansion >= 1.0);
+        assert_eq!(bank.variant_culling_radii.len(), variants.len());
+        assert!(
+            bank.variant_culling_radii
+                .iter()
+                .all(|radius| *radius > 0.0)
+        );
+        assert!(
+            bank.variant_culling_radii
+                .iter()
+                .all(|radius| radius.is_finite())
+        );
         assert_eq!(bank.source_frame, frame);
+        for ((_, tier), &radius) in variants.iter().zip(&bank.variant_culling_radii) {
+            let bounds = tier.source_bounds;
+            let farthest: [f32; 3] = std::array::from_fn(|axis| {
+                (bounds.max[axis] - frame.center[axis])
+                    .abs()
+                    .max((bounds.min[axis] - frame.center[axis]).abs())
+            });
+            assert!(farthest.into_iter().map(|x| x * x).sum::<f32>().sqrt() <= radius);
+        }
         assert!(bank.data.iter().any(|record| record.metadata[0] == 0));
         assert!(bank.data.iter().any(|record| record.metadata[0] == 1));
         assert!(bank.data.iter().any(|record| record.metadata[0] == 2));
@@ -524,6 +546,7 @@ mod module_tests {
         let shared_frame = SourceFrame::new([0.0, 4.0, 0.0], 15.0)?;
         let bank = compile_modules(&variants, shared_frame)?;
         assert_eq!(bank.variant_ids, vec![900; 8]);
+        assert_eq!(bank.variant_culling_radii.len(), 8);
         let slots = (0..300_u64)
             .map(|seed| bank.model_slot_for_seed(900, seed))
             .collect::<Vec<_>>();
@@ -538,6 +561,50 @@ mod module_tests {
         assert_eq!(bank.model_slot_for_seed(901, 5), None);
         let stride = usize::try_from(bank.modules_per_variant)?;
         assert_ne!(bank.data[0..stride], bank.data[stride..2 * stride]);
+        Ok(())
+    }
+
+    #[test]
+    fn heterogeneous_visual_forms_keep_independent_conservative_bounds()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let wide = Species {
+            height: 24.0,
+            crown_radius: 10.0,
+            ..Species::default()
+        };
+        let small = Species {
+            height: 5.0,
+            crown_radius: 1.5,
+            ..Species::default()
+        };
+        let frame = SourceFrame::new([0.0, 10.0, 0.0], 45.0)?;
+        let variants = [&wide, &small]
+            .into_iter()
+            .map(|species| {
+                let plant = Plant::generate(species, 17)?;
+                Ok((
+                    900,
+                    plant.module_tier(
+                        ScreenLod::new(32.0, 0.75, 0.01)?.with_cluster_budget(8)?,
+                        species.wood_color,
+                    )?,
+                ))
+            })
+            .collect::<std::result::Result<Vec<_>, FoliageError>>()?;
+        let bank = compile_modules(&variants, frame)?;
+        let [large, small] = bank.variant_culling_radii.as_slice() else {
+            return Err("expected exactly two source radii".into());
+        };
+        assert!(*large > *small * 1.25);
+        // These bounds are shared-frame-relative rather than normalized to
+        // the individual source plant's independently chosen source center.
+        assert!(*large <= frame.radius);
+        assert!(*small <= frame.radius);
+        for ((_, tier), radius) in variants.iter().zip(&bank.variant_culling_radii) {
+            assert!(module_radius(tier, frame)? <= *radius);
+            assert!(radius.is_finite() && *radius > 0.0);
+        }
+        assert!(bank.model_slot_for_seed(900, 6).is_some());
         Ok(())
     }
 

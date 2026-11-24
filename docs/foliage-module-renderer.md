@@ -17,8 +17,13 @@ scatter system or an automatic replacement for the current KSP assets.
   can share one persistent u64 source variant ID. The dense index order is
   explicit; use CompiledModuleBank::model_slot_for_seed(source_id, stable_seed)
   to select a visual form using persistent object/biome context.
-  Source colors, geometry bounds, and conservative culling expansion survive.
-  Neither selected visual slot nor seed changes the canonical source ID.
+  Source colors and geometric bounds survive. Each selected visual slot has
+  a separate conservative radius in \`CompiledModuleBank.variant_culling_radii\`,
+  measured about the **shared** source-frame center; the host applies that
+  radius to its GPU culling/LOD sphere without modifying source-frame
+  normalization, physical transform, source anchor, or canonical object ID.
+  A shared maximum culling expansion would incorrectly make tiny shrubs
+  project as large mature trees, causing avoidable near/middle geometry.
 - Upload to TreeModules once, not each frame. Each source-space descriptor is
   64 bytes: a typed tapered stem or spatial canopy ellipsoid plus source ID
   and original membership count. GPU expansion emits two crossed cards per
