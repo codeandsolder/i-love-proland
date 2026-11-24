@@ -91,7 +91,7 @@ and byte offset. All indirect `first_instance` values are zero relative
 to the independently bound slice. Only the instance count is atomically
 updated; no object is copied to multiple bins. Choose mesh ranges
 independently of the final projected-size impostor threshold. Mark a tier
-\`prefer_mesh: true\` if the original mesh is already a cheap authored
+`prefer_mesh: true` if the original mesh is already a cheap authored
 billboard/low-cost representation preferable to a generated impostor.
 The storage table contains a squared start distance and a preference flag
 for each tier; the same classifier runs on CPU and GPU.
@@ -99,7 +99,7 @@ for each tier; the same classifier runs on CPU and GPU.
 Below the impostor threshold, the ordinary intended output is the terrain
 canopy appearance field, not a microscopic mesh. A host using a separately
 defined world-space aggregate handoff may instead opt into
-\`GpuView::with_explicit_population()\`: the supplied candidate population
+`GpuView::with_explicit_population()`: the supplied candidate population
 already complements its aggregate field, so frustum-visible objects are
 never discarded a second time based only on projected size. Very small
 non-preferred meshes still choose the generated impostor. The compactor
@@ -223,3 +223,20 @@ The caller owns canonical ID-to-slot mapping; slot order is not semantic.
 
 The GPU example checks actual storage bytes and classified IDs across
 replacement, shrink, zero count and regrowth on AMD Vulkan.
+
+## Staggered projected LOD transitions
+
+A host can call `GpuView::with_projected_lod_spread(0.25)` to spread
+each projected visual threshold across a deterministic ±25% band.
+At a nominal 32px crossover, individual trees switch at 24–40px;
+the near/mid threshold is varied by the same multiplier, preserving
+tier order. The multiplier hashes all four canonical ID words, not
+the GPU slot, model, camera frame or terrain handoff rank. It is
+computed directly during CPU/GPU classification from the existing
+instance record; each tree still contributes to exactly one draw bin.
+
+Zero spread (default) retains the previous exact thresholds.
+The terrain canopy cutoff, distance-based canopy ownership,
+frustum tests, and authored distance tier boundaries are unaffected.
+Staggering distributes population-level changes across distance and
+zoom but does not crossfade an individual silhouette.

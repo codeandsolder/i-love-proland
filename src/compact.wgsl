@@ -13,7 +13,7 @@ struct IndexedDraw {
 struct View {
     counts: vec4<u32>,             // input count, aligned bin stride (u32 indices), mesh bin count, host-owned population flag
     lod: vec4<f32>,                // focal pixels, mesh threshold, impostor threshold, animation displacement bound
-    forward: vec4<f32>,            // normalized camera forward
+    forward: vec4<f32>,            // normalized camera forward, w=projected LOD spread
     source_center: vec4<f32>,      // original source XYZ, W=projected-diameter LOD mode
     planes: array<vec4<f32>, 6>,   // xyz normal, w offset; camera-relative
     eye: vec4<f32>,               // eye in resident local frame
@@ -29,6 +29,26 @@ struct View {
 fn rotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
     let t = 2.0 * cross(q.xyz, v);
     return v + q.w * t + cross(q.xyz, t);
+}
+
+fn rotate_left_bits(value: u32, shift: u32) -> u32 {
+    return (value << shift) | (value >> (32u - shift));
+}
+
+// Same integer avalanche and exact 16-bit rank as the CPU classifier.
+fn projected_lod_multiplier(id: vec4<u32>, spread: f32) -> f32 {
+    if spread == 0.0 {
+        return 1.0;
+    }
+    var hash = id.x ^ rotate_left_bits(id.y, 7u)
+        ^ rotate_left_bits(id.z, 13u) ^ rotate_left_bits(id.w, 21u);
+    hash ^= hash >> 16u;
+    hash *= 0x7feb352du;
+    hash ^= hash >> 15u;
+    hash *= 0x846ca68bu;
+    hash ^= hash >> 16u;
+    let rank = f32(hash >> 16u) / 65536.0;
+    return fma(2.0 * rank - 1.0, spread, 1.0);
 }
 
 @compute @workgroup_size(64)
@@ -83,6 +103,7 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if camera.counts.w == 0u && projected_crown < camera.lod.z * safe_depth {
         return;
     }
+    let visual_depth = safe_depth * projected_lod_multiplier(instance.object_id, camera.forward.w);
     var low = 0u;
     var high = camera.counts.z;
     if camera.source_center.w > 0.5 {
@@ -92,7 +113,7 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // consistent across differently scaled physical tree instances.
         while low < high {
             let middle = low + (high - low) / 2u;
-            if projected_crown < mesh_lods[middle].x * safe_depth {
+            if projected_crown < mesh_lods[middle].x * visual_depth {
                 low = middle + 1u;
             } else {
                 high = middle;
@@ -115,7 +136,7 @@ fn classify_and_compact(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Cheap original cards can be preferable to generated impostors,
     // independently of the family's projected-size crossover.
     var bin = camera.counts.z;
-    if mesh_lods[low].y > 0.5 || projected_crown >= camera.lod.y * safe_depth {
+    if mesh_lods[low].y > 0.5 || projected_crown >= camera.lod.y * visual_depth {
         bin = low;
     }
     let slot = atomicAdd(&draws[bin].instance_count, 1u);

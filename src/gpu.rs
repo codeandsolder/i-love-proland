@@ -234,6 +234,7 @@ pub struct GpuView {
     explicit_population: bool,
     eye: [f32; 3],
     handoff_range: [f32; 2],
+    lod_spread: f32,
 }
 
 impl GpuView {
@@ -290,6 +291,7 @@ impl GpuView {
             explicit_population: false,
             eye: [0.0; 3],
             handoff_range: [0.0; 2],
+            lod_spread: 0.0,
         })
     }
 
@@ -425,6 +427,26 @@ impl GpuView {
         }
         self.handoff_range = [begin, end];
         self.explicit_population = true;
+        Ok(self)
+    }
+
+    /// Stagger projected visual LOD transitions across canonical objects.
+    /// Each object receives one stable threshold multiplier in
+    /// [1 - spread, 1 + spread), shared by every projected mesh tier and
+    /// the mesh/impostor crossover. There is no camera history, duplicate
+    /// drawing, or extra instance storage. Authored distance boundaries,
+    /// visibility and terrain canopy ownership are not staggered.
+    ///
+    /// This is a population-level transition, not a per-object crossfade.
+    /// Zero (the default) preserves exact, unstaggered thresholds.
+    ///
+    /// # Errors
+    /// Rejects nonfinite spread or a value outside [0, 0.5].
+    pub fn with_projected_lod_spread(mut self, spread: f32) -> Result<Self> {
+        if !spread.is_finite() || !(0.0..=0.5).contains(&spread) {
+            return Err(Error::InvalidConfiguration("invalid projected LOD spread"));
+        }
+        self.lod_spread = spread;
         Ok(self)
     }
 
@@ -604,6 +626,23 @@ fn source_anchor(object: &PackedInstance, view: GpuView, position: [f32; 3]) -> 
     core::array::from_fn(|i| position[i] - (object.rotation[3].mul_add(t[i], v[i]) + u[i]))
 }
 
+/// An integer avalanche over all canonical ID words, independent of
+/// resident slots, visual model, camera, and the separate canopy rank.
+fn projected_lod_multiplier(id: [u32; 4], spread: f32) -> f32 {
+    if spread == 0.0 {
+        return 1.0;
+    }
+    let mut hash = id[0] ^ id[1].rotate_left(7) ^ id[2].rotate_left(13) ^ id[3].rotate_left(21);
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x7feb_352d);
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(0x846c_a68b);
+    hash ^= hash >> 16;
+    let [_, _, low, high] = hash.to_le_bytes();
+    let rank = f32::from(u16::from_le_bytes([low, high])) / 65_536.0;
+    (2.0 * rank - 1.0).mul_add(spread, 1.0)
+}
+
 /// Reference classifier for parity testing with the WGSL shader.
 ///
 /// Both paths use the same f32 inputs and cross-multiplied pixel thresholds;
@@ -654,14 +693,16 @@ pub fn classify_cpu(object: &PackedInstance, view: GpuView, mesh_lods: &MeshLods
     if !view.explicit_population && projected_crown < view.impostor_threshold_px * safe_depth {
         return VisualLod::TerrainCanopy;
     }
+    let visual_depth = safe_depth * projected_lod_multiplier(object.object_id, view.lod_spread);
     let tier = mesh_lods
-        .tier_for_projection(projected_crown, safe_depth)
+        .tier_for_projection(projected_crown, visual_depth)
         .unwrap_or_else(|| {
             let anchor = source_anchor(object, view, pos);
             let distance_squared = anchor.iter().map(|x| x * x).sum();
             mesh_lods.tier_for_distance_squared(distance_squared)
         });
-    if mesh_lods.tiers[tier].prefer_mesh || projected_crown >= view.mesh_threshold_px * safe_depth {
+    if mesh_lods.tiers[tier].prefer_mesh || projected_crown >= view.mesh_threshold_px * visual_depth
+    {
         VisualLod::Mesh(tier)
     } else {
         VisualLod::Impostor
@@ -1072,7 +1113,12 @@ impl GpuCompactor {
                 view.impostor_threshold_px,
                 view.displacement_bound,
             ],
-            forward: [view.forward[0], view.forward[1], view.forward[2], 0.0],
+            forward: [
+                view.forward[0],
+                view.forward[1],
+                view.forward[2],
+                view.lod_spread,
+            ],
             source_center: [
                 view.source_center[0],
                 view.source_center[1],
@@ -1371,6 +1417,71 @@ mod tests {
             VisualLod::OutsideFrustum
         );
     }
+    #[test]
+    fn staggered_projected_lod_is_stable_monotonic_and_population_bounded() {
+        let lods = MeshLods::new(vec![
+            MeshLod {
+                start_m: 0.0,
+                index_count: 12,
+                prefer_mesh: true,
+            },
+            MeshLod {
+                start_m: 45.0,
+                index_count: 6,
+                prefer_mesh: false,
+            },
+        ])
+        .unwrap()
+        .with_projected_diameters(vec![80.0, 0.0])
+        .unwrap();
+        let view = GpuView::unculled(500.0, 32.0, 1.0).unwrap();
+        for invalid in [-0.01, 0.51, f32::NAN, f32::INFINITY] {
+            assert!(view.with_projected_lod_spread(invalid).is_err());
+        }
+        let spread = view.with_projected_lod_spread(0.25).unwrap();
+        let mut midpoint_mesh = 0;
+        let mut midpoint_near = 0;
+        for id in 0..1024_u32 {
+            let mut object = PackedInstance {
+                position_radius: [0.0, 0.0, 1000.0, 1.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                axis_radii: [1.0, 1.0, 1.0, 0.0],
+                object_id: [id, 37, 11, 93],
+                metadata: [0; 4],
+                render_model: [0; 4],
+                handoff_anchor_rank: [0.0; 4],
+                tint: [1.0; 4],
+            };
+            assert_eq!(classify_cpu(&object, spread, &lods), VisualLod::Impostor);
+            object.position_radius[2] = 2000.0;
+            assert_eq!(
+                classify_cpu(&object, spread, &lods),
+                VisualLod::TerrainCanopy
+            );
+            let classify = |object: &mut PackedInstance, px: f32| {
+                object.position_radius[2] = 1000.0 / px;
+                classify_cpu(object, spread, &lods)
+            };
+            assert_eq!(classify(&mut object, 23.0), VisualLod::Impostor);
+            let middle = classify(&mut object, 32.0);
+            if middle == VisualLod::Mesh(1) {
+                midpoint_mesh += 1;
+            }
+            assert_eq!(classify(&mut object, 41.0), VisualLod::Mesh(1));
+            assert_eq!(classify(&mut object, 59.0), VisualLod::Mesh(1));
+            if classify(&mut object, 80.0) == VisualLod::Mesh(0) {
+                midpoint_near += 1;
+            }
+            assert_eq!(classify(&mut object, 101.0), VisualLod::Mesh(0));
+            object.render_model[0] = 5;
+            object.handoff_anchor_rank[3] = 0.75;
+            assert_eq!(classify(&mut object, 32.0), middle);
+            assert_eq!(classify_cpu(&object, view, &lods), VisualLod::Mesh(1));
+        }
+        assert!((450..575).contains(&midpoint_mesh));
+        assert_eq!(midpoint_mesh, midpoint_near);
+    }
+
     #[test]
     fn arbitrary_lod_ranges_and_alignment() {
         let tier = |start_m| MeshLod {
