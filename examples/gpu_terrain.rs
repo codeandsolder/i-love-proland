@@ -2,6 +2,8 @@
 mod physics;
 #[path = "gpu_terrain/reference.rs"]
 mod reference;
+#[path = "gpu_terrain/regeneration.rs"]
+mod regeneration;
 // Actual device probe: deterministic overlapping grids, independent
 // collision snapshot ownership, real channel samples, batched timings.
 use i_love_proland::terrain::{
@@ -309,6 +311,17 @@ fn profile(device: &wgpu::Device, queue: &wgpu::Queue, region: &Region, side: u1
 
 fn main() -> Result<()> {
     let (device, queue) = device()?;
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--regeneration")
+    {
+        let asset = std::env::args_os()
+            .nth(2)
+            .ok_or_else(|| io::Error::other("expected regional asset"))?;
+        let output = std::env::args_os().nth(3);
+        let region = Region::read(&std::fs::read(Path::new(&asset))?)?;
+        return regeneration::run(&device, &queue, &region, output.as_deref().map(Path::new));
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|argument| argument == "--physics")
