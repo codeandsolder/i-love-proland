@@ -250,7 +250,7 @@ fn check_prediction(
 
 pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = slope_region(0.0)?;
-    let mut terrain = TerrainGpu::new(device, &region, 65, 1, 0, 0.0)?;
+    let mut terrain = TerrainGpu::new(device, &region, 65, 1)?;
     let mut commands = encoder(device);
     terrain.encode(
         device,
@@ -334,7 +334,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
 
 fn check_slope(device: &wgpu::Device, queue: &wgpu::Queue, sphere: &[Sphere]) -> Result<()> {
     let region = slope_region(0.1)?;
-    let mut sloped = TerrainGpu::new(device, &region, 65, 1, 0, 0.0)?;
+    let mut sloped = TerrainGpu::new(device, &region, 65, 1)?;
     let mut commands = encoder(device);
     sloped.encode(
         device,

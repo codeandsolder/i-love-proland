@@ -2,7 +2,7 @@
 // metres exactly once, independent of region_patch size, slot, and request order.
 struct Config {
     extent_ticks: u32, control_side: u32, bin_side: u32, grid_side: u32,
-    spacing_m: f32, detail: f32, seed: u32, padding: u32,
+    spacing_m: f32, padding0: u32, padding1: u32, padding2: u32,
 }
 struct Reach {
     ends: vec4<f32>,       // ax, ay, bx, by
@@ -19,14 +19,31 @@ struct Job { origin: vec2<u32>, spacing: u32, slot: u32 }
 @group(0) @binding(6) var<storage,read> points: array<vec2<u32>>;
 
 fn smooth_unit(t:f32)->f32 {let q=clamp(t,0.0,1.0);return q*q*(3.0-2.0*q);}
-fn mix_hash(v:u32)->u32 {
-    var h=v;
-    h=(h^(h>>16u))*0x7feb352du;
-    h=(h^(h>>15u))*0x846ca68bu;
-    return h^(h>>16u);
+// Same SplitMix64 finalizer as random::mix64, using two u32 words
+// because WGSL has no portable 64-bit integers. All products wrap.
+fn mul_hi(a:u32,b:u32)->u32{
+    let a0=a&65535u;let a1=a>>16u;
+    let b0=b&65535u;let b1=b>>16u;
+    let p00=a0*b0;let p01=a0*b1;let p10=a1*b0;
+    let carry=((p00>>16u)+(p01&65535u)+(p10&65535u))>>16u;
+    return a1*b1+(p01>>16u)+(p10>>16u)+carry;
 }
-fn lattice(p:vec2<i32>,seed:u32)->f32 {
-    return f32(mix_hash(bitcast<u32>(p.x)*0x9e3779b9u ^ bitcast<u32>(p.y)*0x85ebca6bu ^ seed)>>8u)*(2.0/16777215.0)-1.0;
+fn mul64(a:vec2<u32>,b:vec2<u32>)->vec2<u32>{
+    return vec2<u32>(a.x*b.x,mul_hi(a.x,b.x)+a.x*b.y+a.y*b.x);
+}
+fn shr64(a:vec2<u32>,n:u32)->vec2<u32>{
+    return vec2<u32>((a.x>>n)|(a.y<<(32u-n)),a.y>>n);
+}
+fn mix64(key:vec2<u32>)->vec2<u32>{
+    var h=mul64(key^shr64(key,30u),vec2<u32>(0x1ce4e5b9u,0xbf58476du));
+    h=mul64(h^shr64(h,27u),vec2<u32>(0x133111ebu,0x94d049bbu));
+    return h^shr64(h,31u);
+}
+fn lattice(p:vec2<i32>,seed:u32)->f32{
+    // CPU: seed ^ u64(x).rotate_left(19) ^ u64(y).rotate_left(47).
+    let x=bitcast<u32>(p.x);let y=bitcast<u32>(p.y);
+    let key=vec2<u32>(seed^(x<<19u)^(y>>17u),(x>>13u)^(y<<15u));
+    return f32(mix64(key).y)*(2.0/4294967295.0)-1.0;
 }
 fn noise(p:vec2<f32>,seed:u32)->f32{
     let i=vec2<i32>(floor(p));
@@ -38,9 +55,9 @@ fn noise(p:vec2<f32>,seed:u32)->f32{
 fn unpack_cell(cell:vec2<u32>)->vec4<f32>{
     let bed=f32(bitcast<i32>(cell.x<<16u)>>16u)*0.25;
     let lake=f32(bitcast<i32>(cell.x)>>16u)*0.25;
-    return vec4<f32>(bed,max(max(lake,0.0),bed),0.0,0.0);
+    return vec4<f32>(bed,max(select(lake,0.0,lake == -8192.0),bed),0.0,0.0);
 }
-fn evaluate_controls(p:vec2<f32>)->vec4<f32>{
+fn evaluate_controls(p:vec2<f32>)->vec2<f32>{
     let q=clamp(p/config.spacing_m,vec2<f32>(0.0),vec2<f32>(f32(config.control_side-1u)));
     let ij=min(vec2<u32>(floor(q)),vec2<u32>(config.control_side-2u));
     let f=q-vec2<f32>(ij);
@@ -48,9 +65,7 @@ fn evaluate_controls(p:vec2<f32>)->vec4<f32>{
     let a=controls[idx];let b=controls[idx+1u];
     let c=controls[idx+config.control_side];let d=controls[idx+config.control_side+1u];
     let aa=unpack_cell(a);let bb=unpack_cell(b);let cc=unpack_cell(c);let dd=unpack_cell(d);
-    let v=mix(mix(aa.xy,bb.xy,f.x),mix(cc.xy,dd.xy,f.x),f.y);
-    let grad=vec2<f32>(mix(bb.x-aa.x,dd.x-cc.x,f.y),mix(cc.x-aa.x,dd.x-bb.x,f.x))/config.spacing_m;
-    return vec4<f32>(v,grad);
+    return mix(mix(aa.xy,bb.xy,f.x),mix(cc.xy,dd.xy,f.x),f.y);
 }
 fn color_at(p:vec2<f32>)->vec3<f32>{
     let q=clamp(p/config.spacing_m,vec2<f32>(0.0),vec2<f32>(f32(config.control_side-1u)));
@@ -66,24 +81,6 @@ fn projection(r:Reach,p:vec2<f32>)->vec2<f32>{
     let residual=delta-t*axis;
     return vec2<f32>(dot(residual,residual),t);
 }
-// Oriented ridge detail, progressively reduced on flat, wet and eroded
-// surfaces. The control gradients are used only to rotate the ridges;
-// no tile-local random seed or finite-difference across tile boundaries.
-fn relief(p:vec2<f32>,g:vec2<f32>)->f32 {
-    let slope=length(g);
-    let axis=g/max(slope,0.0001);
-
-    // Continuous world-coordinate noise (the slope-dependent amplitude
-    // fades to zero on flats). Large bands remain anchored to the world.
-    let broad=noise(p/96.0,config.seed);
-    let ridge=1.0-abs(noise(p/23.0+vec2<f32>(broad*0.6),config.seed^17u));
-    let small=noise(p/5.5,config.seed^31u);
-    // Oriented relief is modulated rather than using a rotating coordinate
-    // system as the sole field, which would make slopes unstable.
-    let transverse=vec2<f32>(-axis.y,axis.x);
-    let ribs=noise((p+transverse*18.0)/17.0,config.seed^73u)-noise((p-transverse*18.0)/17.0,config.seed^73u);
-    return smooth_unit(slope/0.5)*(broad*7.0+(ridge-0.5)*3.0+small*0.65+ribs*0.4)*config.detail;
-}
 fn evaluate(p:vec2<f32>)->TerrainSample{
     let control=evaluate_controls(p);
     var bed=control.x;
@@ -93,14 +90,7 @@ fn evaluate(p:vec2<f32>)->TerrainSample{
     if control.y>bed+0.02 {
         return TerrainSample(bed,control.y,pack4x8unorm(vec4<f32>(color,1.0)),1u);
     }
-    let delta=config.spacing_m*0.5;
-    let g=vec2<f32>(
-        evaluate_controls(p+vec2<f32>(delta,0.0)).x-evaluate_controls(p-vec2<f32>(delta,0.0)).x,
-        evaluate_controls(p+vec2<f32>(0.0,delta)).x-evaluate_controls(p-vec2<f32>(0.0,delta)).x
-    )/(2.0*delta);
-    bed+=relief(p,g)*smooth_unit(bed/30.0);
-    water=bed;
-    if bed<=0.0 {return TerrainSample(bed,0.0,pack4x8unorm(vec4<f32>(color,1.0)),1u);}
+    if bed<=0.0 {return TerrainSample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);}
     let bin=min(vec2<u32>(p/250.0),vec2<u32>(config.bin_side-1u));
     let bucket=bin.y*config.bin_side+bin.x;
     let begin=bins[bucket];let end=bins[bucket+1u];
@@ -157,9 +147,10 @@ fn evaluate(p:vec2<f32>)->TerrainSample{
     let base=bed;
     bed=clamp(mix(bed,desired_bed,support),bed-42.0*support,bed+6.0*support);
     let damp=(1.0-smooth_unit(abs(cross-radius)/bank))*support;
-    let gravel=max(shelf,(1.0-smooth_unit(abs(cross-radius-bank*0.45)/(bank*1.4)))*support);
+    let base_gravel=(1.0-smooth_unit(abs(cross-radius-bank*0.45)/(bank*1.4)))*support;
+    let gravel=max(shelf,base_gravel);
     color=mix(color,vec3<f32>(0.19,0.31,0.125),support*valley*0.30);
-    color=mix(color,vec3<f32>(0.50,0.465,0.385),clamp(0.25*gravel+0.65*max(inner*gravel,shelf),0.0,1.0));
+    color=mix(color,vec3<f32>(0.50,0.465,0.385),clamp(0.25*gravel+0.65*max(inner*base_gravel,shelf),0.0,1.0));
     color=mix(color,vec3<f32>(0.25,0.245,0.20),clamp(damp*(0.22+0.28*outer),0.0,1.0));
     water=bed;
     if cross<=radius && stage>bed+0.02 && stage<=base+6.0 {water=stage;kind=2u;}

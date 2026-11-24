@@ -83,7 +83,7 @@ fn wait(
 
 fn check_overlap(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = synthetic()?;
-    let mut gpu = TerrainGpu::new(device, &region, 65, 3, 0x7654_3210, 1.0)?;
+    let mut gpu = TerrainGpu::new(device, &region, 65, 3)?;
     let coarse = TerrainRequest {
         origin_ticks: [12_800, 14_400],
         spacing_ticks: 64,
@@ -158,7 +158,7 @@ fn check_overlap(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
 fn check_explicit_points(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = synthetic()?;
     let side = 17_u16;
-    let mut gpu = TerrainGpu::new(device, &region, side, 3, 0x7654_3210, 1.0)?;
+    let mut gpu = TerrainGpu::new(device, &region, side, 3)?;
     let grid = TerrainRequest {
         origin_ticks: [12800, 14400],
         spacing_ticks: 192,
@@ -247,7 +247,7 @@ fn check_explicit_points(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<(
 }
 
 fn profile(device: &wgpu::Device, queue: &wgpu::Queue, region: &Region, side: u16) -> Result<()> {
-    let mut gpu = TerrainGpu::new(device, region, side, 32, 0x7654_3210, 1.0)?;
+    let mut gpu = TerrainGpu::new(device, region, side, 32)?;
     let extent = region.chart().extent();
     let spacing = 16;
     let span = f64::from(side - 1);

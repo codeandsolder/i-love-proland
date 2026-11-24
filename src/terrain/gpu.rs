@@ -57,9 +57,7 @@ struct Config {
     bin_side: u32,
     grid_side: u32,
     spacing_m: f32,
-    detail: f32,
-    seed: u32,
-    padding: u32,
+    padding: [u32; 3],
 }
 
 #[repr(C)]
@@ -180,19 +178,12 @@ pub struct TerrainGpu {
 impl TerrainGpu {
     /// Create a generator and resident pool for one region and grid size.
     /// A different collision grid resolution may use the same field in a
-    /// separate pool on the same device. Detail is a dimensionless 0..=1 scale.
+    /// separate pool on the same device. Both evaluate the canonical region.
     ///
     /// # Errors
     /// Rejects invalid configuration, chart extent, or device storage limits.
-    pub fn new(
-        device: &wgpu::Device,
-        region: &Region,
-        side: u16,
-        slots: u32,
-        seed: u32,
-        detail: f32,
-    ) -> io::Result<Self> {
-        if !(2..=257).contains(&side) || slots == 0 || !(0.0..=1.0).contains(&detail) {
+    pub fn new(device: &wgpu::Device, region: &Region, side: u16, slots: u32) -> io::Result<Self> {
+        if !(2..=257).contains(&side) || slots == 0 {
             return Err(invalid("invalid GPU terrain pool dimensions"));
         }
         let chart = region.chart();
@@ -215,9 +206,7 @@ impl TerrainGpu {
                 .map_err(io::Error::other)?,
             grid_side: u32::from(side),
             spacing_m: chart.spacing_m as f32,
-            detail,
-            seed,
-            padding: 0,
+            padding: [0; 3],
         };
         let stride = u64::from(side).pow(2) * 16;
         let bytes = stride * u64::from(slots);
