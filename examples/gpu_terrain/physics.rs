@@ -5,8 +5,8 @@ use i_love_proland::terrain::{
     gpu::{
         TerrainGpu, TerrainRequest,
         physics::{
-            ContactMaterial, PhysicsConfig, PhysicsGpu, RigidBody, SimulationClock, Sphere,
-            StepBatch,
+            ContactMaterial, ContactMaterialField, PhysicsConfig, PhysicsGpu, RigidBody,
+            SimulationClock, Sphere, StepBatch,
         },
     },
 };
@@ -47,13 +47,13 @@ const fn body(position: [f32; 3], velocity: [f32; 3], count: u32) -> RigidBody {
         clock: [0; 4],
     }
 }
-const CONFIG: PhysicsConfig = PhysicsConfig {
+const CONFIG: PhysicsConfig<'static> = PhysicsConfig {
     initial_tick: 0,
     hz: 240,
     gravity_m_s2: 9.81,
     contact_slop_m: 0.001,
     solver_iterations: 5,
-    material: ContactMaterial::RIGID,
+    material: ContactMaterialField::Uniform(ContactMaterial::RIGID),
     stop_at_contact: false,
 };
 fn simulate(
@@ -275,7 +275,10 @@ fn check_compliance(
         device,
         terrain,
         0,
-        PhysicsConfig { material, ..CONFIG },
+        PhysicsConfig {
+            material: ContactMaterialField::Uniform(material),
+            ..CONFIG
+        },
         &[initial],
         &sphere,
     )?;

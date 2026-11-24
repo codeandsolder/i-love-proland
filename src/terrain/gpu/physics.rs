@@ -88,6 +88,7 @@ impl RigidBody {
 }
 
 /// Bounded pressure-dependent compliant layer over the rigid triangles.
+///
 /// The sphere cross-section at its current indentation approximates the
 /// loaded area until authored wheel/pad collision primitives are available.
 #[repr(C)]
@@ -111,8 +112,9 @@ impl ContactMaterial {
     }
 }
 
-/// Optional per-tick contact telemetry. Position/normal/orientation use
-/// the solver's metric tangent coordinates. A zero active flag is an
+/// Optional per-tick contact telemetry.
+///
+/// Position/normal/orientation use the solver's metric tangent coordinates. A zero material tag is an
 /// explicit contact gap. Only completed integrated ticks produce records.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -124,26 +126,77 @@ pub struct ContactEvent {
     pub rotation: [f32; 4],
     /// xyz: tangential velocity at the loaded point, w: contact area in m².
     pub slip_area: [f32; 4],
-    /// [completed tick low, completed tick high, global shape ID, active].
+    /// [completed tick low, completed tick high, global shape ID, material index + 1].
     pub metadata: [u32; 4],
 }
 
 impl ContactEvent {
-    #[must_use]
+    #[must_use = "Use the actual completed integration tick"]
     pub const fn tick(&self) -> u64 {
         (self.metadata[1] as u64) << 32 | self.metadata[0] as u64
+    }
+    /// Index into the exact material palette bound to the solver.
+    #[must_use = "Distinguish a loaded contact from a gap"]
+    pub const fn material_index(&self) -> Option<u32> {
+        self.metadata[3].checked_sub(1)
+    }
+}
+
+/// Categorical material field for one pinned collision grid.
+#[derive(Clone, Copy, Debug)]
+pub enum ContactMaterialField<'a> {
+    Uniform(ContactMaterial),
+    /// Row-major canonical cells, identical indexing to contact triangles.
+    /// The profile IDs remain stable for the entire integrated batch.
+    Cells {
+        profiles: &'a [ContactMaterial],
+        indices: &'a [u32],
+    },
+}
+
+impl ContactMaterialField<'_> {
+    fn upload(self, device: &wgpu::Device, side: u32) -> io::Result<(wgpu::Buffer, wgpu::Buffer)> {
+        let (uniform, profiles, indices) = match self {
+            Self::Uniform(material) => ([material], None, None),
+            Self::Cells { profiles, indices } => {
+                ([ContactMaterial::RIGID], Some(profiles), Some(indices))
+            }
+        };
+        let profiles = profiles.unwrap_or(&uniform);
+        let cells = indices.unwrap_or(&[0]);
+        let extent = usize::try_from(u64::from(side - 1).pow(2)).map_err(io::Error::other)?;
+        if profiles.is_empty()
+            || profiles.len() >= u32::MAX as usize
+            || profiles.iter().any(|p| !p.valid())
+            || indices.is_some_and(|v| v.len() != extent)
+            || cells.iter().any(|&i| i as usize >= profiles.len())
+        {
+            return Err(invalid("invalid categorical contact material field"));
+        }
+        Ok((
+            storage(
+                device,
+                "contact material palette",
+                bytemuck::cast_slice(profiles),
+            )?,
+            storage(
+                device,
+                "contact material cells",
+                bytemuck::cast_slice(cells),
+            )?,
+        ))
     }
 }
 
 /// Bounded integration configuration, independent of render cadence.
 #[derive(Clone, Copy, Debug)]
-pub struct PhysicsConfig {
+pub struct PhysicsConfig<'a> {
     pub initial_tick: u64,
     pub hz: u32,
     pub gravity_m_s2: f32,
     pub contact_slop_m: f32,
     pub solver_iterations: u32,
-    pub material: ContactMaterial,
+    pub material: ContactMaterialField<'a>,
     /// Finish a predictive calculation at the first discrete contact.
     pub stop_at_contact: bool,
 }
@@ -163,8 +216,7 @@ struct StepConfig {
     stop_at_contact: u32,
     record_contacts: u32,
     contact_stride: u32,
-    material: ContactMaterial,
-    material_padding: [u32; 2],
+
     projection: GridProjection,
 }
 
@@ -178,6 +230,8 @@ pub struct PhysicsGpu {
     bodies: wgpu::Buffer,
     spheres: wgpu::Buffer,
     empty_contacts: wgpu::Buffer,
+    materials: wgpu::Buffer,
+    material_cells: wgpu::Buffer,
     terrain: wgpu::Buffer,
     request: TerrainRequest,
     params: StepConfig,
@@ -194,7 +248,7 @@ impl PhysicsGpu {
         device: &wgpu::Device,
         terrain: &TerrainGpu,
         slot: u32,
-        config: PhysicsConfig,
+        config: PhysicsConfig<'_>,
         bodies: &[RigidBody],
         spheres: &[Sphere],
     ) -> io::Result<Self> {
@@ -203,7 +257,6 @@ impl PhysicsGpu {
             || !(0.0..=1000.0).contains(&config.gravity_m_s2)
             || !(0.0..=1.0).contains(&config.contact_slop_m)
             || !(1..=32).contains(&config.solver_iterations)
-            || !config.material.valid()
             || bodies.is_empty()
             || spheres.is_empty()
             || bodies
@@ -223,6 +276,7 @@ impl PhysicsGpu {
         let request = terrain
             .grid_request(slot)
             .ok_or_else(|| invalid("physics terrain slot not initialized"))?;
+        let (materials, material_cells) = config.material.upload(device, terrain.side())?;
         let pipeline = Kernel::new(device, "fixed physics steps", STEP_WGSL, "advance");
         let bytes = bytemuck::cast_slice(bodies);
         if u64::try_from(bytes.len()).map_err(io::Error::other)?
@@ -261,8 +315,6 @@ impl PhysicsGpu {
                 .map(|body| body.metadata[1])
                 .max()
                 .unwrap_or(1),
-            material: config.material,
-            material_padding: [0; 2],
             projection: terrain.grid_projection(slot)?,
         };
         Ok(Self {
@@ -279,6 +331,8 @@ impl PhysicsGpu {
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             }),
+            materials,
+            material_cells,
             terrain: terrain.samples().clone(),
             request,
             params,
@@ -330,7 +384,7 @@ impl PhysicsGpu {
 
     /// Number of collider entries per body per integrated tick in the
     /// optional observation buffer. Unused entries are explicit gaps.
-    #[must_use]
+    #[must_use = "Use the exact telemetry layout when decoding batches"]
     pub const fn contact_stride(&self) -> u32 {
         self.params.contact_stride
     }
@@ -409,6 +463,8 @@ impl PhysicsGpu {
             &self.spheres,
             &uniform,
             contacts.unwrap_or(&self.empty_contacts),
+            &self.materials,
+            &self.material_cells,
         ];
         self.pipeline.encode(
             device,
