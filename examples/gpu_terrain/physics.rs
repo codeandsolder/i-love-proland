@@ -328,7 +328,7 @@ fn check_compliance(
     let area = last.slip_area[3];
     let depth = last.normal_depth[3];
     let expected = CONFIG.contact_slop_m
-        + material.max_sinkage_m * force / (force + material.half_sinkage_pressure_pa * area);
+        + material.max_sinkage_m * force / material.half_sinkage_pressure_pa.mul_add(area, force);
     let actual = rigid[0].position[2] - state[0].position[2];
     println!(
         "GPU_COMPLIANT_CONTACT rigid_z={:.6} compliant_z={:.6} delta={actual:.6} force_n={force:.3} area_m2={area:.6} depth_m={depth:.6} predicted_m={expected:.6} events={}",
