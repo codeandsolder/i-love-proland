@@ -31,7 +31,7 @@ impl GridProjection {
         let half = f64::from(side - 1) * spacing * 0.5;
         let radius = chart.radius_m;
         let centre_y = f64::from(request.origin_ticks[1]) / TICKS_PER_METRE + half;
-        let lat = (centre_y - chart.extent() * 0.5) / radius + chart.latitude_rad;
+        let lat = chart.extent().mul_add(-0.5, centre_y) / radius + chart.latitude_rad;
         let (sin_lat, cos_lat) = lat.sin_cos();
         let cos_chart = chart.latitude_rad.cos();
         let dlat = half / radius;
@@ -43,10 +43,10 @@ impl GridProjection {
         // and the unit Lipschitz constant of cosine.
         // One metre covers rounding of the bounded f32 height field.
         let h = elevation_bound + 1.0;
-        let x = h * dlon
-            + radius * ((lat - chart.latitude_rad).abs() + dlat) * dlon
+        let x = (radius * ((lat - chart.latitude_rad).abs() + dlat)).mul_add(dlon, h * dlon)
             + radius * dlon.powi(3) / 6.0;
-        let y = h * dlat + radius * dlat.powi(3) / 6.0 + (radius + h) * dlon.powi(2) * 0.5;
+        let y = ((radius + h) * dlon.powi(2))
+            .mul_add(0.5, h.mul_add(dlat, radius * dlat.powi(3) / 6.0));
         // All projection operations are on offsets. Include a relative
         // rounding allowance for f32 trigonometry and arithmetic.
         let rounding = 64.0 * f64::from(f32::EPSILON) * (half + x.max(y));

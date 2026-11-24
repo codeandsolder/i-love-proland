@@ -12,6 +12,10 @@ pub mod gpu;
 // The GPU is the sole procedural geometric refinement evaluator.
 // Shared coefficients also define the CPU broad-phase envelope.
 const REFINEMENT_AMPLITUDES: [f64; 4] = [7.0, 3.0, 0.65, 0.4];
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "constant arithmetic; fused operations are unnecessary for an outward-rounded compile-time bound"
+)]
 const MAX_RELIEF: f64 = {
     // Exact envelope of the four terms, rounded outward by a millimetre.
     // The coefficients are also the GPU uniform.

@@ -4,24 +4,24 @@ use super::{ChannelField, QUANTUM, Region};
 use crate::terrain::MAX_RELIEF;
 
 /// Coarse bilinear height range and the possible GPU refinement displacement
-/// over a closed chart rectangle.
+/// over a closed chart rectangle, in metres.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HeightEnvelope {
-    pub coarse_min_m: f64,
-    pub coarse_max_m: f64,
-    pub downward_m: f64,
-    pub upward_m: f64,
+    pub coarse_min: f64,
+    pub coarse_max: f64,
+    pub downward: f64,
+    pub upward: f64,
 }
 
 impl HeightEnvelope {
     #[must_use = "Use the lower bound for terrain contact tests"]
     pub fn min_m(self) -> f64 {
-        self.coarse_min_m - self.downward_m
+        self.coarse_min - self.downward
     }
 
     #[must_use = "Use the upper bound for terrain clearance tests"]
     pub fn max_m(self) -> f64 {
-        self.coarse_max_m + self.upward_m
+        self.coarse_max + self.upward
     }
 }
 
@@ -93,8 +93,8 @@ impl Region {
         // Every such difference is bounded by the maximum edge gradient
         // in the expanded rectangle. Bilinear interpolation cannot exceed
         // its endpoint gradients.
-        let lo = min.map(|v| self.cell_index((v - s * 0.5).max(0.0)));
-        let hi = max.map(|v| self.cell_index((v + s * 0.5).min(self.chart.extent())));
+        let lo = min.map(|v| self.cell_index(s.mul_add(-0.5, v).max(0.0)));
+        let hi = max.map(|v| self.cell_index(s.mul_add(0.5, v).min(self.chart.extent())));
         let mut dx = 0.0_f64;
         let mut dy = 0.0_f64;
         for y in lo[1]..=hi[1] + 1 {
@@ -114,7 +114,7 @@ impl Region {
 
     /// Bounds the fully refined GPU field over an arbitrary chart rectangle.
     /// Does not generate refined samples. A caller may reject a trajectory
-    /// interval if its conservative lower altitude exceeds max_m().
+    /// interval if its conservative lower altitude exceeds `max_m()`.
     /// Returning None means the rectangle is invalid or outside this chart;
     /// it must not be treated as clear terrain.
     #[must_use = "Use the refined envelope to reject or subdivide encounter candidates"]
@@ -127,18 +127,16 @@ impl Region {
         }
         let min = min.map(|v| (v - ADDRESS_MARGIN_M).max(0.0));
         let max = max.map(|v| (v + ADDRESS_MARGIN_M).min(extent));
-        let [coarse_min_m, coarse_max_m] = self.coarse_range(min, max)?;
+        let [coarse_min, coarse_max] = self.coarse_range(min, max)?;
         let relief = MAX_RELIEF
             * smooth(self.slope_bound(min, max) / 0.5)
-            * smooth((coarse_max_m + HEIGHT_MARGIN_M) / 30.0);
-        let channels = self.channel_candidates(min, max) && coarse_max_m + relief > 0.0;
+            * smooth((coarse_max + HEIGHT_MARGIN_M) / 30.0);
+        let channels = self.channel_candidates(min, max) && coarse_max + relief > 0.0;
         Some(HeightEnvelope {
-            coarse_min_m,
-            coarse_max_m,
-            downward_m: relief
-                + if channels { ChannelField::MAX_CUT } else { 0.0 }
-                + HEIGHT_MARGIN_M,
-            upward_m: relief
+            coarse_min,
+            coarse_max,
+            downward: relief + if channels { ChannelField::MAX_CUT } else { 0.0 } + HEIGHT_MARGIN_M,
+            upward: relief
                 + if channels {
                     ChannelField::MAX_RAISE
                 } else {
@@ -212,13 +210,13 @@ mod tests {
         let e = r
             .refined_height_envelope([900.0, 1000.0], [920.0, 1000.0])
             .ok_or_else(super::super::invalid)?;
-        assert!(e.upward_m >= MAX_RELIEF + ChannelField::MAX_RAISE);
-        assert!(e.downward_m >= MAX_RELIEF + ChannelField::MAX_CUT);
-        assert!(e.coarse_max_m - e.coarse_min_m < 15.0);
+        assert!(e.upward >= MAX_RELIEF + ChannelField::MAX_RAISE);
+        assert!(e.downward >= MAX_RELIEF + ChannelField::MAX_CUT);
+        assert!(e.coarse_max - e.coarse_min < 15.0);
         let dry = r
             .refined_height_envelope([900.0, 0.0], [920.0, 0.0])
             .ok_or_else(super::super::invalid)?;
-        assert!(dry.upward_m < 10.01 && dry.downward_m < 10.01);
+        assert!(dry.upward < 10.01 && dry.downward < 10.01);
         Ok(())
     }
 }
