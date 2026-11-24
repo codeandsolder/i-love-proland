@@ -223,7 +223,7 @@ impl TerrainGpu {
             grid_side: u32::from(side),
             spacing_m: chart.spacing_m as f32,
             padding: [0; 3],
-            relief: super::REFINEMENT_AMPLITUDES,
+            relief: super::REFINEMENT_AMPLITUDES.map(|v| v as f32),
         };
         let stride = u64::from(side).pow(2) * 16;
         let bytes = stride * u64::from(slots);

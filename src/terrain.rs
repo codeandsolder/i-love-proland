@@ -11,11 +11,11 @@ pub mod gpu;
 
 // The GPU is the sole procedural geometric refinement evaluator.
 // Shared coefficients also define the CPU broad-phase envelope.
-const REFINEMENT_AMPLITUDES: [f32; 4] = [7.0, 3.0, 0.65, 0.4];
+const REFINEMENT_AMPLITUDES: [f64; 4] = [7.0, 3.0, 0.65, 0.4];
 const MAX_RELIEF: f64 = {
     // Exact envelope of the four terms, rounded outward by a millimetre.
     // The coefficients are also the GPU uniform.
     let [a, b, c, d] = REFINEMENT_AMPLITUDES;
-    (a + 0.5 * b + c + 2.0 * d + 0.001) as f64
+    a + 0.5 * b + c + 2.0 * d + 0.001
 };
 pub use region::HeightEnvelope;
