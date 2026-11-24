@@ -43,8 +43,10 @@ fn tick_origin(center: [f64; 2], limit: u32) -> [u32; 2] {
     origin
 }
 
-fn requests(region: &Region) -> Vec<TerrainRequest> {
-    let limit = extent_ticks(region) - SPAN;
+fn requests(region: &Region) -> Result<Vec<TerrainRequest>> {
+    let limit = extent_ticks(region)
+        .checked_sub(SPAN)
+        .ok_or_else(|| io::Error::other("regional chart is smaller than the regeneration grid"))?;
     let aligned = limit / SPACING * SPACING;
     let mut origins = vec![[0, 0], [aligned, 0], [0, aligned], [aligned, aligned]];
     // Include the major channel, a wide range of relief and arbitrary
@@ -64,14 +66,14 @@ fn requests(region: &Region) -> Vec<TerrainRequest> {
             (state % (aligned / SPACING + 1)) * SPACING
         }));
     }
-    (0..LOCATIONS)
+    Ok((0..LOCATIONS)
         .zip(origins)
         .map(|(slot, origin_ticks)| TerrainRequest {
             origin_ticks,
             spacing_ticks: SPACING,
             slot,
         })
-        .collect()
+        .collect())
 }
 
 fn capture(
@@ -290,7 +292,7 @@ pub(super) fn run(
     region: &Region,
     output: Option<&Path>,
 ) -> Result<()> {
-    let original = requests(region);
+    let original = requests(region)?;
     let baseline = {
         let mut gpu = TerrainGpu::new(device, region, SIDE, LOCATIONS)?;
         capture(device, queue, &mut gpu, &original)?

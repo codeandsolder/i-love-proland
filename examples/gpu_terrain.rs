@@ -14,16 +14,23 @@ use std::{error::Error, io, path::Path, time::Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
+fn device(name: Option<&str>) -> Result<(wgpu::Device, wgpu::Queue)> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(descriptor);
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-    }))?;
+    let adapter = if let Some(name) = name {
+        pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
+            .into_iter()
+            .find(|adapter| adapter.get_info().name.contains(name))
+            .ok_or_else(|| io::Error::other(format!("no Vulkan adapter matching {name}")))?
+    } else {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))?
+    };
     println!("GPU_TERRAIN adapter={}", adapter.get_info().name);
     Ok(pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
@@ -310,7 +317,16 @@ fn profile(device: &wgpu::Device, queue: &wgpu::Queue, region: &Region, side: u1
 }
 
 fn main() -> Result<()> {
-    let (device, queue) = device()?;
+    let selected = std::env::args_os().nth(4);
+    let (device, queue) = device(
+        selected
+            .as_ref()
+            .map(|v| {
+                v.to_str()
+                    .ok_or_else(|| io::Error::other("invalid adapter name"))
+            })
+            .transpose()?,
+    )?;
     if std::env::args_os()
         .nth(1)
         .is_some_and(|argument| argument == "--regeneration")
