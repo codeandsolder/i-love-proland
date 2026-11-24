@@ -633,6 +633,8 @@ pub struct TreeRenderConfig {
     pub color_format: wgpu::TextureFormat,
     pub depth_format: wgpu::TextureFormat,
     pub sample_count: u32,
+    /// Allocate optional single-sample raw triangle-coverage pipelines.
+    pub triangle_coverage: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -717,6 +719,7 @@ fn render_pipeline(
     pass_kind: PassKind,
     vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     config: TreeRenderConfig,
+    coverage: bool,
 ) -> wgpu::RenderPipeline {
     let (name, vertex_entry, fragment_entry, alpha_to_coverage) = match pass_kind {
         PassKind::Mesh => (
@@ -738,6 +741,22 @@ fn render_pipeline(
             config.sample_count > 1,
         ),
     };
+    let (fragment_entry, alpha_to_coverage) = if coverage {
+        (
+            match pass_kind {
+                PassKind::Mesh | PassKind::Module => "mesh_coverage_fs",
+                PassKind::Impostor => "impostor_coverage_fs",
+            },
+            false,
+        )
+    } else {
+        (fragment_entry, alpha_to_coverage)
+    };
+    let additive = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(name),
         layout: Some(pipeline_layout),
@@ -752,7 +771,7 @@ fn render_pipeline(
             cull_mode: None,
             ..Default::default()
         },
-        depth_stencil: Some(wgpu::DepthStencilState {
+        depth_stencil: (!coverage).then_some(wgpu::DepthStencilState {
             format: config.depth_format,
             depth_write_enabled: Some(true),
             depth_compare: Some(wgpu::CompareFunction::Less),
@@ -760,7 +779,7 @@ fn render_pipeline(
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState {
-            count: config.sample_count,
+            count: if coverage { 1 } else { config.sample_count },
             alpha_to_coverage_enabled: alpha_to_coverage,
             ..Default::default()
         },
@@ -769,8 +788,15 @@ fn render_pipeline(
             entry_point: Some(fragment_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: config.color_format,
-                blend: None,
+                format: if coverage {
+                    wgpu::TextureFormat::Rgba16Float
+                } else {
+                    config.color_format
+                },
+                blend: coverage.then_some(wgpu::BlendState {
+                    color: additive,
+                    alpha: additive,
+                }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -1087,9 +1113,8 @@ fn build_mesh_draw(
 pub struct TreePipelines {
     compaction: CompactionPipeline,
     config: TreeRenderConfig,
-    mesh: wgpu::RenderPipeline,
-    modules: wgpu::RenderPipeline,
-    impostor: wgpu::RenderPipeline,
+    normal: DrawPipelines,
+    coverage: Option<DrawPipelines>,
     material_layout: wgpu::BindGroupLayout,
     instance_layout: wgpu::BindGroupLayout,
     module_layout: wgpu::BindGroupLayout,
@@ -1097,6 +1122,13 @@ pub struct TreePipelines {
     source_sampler: wgpu::Sampler,
     placeholder: wgpu::TextureView,
     quad_indices: wgpu::Buffer,
+}
+
+#[derive(Clone)]
+struct DrawPipelines {
+    mesh: wgpu::RenderPipeline,
+    modules: wgpu::RenderPipeline,
+    impostor: wgpu::RenderPipeline,
 }
 
 impl TreePipelines {
@@ -1144,30 +1176,37 @@ impl TreePipelines {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
         })];
-        let mesh = render_pipeline(
-            device,
-            &pipeline_layout,
-            &shader,
-            PassKind::Mesh,
-            &vertex_layout,
-            config,
-        );
-        let modules = render_pipeline(
-            device,
-            &module_pipeline_layout,
-            &shader,
-            PassKind::Module,
-            &[],
-            config,
-        );
-        let impostor = render_pipeline(
-            device,
-            &pipeline_layout,
-            &shader,
-            PassKind::Impostor,
-            &[],
-            config,
-        );
+        let make = |coverage| DrawPipelines {
+            mesh: render_pipeline(
+                device,
+                &pipeline_layout,
+                &shader,
+                PassKind::Mesh,
+                &vertex_layout,
+                config,
+                coverage,
+            ),
+            modules: render_pipeline(
+                device,
+                &module_pipeline_layout,
+                &shader,
+                PassKind::Module,
+                &[],
+                config,
+                coverage,
+            ),
+            impostor: render_pipeline(
+                device,
+                &pipeline_layout,
+                &shader,
+                PassKind::Impostor,
+                &[],
+                config,
+                coverage,
+            ),
+        };
+        let normal = make(false);
+        let coverage = config.triangle_coverage.then(|| make(true));
         let quad_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("i-love-proland billboard quad 6 indices"),
             contents: bytemuck::cast_slice(&[0_u32, 1, 2, 2, 1, 3]),
@@ -1192,9 +1231,8 @@ impl TreePipelines {
         Ok(Self {
             compaction: compaction.clone(),
             config,
-            mesh,
-            modules,
-            impostor,
+            normal,
+            coverage,
             material_layout,
             instance_layout,
             module_layout,
@@ -1502,17 +1540,47 @@ impl TreeRenderer {
     /// Draw every mesh tier's materials with its compacted instance set,
     /// then emit precisely one composite middle-distance impostor draw.
     pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        self.draw_using(pass, &self.pipelines.normal);
+    }
+
+    /// Count rasterized triangle coverage in a single-sample RGBA16Float
+    /// additive pass cleared to zero, with no depth or alpha rejection.
+    /// Red counts mesh/module coverage; green counts impostor coverage.
+    /// Integer half-float counts are exact up to 2048.
+    ///
+    /// # Errors
+    /// Requires triangle coverage pipelines to have been requested at creation.
+    pub fn draw_triangle_coverage<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+    ) -> Result<()> {
+        let pipelines = self
+            .pipelines
+            .coverage
+            .as_ref()
+            .ok_or(Error::InvalidConfiguration(
+                "triangle coverage pipelines not configured",
+            ))?;
+        self.draw_using(pass, pipelines);
+        Ok(())
+    }
+
+    fn draw_using<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        pipelines: &'pass DrawPipelines,
+    ) {
         for material in &self.mesh_draws {
             pass.set_bind_group(0, &material.bind, &[]);
             pass.set_bind_group(1, &self.instance_bindings[material.tier], &[]);
             match &material.geometry {
                 TreeGeometry::Mesh(mesh) => {
-                    pass.set_pipeline(&self.pipelines.mesh);
+                    pass.set_pipeline(&pipelines.mesh);
                     pass.set_vertex_buffer(0, mesh.vertex.slice(..));
                     pass.set_index_buffer(mesh.index.slice(..), wgpu::IndexFormat::Uint32);
                 }
                 TreeGeometry::Modules(modules) => {
-                    pass.set_pipeline(&self.pipelines.modules);
+                    pass.set_pipeline(&pipelines.modules);
                     if let Some(bind) = &material.module_bind {
                         pass.set_bind_group(2, bind, &[]);
                     }
@@ -1521,7 +1589,7 @@ impl TreeRenderer {
             }
             pass.draw_indexed_indirect(&material.indirect, 0);
         }
-        pass.set_pipeline(&self.pipelines.impostor);
+        pass.set_pipeline(&pipelines.impostor);
         pass.set_bind_group(0, &self.impostor_bind, &[]);
         pass.set_bind_group(
             1,
