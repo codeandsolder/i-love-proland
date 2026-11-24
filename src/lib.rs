@@ -22,6 +22,8 @@ pub mod atlas_bake;
 #[cfg(feature = "gpu")]
 pub mod billboard;
 #[cfg(feature = "gpu")]
+pub mod canopy_card;
+#[cfg(feature = "gpu")]
 pub mod gpu;
 #[cfg(feature = "gpu")]
 pub mod impostor;

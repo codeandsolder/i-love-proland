@@ -266,12 +266,17 @@ impl CompiledModuleBank {
     ///
     /// # Errors
     /// Returns a GPU/device error when the immutable bank exceeds its limits.
-    pub fn upload(&self, device: &wgpu::Device) -> Result<crate::impostor::TreeModules> {
+    pub fn upload(
+        &self,
+        device: &wgpu::Device,
+        canopy: &crate::canopy_card::CanopyTexture,
+    ) -> Result<crate::impostor::TreeModules> {
         crate::impostor::TreeModules::new(
             device,
             &self.data,
             self.variant_ids.clone(),
             self.modules_per_variant,
+            canopy,
         )
     }
 }

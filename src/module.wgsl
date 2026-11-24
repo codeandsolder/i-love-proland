@@ -15,6 +15,7 @@ struct ModuleSettings {
 }
 @group(2) @binding(0) var<storage,read> module_bank:array<ModuleData>;
 @group(2) @binding(1) var<uniform> module_settings:ModuleSettings;
+@group(2) @binding(2) var canopy_texture:texture_2d<f32>;
 
 fn module_corner(vertex:u32)->vec2<f32> {
     switch (vertex) {
@@ -85,7 +86,9 @@ fn module_vs(
         world + wind_offset(world, source_y, object.rotation), 1.0
     );
     out.color = module_data.color * object.tint;
-    out.uv = vec2<f32>(0.5 + 0.5 * corner.x, corner.y);
+    let uv_x = 0.5 + 0.5 * corner.x;
+    let mirror = module_data.metadata.x == 2u && (module_hash(module_data.metadata.y) & 0x10000u) != 0u;
+    out.uv = vec2<f32>(select(uv_x, 1.0 - uv_x, mirror), corner.y);
     out.kind = module_data.metadata.x;
     out.stable_id = module_hash(object.object_id.x ^ module_data.metadata.y);
     return out;
@@ -93,21 +96,18 @@ fn module_vs(
 
 @fragment
 fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
-    let texel = textureSample(source_texture,source_sampler,input.uv);
+    let dx = dpdx(input.uv);
+    let dy = dpdy(input.uv);
     if input.kind == 0u {
         discard;
     }
     if input.kind == 1u {
+        let texel = textureSampleGrad(source_texture, source_sampler, input.uv, dx, dy);
         if texel.a * input.color.a < camera.material.x {discard;}
         return vec4<f32>(texel.rgb * input.color.rgb, 1.0);
     }
-    let xy = 2.0 * input.uv - vec2<f32>(1.0);
-    let radius = length(xy);
-    // An anti-aliased envelope is more stable in the intermediate LOD than
-    // dropping a polygon exactly when its screen-space edge gets subpixel.
-    let edge_width = max(fwidth(radius), 0.025);
-    let shape = 1.0 - smoothstep(1.0 - edge_width, 1.0 + edge_width, radius);
-    let alpha = shape * texel.a * input.color.a;
+    let texel = textureSampleGrad(canopy_texture, atlas_sampler, input.uv, dx, dy);
+    let alpha = texel.a * input.color.a;
     if alpha <= 0.0 {discard;}
     if camera.material.y < 0.5 {
         // Stable per-pixel cutout on non-MSAA targets; on multisample targets,
@@ -119,5 +119,5 @@ fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
         let threshold = (f32(value & 65535u) + 0.5) / 65536.0;
         if alpha < threshold {discard;}
     }
-    return vec4<f32>(texel.rgb * input.color.rgb, alpha);
+    return vec4<f32>(texel.rgb / texel.a * input.color.rgb, alpha);
 }
