@@ -1363,6 +1363,7 @@ fn reference_pipelines(device: &wgpu::Device) -> Result<TreePipelines, Box<dyn E
     Ok(TreePipelines::new(
         &CompactionPipeline::new(device),
         TreeRenderConfig {
+            triangle_coverage: false,
             color_format: wgpu::TextureFormat::Rgba8UnormSrgb,
             depth_format: wgpu::TextureFormat::Depth24Plus,
             sample_count: 1,

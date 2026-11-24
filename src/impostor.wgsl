@@ -237,3 +237,14 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
     // Unpremultiply after both spatial mip filtering and angular blending.
     return vec4<f32>(color.rgb / color.a * input.tint.rgb, alpha);
 }
+
+// Single-sample, additive, depthless diagnostic: actual compacted geometry
+// at pixel centers, including geometry later rejected by alpha or depth.
+@fragment
+fn mesh_coverage_fs() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 0.0, 0.0);
+}
+@fragment
+fn impostor_coverage_fs() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 1.0, 0.0, 0.0);
+}
