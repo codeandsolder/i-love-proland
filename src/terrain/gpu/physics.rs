@@ -288,7 +288,7 @@ impl PhysicsGpu {
     /// Rejects invalid configuration, shapes, sizes or an uninitialized slot.
     pub fn new(
         device: &wgpu::Device,
-        terrain: &impl ContactGrid,
+        terrain: &(impl ContactGrid + ?Sized),
         slot: u32,
         config: PhysicsConfig<'_>,
         bodies: &[RigidBody],
@@ -457,7 +457,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &impl ContactGrid,
+        terrain: &(impl ContactGrid + ?Sized),
         batch: StepBatch,
     ) -> io::Result<()> {
         self.encode_batch(device, encoder, terrain, batch, None)
@@ -479,7 +479,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &impl ContactGrid,
+        terrain: &(impl ContactGrid + ?Sized),
         batch: StepBatch,
     ) -> io::Result<RecordedReadback<ContactEvent>> {
         let size = u64::from(batch.steps)
@@ -512,7 +512,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &impl ContactGrid,
+        terrain: &(impl ContactGrid + ?Sized),
         batch: StepBatch,
         contacts: Option<&wgpu::Buffer>,
     ) -> io::Result<()> {
