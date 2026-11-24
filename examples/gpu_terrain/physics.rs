@@ -315,7 +315,11 @@ fn check_compliance(
     let last = events
         .last()
         .ok_or_else(|| io::Error::other("no final contact"))?;
-    assert_eq!(last.metadata[3], 1);
+    assert_eq!(
+        last.metadata[3], 1,
+        "final state={:?}, event={last:?}",
+        state[0]
+    );
     assert_eq!(last.tick(), 1440);
     let force = last.position_force[3];
     let area = last.slip_area[3];

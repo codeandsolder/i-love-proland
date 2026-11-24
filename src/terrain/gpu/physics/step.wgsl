@@ -135,6 +135,30 @@ fn prepare(b:Body,sphere:vec4<f32>,shape:u32)->Constraint{
     let area=3.14159265*indentation*(2.0*sphere.w-indentation);
     return Constraint(n,max(bias,bounce),arm,1.0/max(effective_mass(b,arm,n),1e-8),vec3<f32>(0.0),0.0,contact.point,contact.depth,area,shape,bounce,0.0);
 }
+// The normal impulse enters both velocity and the pressure-dependent
+// equilibrium depth. Solve the monotone rational equation exactly rather
+// than iterating a stiff explicit target (which can oscillate at high mass).
+fn compliant_impulse(c:Constraint,vn:f32)->f32{
+    let k=1.0/c.inv_effective_mass;
+    let base=vn-k*c.normal_impulse;
+    let beta=0.22/config.dt;
+    let h=max(config.material.y*c.area*config.dt,1e-12);
+    let raw=beta*(c.depth-config.slop);
+    var root=0.0;
+    if raw>base{
+        let b=base+k*h-raw+beta*config.material.x;
+        let q=(raw-base)*h;
+        let discriminant=sqrt(max(0.0,b*b+4.0*k*q));
+        if b>=0.0{
+            root=2.0*q/max(b+discriminant,1e-20);
+        }else{
+            root=(discriminant-b)/(2.0*k);
+        }
+    }
+    let minimum=select(-2.0,c.bounce,c.bounce>0.0);
+    let maximum=max(2.0,c.bounce);
+    return clamp(root,max(0.0,(minimum-base)/k),max(0.0,(maximum-base)/k));
+}
 fn solve(b:ptr<function,Body>,constraint:Constraint)->Constraint{
     var c=constraint;
     let n=c.normal;
@@ -143,23 +167,8 @@ fn solve(b:ptr<function,Body>,constraint:Constraint)->Constraint{
     let vn=dot(relative,n);
     // Project the accumulated normal impulse onto the unilateral cone.
     // Subsequent iterations can undo an excessive prior impulse.
-    var desired=c.desired_speed;
-    var mass=c.inv_effective_mass;
-    if config.material.x>0.0{
-        // Solve the load-dependent rest offset implicitly. The derivative
-        // is positive in the residual, stabilizing the pressure feedback.
-        let half_impulse=config.material.y*c.area*config.dt;
-        let denominator=max(c.normal_impulse+half_impulse,1e-12);
-        let sinkage=config.material.x*c.normal_impulse/denominator;
-        let raw=(c.depth-config.slop-sinkage)*0.22/config.dt;
-        let bias=clamp(raw,-2.0,2.0);
-        desired=select(bias,max(bias,c.bounce),c.bounce>0.0);
-        if abs(raw)<2.0 && (c.bounce<=0.0 || bias>=c.bounce){
-            let derivative=config.material.x*half_impulse/(denominator*denominator)*0.22/config.dt;
-            mass=1.0/(1.0/c.inv_effective_mass+derivative);
-        }
-    }
-    let next_normal=max(0.0,c.normal_impulse+(desired-vn)*mass);
+    var next_normal=max(0.0,c.normal_impulse+(c.desired_speed-vn)*c.inv_effective_mass);
+    if config.material.x>0.0{next_normal=compliant_impulse(c,vn);}
     apply_impulse(b,r,n*(next_normal-c.normal_impulse));
     c.normal_impulse=next_normal;
     let after=(*b).velocity.xyz+cross((*b).angular.xyz,r);
