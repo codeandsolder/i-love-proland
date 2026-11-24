@@ -8,6 +8,7 @@ const SOURCE: &str = concat!(
     include_str!("body.wgsl"),
     include_str!("collider.wgsl"),
     include_str!("body_math.wgsl"),
+    include_str!("sphere_pair_math.wgsl"),
     include_str!("sphere_pairs.wgsl"),
 );
 
@@ -23,19 +24,27 @@ pub(super) fn eligible(bodies: &[RigidBody], colliders: &[Collider]) -> bool {
     })
 }
 
+const LOCAL_SOURCE: &str = concat!(
+    include_str!("body.wgsl"),
+    include_str!("collider.wgsl"),
+    include_str!("body_math.wgsl"),
+    include_str!("sphere_pair_math.wgsl"),
+    include_str!("sphere_pairs_local.wgsl"),
+);
+
 struct Sweep {
     count: wgpu::BindGroup,
     solve: wgpu::BindGroup,
 }
 
-pub(super) struct SpherePairs {
+pub(super) struct ParallelPairs {
     count: Kernel,
     solve: Kernel,
     sweeps: [Sweep; 2],
     groups: [u32; 3],
 }
 
-impl SpherePairs {
+impl ParallelPairs {
     pub(super) fn new(
         device: &wgpu::Device,
         bodies: &wgpu::Buffer,
@@ -104,6 +113,40 @@ impl SpherePairs {
                 &sweep.solve,
                 self.groups,
             );
+        }
+    }
+}
+
+pub(super) enum SpherePairs {
+    Local {
+        kernel: Kernel,
+        bind: wgpu::BindGroup,
+    },
+    Parallel(Box<ParallelPairs>),
+}
+impl SpherePairs {
+    pub(super) fn new(
+        device: &wgpu::Device,
+        bodies: &wgpu::Buffer,
+        colliders: &wgpu::Buffer,
+        count: u32,
+    ) -> io::Result<Self> {
+        if (1..=64).contains(&count) {
+            let kernel = Kernel::new(device, "local sphere island", LOCAL_SOURCE, "solve_local");
+            let bind = kernel.bind(device, "local sphere island", &[bodies, colliders])?;
+            Ok(Self::Local { kernel, bind })
+        } else {
+            Ok(Self::Parallel(Box::new(ParallelPairs::new(
+                device, bodies, colliders, count,
+            )?)))
+        }
+    }
+    pub(super) fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        match self {
+            Self::Local { kernel, bind } => {
+                kernel.dispatch(encoder, "local sphere island", bind, [1, 1, 1])
+            }
+            Self::Parallel(pairs) => pairs.encode(encoder),
         }
     }
 }
