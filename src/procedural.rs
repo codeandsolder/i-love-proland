@@ -567,6 +567,7 @@ mod module_tests {
     #[test]
     fn heterogeneous_visual_forms_keep_independent_conservative_bounds()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use crate::gpu::{GpuView, MeshLod, MeshLods, PackedInstance, VisualLod, classify_cpu};
         let wide = Species {
             height: 24.0,
             crown_radius: 10.0,
@@ -610,7 +611,6 @@ mod module_tests {
         // dimensions, but independently conservative projected diameters.
         // Their visible material, impostor billboard size, canonical source
         // metadata and handoff anchor are deliberately unchanged.
-        use crate::gpu::{GpuView, MeshLod, MeshLods, PackedInstance, VisualLod, classify_cpu};
         let mature = PackedInstance {
             position_radius: [0.0, 0.0, 300.0, *large],
             rotation: [0.0, 0.0, 0.0, 1.0],
