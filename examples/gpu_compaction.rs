@@ -403,8 +403,9 @@ fn validate_projected_lod_parity(
     let tiers = original
         .tiers()
         .iter()
-        .map(|tier| MeshLod {
-            prefer_mesh: true,
+        .enumerate()
+        .map(|(index, tier)| MeshLod {
+            prefer_mesh: index + 1 < original.tiers().len(),
             ..*tier
         })
         .collect::<Vec<_>>();
@@ -412,9 +413,17 @@ fn validate_projected_lod_parity(
     let mut projected_compactor =
         GpuCompactor::new(pipeline, u32::try_from(candidates.len())?, projected, 6)?;
     projected_compactor.set_candidates(queue, candidates)?;
-    for focal in [270.0, 540.0, 1080.0] {
-        let projected_view =
-            GpuView::unculled(focal, 32.0, 1.0)?.with_source_center([0.12, 0.4, -0.19])?;
+    for (focal, spread) in [
+        (270.0, 0.0),
+        (540.0, 0.0),
+        (1080.0, 0.0),
+        (270.0, 0.25),
+        (540.0, 0.25),
+        (1080.0, 0.25),
+    ] {
+        let projected_view = GpuView::unculled(focal, 32.0, 1.0)?
+            .with_source_center([0.12, 0.4, -0.19])?
+            .with_projected_lod_spread(spread)?;
         let (expected, _) = reference(candidates, projected_view, projected_compactor.mesh_lods());
         let (draws, _) = gpu_parity(
             device,
@@ -425,7 +434,7 @@ fn validate_projected_lod_parity(
             &expected,
         )?;
         println!(
-            "GPU_PROJECTED_LOD_PARITY focal={focal} bins={:?}",
+            "GPU_PROJECTED_LOD_PARITY focal={focal} spread={spread} bins={:?}",
             draws
                 .iter()
                 .map(|draw| draw.instance_count)
