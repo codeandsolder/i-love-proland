@@ -985,12 +985,12 @@ fn bake_reference_atlas(
 }
 
 fn module_source_forms() -> Result<Vec<Plant>, Box<dyn Error>> {
-    let broadleaf = Species::default();
-    let mut shrub = broadleaf;
+    let broadleaf = i_love_proland::foliage::Broadleaf::default();
+    let mut shrub = Species::default();
     shrub.height *= 0.48;
     shrub.crown_radius *= 1.2;
     Ok(vec![
-        Plant::generate(&broadleaf, 900)?,
+        broadleaf.generate(900)?,
         i_love_proland::foliage::WhorledConifer::default().generate(901)?,
         Plant::generate(&shrub, 902)?,
     ])
@@ -1118,7 +1118,13 @@ fn build_module_forest(
     for (start_m, projected, budget, stem_error) in lod_requests {
         let model_tiers = plants
             .iter()
-            .map(|plant| {
+            .enumerate()
+            .map(|(index, plant)| {
+                let stem_error = if index == 0 && projected >= 96.0 {
+                    0.45
+                } else {
+                    stem_error
+                };
                 Ok((
                     900_u64,
                     plant.module_tier(
