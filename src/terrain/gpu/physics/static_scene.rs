@@ -23,7 +23,7 @@ struct Triangle {
 }
 
 impl Triangle {
-    fn new(t: StaticTriangle) -> Self {
+    const fn new(t: StaticTriangle) -> Self {
         let [a, b, c] = t.vertices;
         Self {
             a,

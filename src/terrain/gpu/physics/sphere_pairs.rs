@@ -144,7 +144,7 @@ impl SpherePairs {
     pub(super) fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
         match self {
             Self::Local { kernel, bind } => {
-                kernel.dispatch(encoder, "local sphere island", bind, [1, 1, 1])
+                kernel.dispatch(encoder, "local sphere island", bind, [1, 1, 1]);
             }
             Self::Parallel(pairs) => pairs.encode(encoder),
         }
