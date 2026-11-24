@@ -1,8 +1,12 @@
 //! Experimental fixed-step GPU rigid-body terrain solver. This is a local
 //! chart-space sandbox, not yet a full planetary multi-body physics engine.
+mod articulation;
 mod clock;
 use super::{
     GridProjection, Kernel, RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage,
+};
+pub use articulation::{
+    ARTICULATION_WGSL, ArticulationLayout, Island, Joint, JointDrive, JointFrame, JointKind,
 };
 pub use clock::{SimulationClock, StepBatch};
 use std::io;
@@ -257,6 +261,7 @@ struct StepConfig {
 /// intentionally outside this first terrain-contact solver.
 pub struct PhysicsGpu {
     pipeline: Kernel,
+    articulation: Option<articulation::Articulation>,
     bodies: wgpu::Buffer,
     shapes: wgpu::Buffer,
     empty_contacts: wgpu::Buffer,
@@ -346,6 +351,7 @@ impl PhysicsGpu {
         };
         Ok(Self {
             pipeline,
+            articulation: None,
             bodies: states,
             shapes: storage(
                 device,
@@ -366,6 +372,48 @@ impl PhysicsGpu {
             submitted: config.initial_tick,
             hz: config.hz,
         })
+    }
+
+    /// Upload coupled islands with the same GPU terrain contact geometry.
+    /// Each island is an exclusive owner of its bodies during a dispatch.
+    ///
+    /// # Errors
+    /// Rejects invalid topology, joint parameters or adapter limits.
+    pub fn articulated(
+        device: &wgpu::Device,
+        terrain: &TerrainGpu,
+        slot: u32,
+        config: PhysicsConfig<'_>,
+        bodies: &[RigidBody],
+        shapes: &[Collider],
+        layout: ArticulationLayout<'_>,
+    ) -> io::Result<Self> {
+        let mut physics = Self::new(device, terrain, slot, config, bodies, shapes)?;
+        physics.articulation = Some(articulation::Articulation::new(
+            device,
+            layout,
+            bodies,
+            shapes,
+            physics.params.contact_stride,
+        )?);
+        Ok(physics)
+    }
+
+    /// Change a scalar joint drive in command-buffer order.
+    ///
+    /// # Errors
+    /// Rejects invalid drive or a nonexistent joint.
+    pub fn encode_joint_drive(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        index: usize,
+        drive: JointDrive,
+    ) -> io::Result<()> {
+        self.articulation
+            .as_mut()
+            .ok_or_else(|| invalid("independent physics has no joints"))?
+            .drive(device, encoder, index, drive)
     }
 
     /// Geometry used by both the solver and its terrain draw.
@@ -493,13 +541,28 @@ impl PhysicsGpu {
             &self.materials,
             &self.material_cells,
         ];
-        self.pipeline.encode(
-            device,
-            encoder,
-            "advance fixed physics ticks",
-            &buffers,
-            [self.params.count.div_ceil(64), 1, 1],
-        )?;
+        if let Some(articulation) = &self.articulation {
+            let buffers = [
+                &buffers[..],
+                &[&articulation.topology, &articulation.scratch],
+            ]
+            .concat();
+            articulation.pipeline.encode(
+                device,
+                encoder,
+                "advance coupled islands",
+                &buffers,
+                [articulation.count, 1, 1],
+            )?;
+        } else {
+            self.pipeline.encode(
+                device,
+                encoder,
+                "advance fixed physics ticks",
+                &buffers,
+                [self.params.count.div_ceil(64), 1, 1],
+            )?;
+        }
         self.submitted = end;
         Ok(())
     }

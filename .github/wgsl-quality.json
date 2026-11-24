@@ -37,7 +37,8 @@
         "src/terrain/gpu/projection.wgsl",
         "src/terrain/gpu/physics/body.wgsl",
         "src/terrain/gpu/physics/collider.wgsl",
-        "src/terrain/gpu/physics/step.wgsl"
+        "src/terrain/gpu/physics/step.wgsl",
+        "src/terrain/gpu/physics/articulation.wgsl"
       ]
     },
     {
