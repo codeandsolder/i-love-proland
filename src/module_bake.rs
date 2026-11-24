@@ -1,15 +1,16 @@
 //! Source-geometry-consistent angular atlas generation from the compact GPU module bank.
 //!
 //! Use the same tapered branch quads, source-ID-oriented canopy cards, source
-//! texture and radial cutout as the module vertex/fragment shaders. Every
+//! texture and textured leaf-clump cutout as the module shaders. Every
 //! visual model is baked independently in its original local source frame;
 //! the canonical tree ID never changes with LOD or camera angle.
 
 use crate::{
     Error, Result,
-    atlas_bake::{BakeSurface, bake_scene, to_byte},
+    atlas_bake::{BakeSurface, bake_scene},
+    canopy_card::CanopyCard,
     impostor::{AtlasImage, AtlasTexture, GpuModule, ModelAtlas, TreeVertex},
-    material::{SourceImage, linear_to_srgb},
+    material::SourceImage,
     procedural::CompiledModuleBank,
 };
 
@@ -105,7 +106,12 @@ fn quad(module: &GpuModule, side: u8) -> Result<[TreeVertex; 4]> {
             ));
         }
     };
-    let uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+    let mut uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+    if module.metadata[0] == 2 && module_hash(module.metadata[1]) & 0x10000 != 0 {
+        for uv in &mut uvs {
+            uv[0] = 1.0 - uv[0];
+        }
+    }
     Ok(std::array::from_fn(|i| TreeVertex {
         position: [positions[i][0], positions[i][1], positions[i][2], 1.0],
         color,
@@ -140,35 +146,6 @@ impl QuadMesh {
     }
 }
 
-fn masked_canopy_texture(source: &SourceImage, tile_size: u32) -> Result<SourceImage> {
-    let size = u16::try_from(tile_size.max(128)).map_err(|_| Error::IndexOverflow)?;
-    let texels = source.linear_texels();
-    let capacity = usize::from(size)
-        .checked_mul(usize::from(size))
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or(Error::IndexOverflow)?;
-    let mut bytes = Vec::with_capacity(capacity);
-    let inverse = f32::from(size).recip();
-    for y in 0..size {
-        for x in 0..size {
-            let uv = [
-                (f32::from(x) + 0.5) * inverse,
-                (f32::from(y) + 0.5) * inverse,
-            ];
-            let texel = source.sample(&texels, uv);
-            let distance = (2.0_f32.mul_add(uv[0], -1.0)).hypot(2.0_f32.mul_add(uv[1], -1.0));
-            let shape = ((1.025 - distance) / 0.05).clamp(0.0, 1.0);
-            bytes.extend_from_slice(&[
-                to_byte(linear_to_srgb(texel[0])),
-                to_byte(linear_to_srgb(texel[1])),
-                to_byte(linear_to_srgb(texel[2])),
-                to_byte(texel[3] * shape),
-            ]);
-        }
-    }
-    SourceImage::new(u32::from(size), u32::from(size), bytes)
-}
-
 impl CompiledModuleBank {
     /// Bake and upload the complete per-seed atlas in the exact canonical
     /// catalog order owned by this module bank. The caller cannot swap the
@@ -181,10 +158,11 @@ impl CompiledModuleBank {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         source: &SourceImage,
+        canopy: &CanopyCard,
         tile_size: u32,
         gutter: u32,
     ) -> Result<AtlasTexture> {
-        let images = self.bake_variant_atlases(source, tile_size, gutter)?;
+        let images = self.bake_variant_atlases(source, canopy, tile_size, gutter)?;
         AtlasImage::upload_variants(device, queue, &images)
     }
 
@@ -193,9 +171,9 @@ impl CompiledModuleBank {
     /// The output has the same order as the original dense visual-model catalog.
     ///
     /// For an exact match, use the same source image for GPU module materials;
-    /// the baker adds the module canopy's radial alpha envelope while keeping
-    /// source-sampled linear RGB. Each model is rebaked within its own
-    /// tight sphere about the common source anchor. Its atlas scale restores
+    /// the baker samples the same immutable leaf-clump card, including
+    /// its irregular coverage and source-local linear-light shading. Each
+    /// model is rebaked within its own tight sphere about the common source anchor. Its atlas scale restores
     /// the exact original projected physical dimensions at render time.
     ///
     /// # Errors
@@ -204,6 +182,7 @@ impl CompiledModuleBank {
     pub fn bake_variant_atlases(
         &self,
         source: &SourceImage,
+        canopy: &CanopyCard,
         tile_size: u32,
         gutter: u32,
     ) -> Result<Vec<ModelAtlas>> {
@@ -215,7 +194,6 @@ impl CompiledModuleBank {
                 "invalid procedural atlas dimensions",
             ));
         }
-        let mask = masked_canopy_texture(source, tile_size)?;
         let stride = usize::try_from(self.modules_per_variant).map_err(|_| Error::IndexOverflow)?;
         if self.variant_ids.is_empty()
             || stride == 0
@@ -267,7 +245,10 @@ impl CompiledModuleBank {
                         *component /= radius_scale;
                     }
                 }
-                let materials = [branches.surface(source, 0.35), leaves.surface(&mask, 0.5)];
+                let materials = [
+                    branches.surface(source, 0.35),
+                    leaves.surface(&canopy.image, 0.5),
+                ];
                 let surfaces = materials.into_iter().flatten().collect::<Vec<_>>();
                 Ok(ModelAtlas {
                     variant_id,
@@ -310,7 +291,9 @@ mod tests {
                 .map_err(|_| Error::InvalidConfiguration("source frame"))?,
         )
         .map_err(|_| Error::InvalidConfiguration("module compilation"))?;
-        let atlases = bank.bake_variant_atlases(&SourceImage::white(), 16, 2)?;
+        let source = SourceImage::white();
+        let canopy = CanopyCard::new(&source)?;
+        let atlases = bank.bake_variant_atlases(&source, &canopy, 16, 2)?;
         assert_eq!(atlases.len(), sources.len());
         assert_ne!(atlases[0].image.rgba(), atlases[1].image.rgba());
         assert!(atlases.iter().all(|atlas| {
@@ -320,10 +303,7 @@ mod tests {
                 .chunks_exact(4)
                 .any(|pixel| pixel[3] != 0)
         }));
-        assert!(
-            bank.bake_variant_atlases(&SourceImage::white(), 4, 2)
-                .is_err()
-        );
+        assert!(bank.bake_variant_atlases(&source, &canopy, 4, 2).is_err());
         Ok(())
     }
 
@@ -359,7 +339,9 @@ mod tests {
             modules_per_variant: 2,
             variant_culling_radii: vec![6.0, 1.5],
         };
-        let atlases = bank.bake_variant_atlases(&SourceImage::white(), 32, 2)?;
+        let source = SourceImage::white();
+        let canopy = CanopyCard::new(&source)?;
+        let atlases = bank.bake_variant_atlases(&source, &canopy, 32, 2)?;
         let [large, small] = atlases.as_slice() else {
             return Err(Error::InvalidConfiguration("expected two model atlases"));
         };
@@ -370,10 +352,7 @@ mod tests {
         // Equal normalized alpha coverage now represents 1/16 as much
         // physical area, and uses 1/16 as much billboard raster area.
         bank.variant_culling_radii[1] = 0.01;
-        assert!(
-            bank.bake_variant_atlases(&SourceImage::white(), 32, 2)
-                .is_err()
-        );
+        assert!(bank.bake_variant_atlases(&source, &canopy, 32, 2).is_err());
         Ok(())
     }
 

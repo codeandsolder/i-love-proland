@@ -1117,6 +1117,8 @@ fn build_module_forest(
     let mut bank_materials = Vec::new();
     let mut tier_descriptors = Vec::new();
     let mut largest_expansion = 1.0_f32;
+    let canopy_card = i_love_proland::canopy_card::CanopyCard::new(&SourceImage::white())?;
+    let canopy_texture = canopy_card.upload(device, queue)?;
     for (start_m, projected, budget, stem_error) in lod_requests {
         let model_tiers = plants
             .iter()
@@ -1150,11 +1152,12 @@ fn build_module_forest(
                 device,
                 queue,
                 &SourceImage::white(),
+                &canopy_card,
                 64,
                 2,
             )?);
         }
-        let modules = compiled.upload(device)?;
+        let modules = compiled.upload(device, &canopy_texture)?;
         tier_descriptors.push(MeshLod {
             start_m,
             index_count: modules.index_count(),

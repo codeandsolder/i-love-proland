@@ -9,6 +9,7 @@ use crate::{
     Error, Result,
     atlas_bake::to_byte,
     billboard::Billboard,
+    canopy_card::CanopyTexture,
     material::{linear_to_srgb, srgb_to_linear},
     wind::{WindFrame, WindParameters},
 };
@@ -130,6 +131,7 @@ pub struct TreeModules {
     variant_count: u32,
     variant_ids: Vec<u64>,
     modules_per_variant: u32,
+    canopy: CanopyTexture,
     uniforms: wgpu::Buffer,
 }
 
@@ -144,6 +146,7 @@ impl TreeModules {
         data: &[GpuModule],
         variant_ids: Vec<u64>,
         modules_per_variant: u32,
+        canopy: &CanopyTexture,
     ) -> Result<Self> {
         let variants = u32::try_from(variant_ids.len()).map_err(|_| Error::IndexOverflow)?;
         let size = u64::from(variants)
@@ -215,6 +218,7 @@ impl TreeModules {
             variant_count: variants,
             variant_ids,
             modules_per_variant,
+            canopy: canopy.clone(),
             uniforms,
         })
     }
@@ -870,6 +874,16 @@ fn module_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -1026,6 +1040,10 @@ fn build_mesh_draw(
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: modules.uniforms.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&modules.canopy.view),
                     },
                 ],
             }))
