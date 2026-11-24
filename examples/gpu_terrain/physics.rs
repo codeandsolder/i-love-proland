@@ -4,7 +4,10 @@ use i_love_proland::terrain::{
     Region, RegionCell, RegionChart,
     gpu::{
         TerrainGpu, TerrainRequest,
-        physics::{PhysicsConfig, PhysicsGpu, RigidBody, SimulationClock, Sphere, StepBatch},
+        physics::{
+            Collider, ContactMaterial, ContactMaterialField, PhysicsConfig, PhysicsGpu, RigidBody,
+            SimulationClock, StepBatch,
+        },
     },
 };
 use std::{
@@ -44,12 +47,13 @@ const fn body(position: [f32; 3], velocity: [f32; 3], count: u32) -> RigidBody {
         clock: [0; 4],
     }
 }
-const CONFIG: PhysicsConfig = PhysicsConfig {
+const CONFIG: PhysicsConfig<'static> = PhysicsConfig {
     initial_tick: 0,
     hz: 240,
     gravity_m_s2: 9.81,
     contact_slop_m: 0.001,
     solver_iterations: 5,
+    material: ContactMaterialField::Uniform(ContactMaterial::RIGID),
     stop_at_contact: false,
 };
 fn simulate(
@@ -57,7 +61,7 @@ fn simulate(
     queue: &wgpu::Queue,
     terrain: &TerrainGpu,
     initial: &[RigidBody],
-    spheres: &[Sphere],
+    spheres: &[Collider],
     batch_size: u32,
 ) -> Result<(Vec<RigidBody>, f64)> {
     let initial_tick = initial[0].completed_tick();
@@ -112,10 +116,7 @@ fn check_presentation(
     terrain: &TerrainGpu,
 ) -> Result<()> {
     use i_love_proland::terrain::gpu::physics::{PresentationHistory, PresentationTime, StepBatch};
-    let sphere = [Sphere {
-        center: [0.0; 3],
-        radius: 0.5,
-    }];
+    let sphere = [Collider::sphere([0.0; 3], 0.5)];
     let mut initial = body([32.0, 32.0, 110.0], [1.0, 0.0, 0.0], 1);
     initial.clock = [u32::MAX - 100, 15, 0, 0];
     let epoch = initial.completed_tick();
@@ -203,7 +204,7 @@ fn check_prediction(
     queue: &wgpu::Queue,
     terrain: &TerrainGpu,
     initial: &[RigidBody],
-    sphere: &[Sphere],
+    sphere: &[Collider],
     expected: Option<u64>,
 ) -> Result<()> {
     let mut predictor = PhysicsGpu::new(
@@ -248,6 +249,152 @@ fn check_prediction(
     Ok(())
 }
 
+// Real solver regression: same initial state and fixed triangles, with
+// rigid and compliant material; logged support/force must match equilibrium.
+fn check_compliance(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    terrain: &TerrainGpu,
+    collider: Collider,
+    axes: [f32; 3],
+    expected_height: f32,
+) -> Result<(f32, f32)> {
+    let sphere = [collider];
+    let mut initial = body([32.0, 32.0, 103.0], [0.0; 3], 1);
+    initial.position[3] = 0.001; // 1000 kg
+    initial.inverse_inertia = [0.01, 0.01, 0.01, 0.0];
+    let material = ContactMaterial {
+        max_sinkage_m: 0.06,
+        half_sinkage_pressure_pa: 35_000.0,
+    };
+    let (rigid, _) = simulate(device, queue, terrain, &[initial], &sphere, 64)?;
+    let mut physics = PhysicsGpu::new(
+        device,
+        terrain,
+        0,
+        PhysicsConfig {
+            material: ContactMaterialField::Uniform(material),
+            ..CONFIG
+        },
+        &[initial],
+        &sphere,
+    )?;
+    let mut commands = encoder(device);
+    physics.encode(
+        device,
+        &mut commands,
+        terrain,
+        StepBatch {
+            start_tick: 0,
+            steps: 1024,
+            hz: CONFIG.hz,
+        },
+    )?;
+    let events = physics.encode_contacts(
+        device,
+        &mut commands,
+        terrain,
+        StepBatch {
+            start_tick: 1024,
+            steps: 416,
+            hz: CONFIG.hz,
+        },
+    )?;
+    let state = physics.snapshot(device, &mut commands);
+    queue.submit([commands.finish()]);
+    let mut events = events.begin();
+    let mut state = state.begin();
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let events = events
+        .try_take()?
+        .ok_or_else(|| io::Error::other("contact observations unfinished"))?;
+    let state = state
+        .try_take()?
+        .ok_or_else(|| io::Error::other("compliant state unfinished"))?;
+    assert_eq!(events.len(), 416);
+    let last = events
+        .last()
+        .ok_or_else(|| io::Error::other("no final contact"))?;
+    assert_eq!(
+        last.metadata[3], 1,
+        "final state={:?}, event={last:?}",
+        state[0]
+    );
+    assert_eq!(last.tick(), 1440);
+    let force = last.position_force[3];
+    let area = last.slip_area[3];
+    let depth = last.normal_depth[3];
+    let expected = CONFIG.contact_slop_m
+        + material.max_sinkage_m * force / material.half_sinkage_pressure_pa.mul_add(area, force);
+    let actual = rigid[0].position[2] - state[0].position[2];
+    println!(
+        "GPU_COMPLIANT_CONTACT rigid_z={:.6} compliant_z={:.6} delta={actual:.6} force_n={force:.3} area_m2={area:.6} depth_m={depth:.6} predicted_m={expected:.6} events={}",
+        rigid[0].position[2],
+        state[0].position[2],
+        events.len()
+    );
+    assert!(actual > 0.0 && actual < material.max_sinkage_m + 0.005);
+    assert!((rigid[0].position[2] - (100.0 + expected_height)).abs() < 0.004);
+    // Independent ellipsoid section formula for axis-aligned resting
+    // plane (the fixture rotates a principal axis exactly onto world Z).
+    let normalized = (1.0 - depth.min(expected_height) / expected_height).powi(2);
+    let predicted_area =
+        std::f32::consts::PI * axes.iter().product::<f32>() / expected_height * (1.0 - normalized);
+    assert!(
+        (area - predicted_area).abs() < 0.001,
+        "area {area} predicted {predicted_area}"
+    );
+    assert!((force - 9810.0).abs() < 100.0);
+    assert!((depth - expected).abs() < 0.002);
+    assert!(state[0].velocity[..3].iter().all(|v| v.abs() < 0.1));
+    Ok((actual, area))
+}
+
+fn check_ellipsoid_compliance(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    terrain: &TerrainGpu,
+) -> Result<()> {
+    let (sphere_sinkage, _) = check_compliance(
+        device,
+        queue,
+        terrain,
+        Collider::sphere([0.0; 3], 0.5),
+        [0.5; 3],
+        0.5,
+    )?;
+    let axes = [0.9, 0.6, 0.2];
+    let (wide_sinkage, wide_area) = check_compliance(
+        device,
+        queue,
+        terrain,
+        Collider::ellipsoid([0.0; 3], axes, [0.0, 0.0, 0.0, 1.0]),
+        axes,
+        0.2,
+    )?;
+    let axes = [0.5, 0.5, 0.13];
+    let rotation = [
+        std::f32::consts::FRAC_1_SQRT_2,
+        0.0,
+        0.0,
+        std::f32::consts::FRAC_1_SQRT_2,
+    ];
+    let (wheel_sinkage, wheel_area) = check_compliance(
+        device,
+        queue,
+        terrain,
+        Collider::ellipsoid([0.0; 3], axes, rotation),
+        axes,
+        0.5,
+    )?;
+    assert!(wide_sinkage < sphere_sinkage && sphere_sinkage < wheel_sinkage);
+    assert!(wide_area > wheel_area);
+    println!(
+        "GPU_ELLIPSOID_COMPLIANCE wide_sinkage_m={wide_sinkage:.6} wheel_sinkage_m={wheel_sinkage:.6} wide_area_m2={wide_area:.6} wheel_area_m2={wheel_area:.6}"
+    );
+    Ok(())
+}
+
 pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = slope_region(0.0)?;
     let mut terrain = TerrainGpu::new(device, &region, 65, 1)?;
@@ -263,10 +410,8 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     )?;
     queue.submit([commands.finish()]);
     check_presentation(device, queue, &terrain)?;
-    let sphere = [Sphere {
-        center: [0.0; 3],
-        radius: 0.5,
-    }];
+    check_ellipsoid_compliance(device, queue, &terrain)?;
+    let sphere = [Collider::sphere([0.0; 3], 0.5)];
     let initial = [body([32.0, 32.0, 103.0], [0.0; 3], 1)];
     let (a, _) = simulate(device, queue, &terrain, &initial, &sphere, 64)?;
     check_prediction(
@@ -291,22 +436,10 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     );
     assert!(a[0].velocity[..3].iter().all(|v| v.abs() < 0.1));
     let feet = [
-        Sphere {
-            center: [-0.6, -0.6, -0.4],
-            radius: 0.25,
-        },
-        Sphere {
-            center: [0.6, -0.6, -0.4],
-            radius: 0.25,
-        },
-        Sphere {
-            center: [-0.6, 0.6, -0.4],
-            radius: 0.25,
-        },
-        Sphere {
-            center: [0.6, 0.6, -0.4],
-            radius: 0.25,
-        },
+        Collider::sphere([-0.6, -0.6, -0.4], 0.25),
+        Collider::sphere([0.6, -0.6, -0.4], 0.25),
+        Collider::sphere([-0.6, 0.6, -0.4], 0.25),
+        Collider::sphere([0.6, 0.6, -0.4], 0.25),
     ];
     let mut lander = body([32.0, 32.0, 103.0], [1.0, 0.0, 0.0], 4);
     lander.rotation = [0.099_833_42, 0.0, 0.0, 0.995_004_2];
@@ -332,7 +465,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     check_slope(device, queue, &sphere)
 }
 
-fn check_slope(device: &wgpu::Device, queue: &wgpu::Queue, sphere: &[Sphere]) -> Result<()> {
+fn check_slope(device: &wgpu::Device, queue: &wgpu::Queue, sphere: &[Collider]) -> Result<()> {
     let region = slope_region(0.1)?;
     let mut sloped = TerrainGpu::new(device, &region, 65, 1)?;
     let mut commands = encoder(device);
