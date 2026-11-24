@@ -986,18 +986,14 @@ fn bake_reference_atlas(
 
 fn module_source_forms() -> Result<Vec<Plant>, Box<dyn Error>> {
     let broadleaf = Species::default();
-    let mut conifer = broadleaf;
-    conifer.height *= 1.7;
-    conifer.crown_radius *= 0.55;
-    conifer.levels = 2;
     let mut shrub = broadleaf;
     shrub.height *= 0.48;
     shrub.crown_radius *= 1.2;
-    let variants = [(broadleaf, 900), (conifer, 901), (shrub, 902)];
-    variants
-        .into_iter()
-        .map(|(species, seed)| Ok(Plant::generate(&species, seed)?))
-        .collect()
+    Ok(vec![
+        Plant::generate(&broadleaf, 900)?,
+        i_love_proland::foliage::WhorledConifer::default().generate(901)?,
+        Plant::generate(&shrub, 902)?,
+    ])
 }
 
 /// Spatially coherent *visual* groves are chosen by coarse world cells.
