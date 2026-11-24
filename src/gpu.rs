@@ -640,7 +640,7 @@ fn projected_lod_multiplier(id: [u32; 4], spread: f32) -> f32 {
     hash ^= hash >> 16;
     let [_, _, low, high] = hash.to_le_bytes();
     let rank = f32::from(u16::from_le_bytes([low, high])) / 65_536.0;
-    (2.0 * rank - 1.0).mul_add(spread, 1.0)
+    2.0_f32.mul_add(rank, -1.0).mul_add(spread, 1.0)
 }
 
 /// Reference classifier for parity testing with the WGSL shader.
