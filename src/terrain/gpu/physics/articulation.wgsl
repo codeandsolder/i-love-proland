@@ -216,7 +216,7 @@ fn advance_island(@builtin(global_invocation_id) invocation:vec3<u32>){
             }
             if contact&&b.metadata.w==0u{
                 b.metadata.w=1u;
-                b.clock.zw=b.clock.xy;
+                b.clock.z=b.clock.x;b.clock.w=b.clock.y;
                 stop=stop||config.stop_at_contact!=0u;
             }
             bodies[i]=b;

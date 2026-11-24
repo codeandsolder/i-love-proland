@@ -1,5 +1,5 @@
 //! Disjoint articulated rigid-body islands sharing the terrain contact solver.
-use super::{Collider, Kernel, RigidBody, invalid};
+use super::{Kernel, RigidBody, invalid};
 use std::io;
 use wgpu::util::DeviceExt;
 
@@ -113,6 +113,7 @@ pub struct Island {
     pub joint_count: u32,
 }
 
+#[derive(Clone, Copy)]
 pub struct ArticulationLayout<'a> {
     pub islands: &'a [Island],
     pub joints: &'a [Joint],
@@ -182,7 +183,7 @@ impl Articulation {
         device: &wgpu::Device,
         layout: ArticulationLayout<'_>,
         bodies: &[RigidBody],
-        _shapes: &[Collider],
+
         stride: u32,
     ) -> io::Result<Self> {
         let count = u32::try_from(layout.islands.len()).map_err(io::Error::other)?;

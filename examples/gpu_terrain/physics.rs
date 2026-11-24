@@ -1,4 +1,6 @@
 //! End-to-end measurements and contact regressions on the actual GPU.
+#[path = "physics/articulation.rs"]
+mod articulation;
 use super::{Result, encoder};
 use i_love_proland::terrain::{
     Region, RegionCell, RegionChart,
@@ -411,6 +413,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     queue.submit([commands.finish()]);
     check_presentation(device, queue, &terrain)?;
     check_ellipsoid_compliance(device, queue, &terrain)?;
+    articulation::check(device, queue, &terrain)?;
     let sphere = [Collider::sphere([0.0; 3], 0.5)];
     let initial = [body([32.0, 32.0, 103.0], [0.0; 3], 1)];
     let (a, _) = simulate(device, queue, &terrain, &initial, &sphere, 64)?;

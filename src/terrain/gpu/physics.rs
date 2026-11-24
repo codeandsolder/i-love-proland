@@ -393,7 +393,6 @@ impl PhysicsGpu {
             device,
             layout,
             bodies,
-            shapes,
             physics.params.contact_stride,
         )?);
         Ok(physics)
