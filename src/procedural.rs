@@ -468,24 +468,22 @@ mod module_tests {
     fn heterogeneous_species_share_explicit_frame_and_padded_gpu_stride()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let broadleaf = Species::default();
-        let mut conifer = broadleaf;
-        conifer.height *= 1.7;
-        conifer.crown_radius *= 0.55;
-        conifer.levels = 2;
         let frame = SourceFrame::new([0.0, 8.0, 0.0], 22.0)?;
         let variants = [
-            (&broadleaf, 0xdead_beef_u64),
-            (&conifer, 2_u64),
-            (&broadleaf, 99999_u64),
+            (
+                Plant::generate(&broadleaf, 0xdead_beef_u64)?,
+                0xdead_beef_u64,
+            ),
+            (lorax_rs::WhorledConifer::default().generate(2)?, 2_u64),
+            (Plant::generate(&broadleaf, 99999_u64)?, 99999_u64),
         ]
         .into_iter()
-        .map(|(species, seed)| {
-            let tree = Plant::generate(species, seed)?;
+        .map(|(tree, seed)| {
             Ok((
                 seed,
                 tree.module_tier(
                     ScreenLod::new(80.0, 0.75, 0.01)?.with_cluster_budget(24)?,
-                    species.wood_color,
+                    broadleaf.wood_color,
                 )?,
             ))
         })
