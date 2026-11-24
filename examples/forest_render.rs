@@ -349,7 +349,7 @@ struct ForestPass<'a> {
     background: &'a wgpu::RenderPipeline,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct ForestQueries<'a> {
     timestamps: Option<(&'a wgpu::QuerySet, u32)>,
     fragments: Option<(&'a wgpu::QuerySet, u32)>,
@@ -1378,6 +1378,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         return impostor_bench::run(prefix);
     }
     let (prefix, source, module_smoke) = parse_forest_input()?;
+    run_forest_capture(&prefix, &source, module_smoke)
+}
+
+fn run_forest_capture(
+    prefix: &str,
+    source: &SourceImage,
+    module_smoke: bool,
+) -> Result<(), Box<dyn Error>> {
     let (vertices, indices) = sample_tree()?;
     // The synthetic source consists of a 10-sided trunk (20 vertices, 60
     // indices), followed by several UV-mapped crowns. They use different
@@ -1396,7 +1404,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         leaf_vertices,
         &leaf_indices,
         &bark,
-        &source,
+        source,
     )?;
     write_atlas_preview(&format!("{prefix}-atlas.ppm"), &atlas)?;
 
@@ -1447,7 +1455,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         depth: &targets.depth_view,
         background: &background,
     };
-    let greens = capture_initial_forest(&device, &scene, color, &prefix)?;
+    let greens = capture_initial_forest(&device, &scene, color, prefix)?;
 
     render_overhead(
         &device,
@@ -1455,7 +1463,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         low_camera,
         &overhead_background,
         color,
-        &prefix,
+        prefix,
     )?;
 
     let frame_ms = validate_and_benchmark(
@@ -1473,7 +1481,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &pipelines,
             bark_texture.view(),
             &candidates,
-            &prefix,
+            prefix,
         )?;
     }
     println!(

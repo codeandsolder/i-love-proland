@@ -163,7 +163,7 @@ fn summarize(ticks: &[u64], fragments: &[u64], period: f32) -> Result<(), Box<dy
     Ok(())
 }
 
-pub(super) fn run(prefix: &str) -> Result<(), Box<dyn Error>> {
+pub fn run(prefix: &str) -> Result<(), Box<dyn Error>> {
     let features = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::PIPELINE_STATISTICS_QUERY;
     let (device, queue) = create_device(features)?;
     let (candidates, _) = generate_forest()?;
