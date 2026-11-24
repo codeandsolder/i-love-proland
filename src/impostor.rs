@@ -1359,7 +1359,7 @@ impl TreeRenderer {
                 || required <= 0.0
                 || !physical.is_finite()
                 || physical <= 0.0
-                || required > physical * (1.0 + 8.0 * f32::EPSILON)
+                || required > physical * 8.0_f32.mul_add(f32::EPSILON, 1.0)
             {
                 return Err(Error::InvalidConfiguration(
                     "impostor exceeds physical culling radius",

@@ -256,7 +256,7 @@ impl CompiledModuleBank {
                     || radius_scale <= 0.0
                     || !max_scale.is_finite()
                     || max_scale <= 0.0
-                    || radius_scale > max_scale * (1.0 + 8.0 * f32::EPSILON)
+                    || radius_scale > max_scale * 8.0_f32.mul_add(f32::EPSILON, 1.0)
                 {
                     return Err(Error::InvalidConfiguration(
                         "module atlas exceeds physical source bound",
