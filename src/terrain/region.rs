@@ -40,7 +40,7 @@ impl RegionChart {
     pub fn extent(self) -> f64 {
         self.spacing_m * f64::from(self.cells)
     }
-    fn valid(self) -> bool {
+    pub(super) fn valid(self) -> bool {
         let extent = self.extent();
         self.radius_m.is_finite()
             && self.radius_m > 0.0

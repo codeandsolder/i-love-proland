@@ -185,18 +185,21 @@ mod tests {
         build(&mut nodes, &mut triangles, 0)?;
         let mut counts = vec![0; triangles.len()];
         for (i, n) in nodes.iter().enumerate() {
-            assert!(usize::try_from(n.escape)? > i);
-            assert!(usize::try_from(n.escape)? <= nodes.len());
+            assert!(usize::try_from(n.escape).map_err(io::Error::other)? > i);
+            assert!(usize::try_from(n.escape).map_err(io::Error::other)? <= nodes.len());
             if n.count > 0 {
                 for j in n.first..n.first + n.count {
-                    counts[usize::try_from(j)?] += 1;
-                    let b = triangles[usize::try_from(j)?].bounds();
+                    counts[usize::try_from(j).map_err(io::Error::other)?] += 1;
+                    let b = triangles[usize::try_from(j).map_err(io::Error::other)?].bounds();
                     assert!((0..3).all(|i| n.min[i] <= b.min[i] && n.max[i] >= b.max[i]));
                 }
             }
         }
         assert!(counts.iter().all(|&n| n == 1));
-        assert_eq!(usize::try_from(nodes[0].escape)?, nodes.len());
+        assert_eq!(
+            usize::try_from(nodes[0].escape).map_err(io::Error::other)?,
+            nodes.len()
+        );
         Ok(())
     }
 }

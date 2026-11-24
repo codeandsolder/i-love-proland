@@ -1,6 +1,8 @@
 //! Experimental fixed-step GPU rigid-body terrain solver. This is a local
 //! chart-space sandbox, not yet a full planetary multi-body physics engine.
 mod clock;
+mod contact_grid;
+pub use contact_grid::{ContactGrid, PinnedGrid};
 mod sphere_pairs;
 mod static_scene;
 use super::{
@@ -286,7 +288,7 @@ impl PhysicsGpu {
     /// Rejects invalid configuration, shapes, sizes or an uninitialized slot.
     pub fn new(
         device: &wgpu::Device,
-        terrain: &TerrainGpu,
+        terrain: &impl ContactGrid,
         slot: u32,
         config: PhysicsConfig<'_>,
         bodies: &[RigidBody],
@@ -455,7 +457,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &TerrainGpu,
+        terrain: &impl ContactGrid,
         batch: StepBatch,
     ) -> io::Result<()> {
         self.encode_batch(device, encoder, terrain, batch, None)
@@ -477,7 +479,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &TerrainGpu,
+        terrain: &impl ContactGrid,
         batch: StepBatch,
     ) -> io::Result<RecordedReadback<ContactEvent>> {
         let size = u64::from(batch.steps)
@@ -510,7 +512,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &TerrainGpu,
+        terrain: &impl ContactGrid,
         batch: StepBatch,
         contacts: Option<&wgpu::Buffer>,
     ) -> io::Result<()> {
