@@ -28,6 +28,7 @@ struct RenderUniform {
 @group(0) @binding(4) var source_texture: texture_2d<f32>;
 @group(0) @binding(5) var source_sampler: sampler;
 @group(0) @binding(6) var wind_texture: texture_2d<f32>;
+@group(0) @binding(7) var<storage, read> atlas_radius_scales: array<f32>;
 
 struct MeshVertex {
     @location(0) position: vec4<f32>,
@@ -146,7 +147,6 @@ fn impostor_vs(
 ) -> ImpostorOutput {
     let object = objects[visible_indices[instance_id]];
     let center = object.position_radius.xyz - camera.eye.xyz;
-    let radius = object.position_radius.w;
     let to_eye = select(normalize(-center), vec3<f32>(0.0, 0.0, 1.0), dot(center, center) < 0.000001);
 
     // Camera azimuth and elevation in the original *source* frame.
@@ -164,8 +164,9 @@ fn impostor_vs(
     // conservative extents, while angular atlas shading remains approximate.
     let local_right = inverse_rotate(object.rotation, right);
     let local_up = inverse_rotate(object.rotation, up);
-    let half_width = length(local_right * object.axis_radii.xyz);
-    let half_height = length(local_up * object.axis_radii.xyz);
+    let atlas_scale = atlas_radius_scales[object.render_model.x];
+    let half_width = length(local_right * object.axis_radii.xyz) * atlas_scale;
+    let half_height = length(local_up * object.axis_radii.xyz) * atlas_scale;
     let uv = vec2<f32>(f32(vertex_id & 1u), f32(vertex_id >> 1u));
     let corners = uv * 2.0 - vec2<f32>(1.0);
     let world = center + right * (corners.x * half_width)

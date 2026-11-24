@@ -1163,11 +1163,23 @@ fn compare_impostor_visual_forms(
     renderer: &mut TreeRenderer,
     visuals: &[PackedInstance],
     view: GpuView,
+    largest_expansion: f32,
     render: &impl Fn(&mut TreeRenderer) -> Result<Vec<u8>, Box<dyn Error>>,
     prefix: &str,
 ) -> Result<usize, Box<dyn Error>> {
     let impostor_candidates = visuals
         .iter()
+        .copied()
+        .map(|mut object| {
+            // Both substituted forms must fit the same conservative bound
+            // and remain in the impostor bin when comparing their images.
+            object.position_radius[3] = object.axis_radii[..3]
+                .iter()
+                .copied()
+                .fold(0.0_f32, f32::max)
+                * largest_expansion;
+            object
+        })
         .filter(|object| {
             matches!(
                 classify_cpu(object, view, renderer.compactor().mesh_lods()),
@@ -1175,7 +1187,6 @@ fn compare_impostor_visual_forms(
             )
         })
         .take(1024)
-        .copied()
         .collect::<Vec<_>>();
     assert!(
         !impostor_candidates.is_empty(),
@@ -1259,8 +1270,15 @@ fn capture_module_forest(
     let empty = render(renderer)?;
     renderer.set_candidates(queue, visuals)?;
     let image = render(renderer)?;
-    let different_form_pixels =
-        compare_impostor_visual_forms(queue, renderer, visuals, view, &render, prefix)?;
+    let different_form_pixels = compare_impostor_visual_forms(
+        queue,
+        renderer,
+        visuals,
+        view,
+        largest_expansion,
+        &render,
+        prefix,
+    )?;
     let changed = empty
         .as_chunks::<4>()
         .0
@@ -1277,6 +1295,12 @@ fn capture_module_forest(
     assert!(
         renderer.set_candidates(queue, &[wrong_model]).is_err(),
         "a render-local module model must never silently differ from the canonical source variant"
+    );
+    let mut underbounded = visuals[0];
+    underbounded.position_radius[3] = f32::MIN_POSITIVE;
+    assert!(
+        renderer.set_candidates(queue, &[underbounded]).is_err(),
+        "the conservative classifier must enclose the physical impostor quad"
     );
     renderer.set_candidates(queue, visuals)?;
     let tri_per_changed_px_milli = triangles

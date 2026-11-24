@@ -121,7 +121,7 @@ same `SourceImage` used in the GPU near module material. The source's tapered
 branch quads, original-ID-stable two-sided foliage cards, colors, normalized
 geometry, and radial canopy coverage are rasterized in 8x4 source-relative
 view directions. Upload the results using
-`AtlasImage::upload_variants(device, queue, &[(canonical_id, &image), ...])`.
+`AtlasImage::upload_variants(device, queue, &model_atlases)`.
 Preserve catalog order even when a canonical ID occurs more than once due to
 distinct procedural seeds. The `TreeRenderer` checks that the atlas catalog
 matches the module model bank.
@@ -136,5 +136,16 @@ The CPU atlas is an approximation of the shaded GPU module: its alpha mask
 is baked at a fixed source-sampling resolution, then area filtered per view,
 whereas GPU near foliage uses projected-derivative edges and sample coverage.
 Matching silhouette at the actual KSP LOD crossover remains a visual
-acceptance gate; the source must have enough normalization radius to
-conservatively contain all baked card corners.
+acceptance gate. Each ModelAtlas carries the original source variant ID,
+image and tight radius_scale about the shared source anchor. Baking
+renormalizes the actual branch and leaf card corners to a unit sphere;
+the vertex shader restores that radius scale relative to the immutable
+mesh axis radii. This reduces transparent quad raster area and improves
+effective atlas resolution for smaller forms without moving or resizing
+the physical plant. The CPU validates that the per-form culling radius
+covers the actual atlas radius, including anisotropic instance scale.
+
+When measuring physical area for terrain-canopy coverage, use
+source_frame.radius * model.radius_scale, not the shared mesh
+normalization radius. Otherwise smaller forms would contribute excessive
+aggregate coverage. Ordinary authored atlases keep a scale of one.
