@@ -1,5 +1,7 @@
 #[path = "gpu_terrain/physics.rs"]
 mod physics;
+#[path = "gpu_terrain/reference.rs"]
+mod reference;
 // Actual device probe: deterministic overlapping grids, independent
 // collision snapshot ownership, real channel samples, batched timings.
 use i_love_proland::terrain::{
@@ -122,6 +124,7 @@ fn check_overlap(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         .collect::<Result<Vec<_>>>()?
         .try_into()
         .map_err(|_| io::Error::other("four snapshots expected"))?;
+    reference::compare(&region, &a)?;
     assert_eq!(a.request, coarse);
     assert_eq!(d.request, reused);
     assert_ne!(a.samples, d.samples);
@@ -294,6 +297,7 @@ fn profile(device: &wgpu::Device, queue: &wgpu::Queue, region: &Region, side: u1
     let snapshot = gpu.snapshot(device, &mut commands, 0)?;
     queue.submit([commands.finish()]);
     let data = wait(device, snapshot.begin())?;
+    reference::compare(region, &data)?;
     let wet = data.samples.iter().filter(|s| s.water_kind == 2).count();
     println!(
         "GPU_TERRAIN collision side={side} bytes={} map_ms={:.3} river_samples={wet}",
