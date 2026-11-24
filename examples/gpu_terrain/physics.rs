@@ -1,4 +1,6 @@
 //! End-to-end measurements and contact regressions on the actual GPU.
+#[path = "marbles.rs"]
+mod marbles;
 use super::{Result, encoder};
 use i_love_proland::terrain::{
     Region, RegionCell, RegionChart,
@@ -409,6 +411,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         }],
     )?;
     queue.submit([commands.finish()]);
+    marbles::run(device, queue, &terrain)?;
     check_presentation(device, queue, &terrain)?;
     check_ellipsoid_compliance(device, queue, &terrain)?;
     let sphere = [Collider::sphere([0.0; 3], 0.5)];

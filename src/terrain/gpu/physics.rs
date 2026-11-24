@@ -1,10 +1,15 @@
 //! Experimental fixed-step GPU rigid-body terrain solver. This is a local
 //! chart-space sandbox, not yet a full planetary multi-body physics engine.
 mod clock;
+mod contact_grid;
+pub use contact_grid::{ContactGrid, PinnedGrid};
+mod sphere_pairs;
+mod static_scene;
 use super::{
     GridProjection, Kernel, RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage,
 };
 pub use clock::{SimulationClock, StepBatch};
+pub use static_scene::{StaticScene, StaticTriangle};
 use std::io;
 use wgpu::util::DeviceExt;
 
@@ -14,8 +19,10 @@ pub const STEP_WGSL: &str = concat!(
     include_str!("sample.wgsl"),
     include_str!("projection.wgsl"),
     include_str!("physics/body.wgsl"),
+    include_str!("physics/body_math.wgsl"),
     include_str!("physics/collider.wgsl"),
-    include_str!("physics/step.wgsl")
+    include_str!("physics/step.wgsl"),
+    include_str!("physics/static_scene.wgsl")
 );
 
 /// Oriented ellipsoid relative to the rigid body's center of mass.
@@ -248,6 +255,8 @@ struct StepConfig {
     contact_stride: u32,
 
     projection: GridProjection,
+    first_tick_low: u32,
+    padding: [u32; 3],
 }
 
 /// One batch of independent rigid bodies over a pinned terrain slot.
@@ -257,6 +266,9 @@ struct StepConfig {
 /// intentionally outside this first terrain-contact solver.
 pub struct PhysicsGpu {
     pipeline: Kernel,
+    static_scene: StaticScene,
+    sphere_eligible: bool,
+    sphere_pairs: Option<sphere_pairs::SpherePairs>,
     bodies: wgpu::Buffer,
     shapes: wgpu::Buffer,
     empty_contacts: wgpu::Buffer,
@@ -276,7 +288,7 @@ impl PhysicsGpu {
     /// Rejects invalid configuration, shapes, sizes or an uninitialized slot.
     pub fn new(
         device: &wgpu::Device,
-        terrain: &TerrainGpu,
+        terrain: &(impl ContactGrid + ?Sized),
         slot: u32,
         config: PhysicsConfig<'_>,
         bodies: &[RigidBody],
@@ -343,9 +355,14 @@ impl PhysicsGpu {
                 .max()
                 .unwrap_or(1),
             projection: terrain.grid_projection(slot)?,
+            first_tick_low: 0,
+            padding: [0; 3],
         };
         Ok(Self {
             pipeline,
+            static_scene: StaticScene::new(device, &[])?,
+            sphere_eligible: sphere_pairs::eligible(bodies, shapes),
+            sphere_pairs: None,
             bodies: states,
             shapes: storage(
                 device,
@@ -392,6 +409,43 @@ impl PhysicsGpu {
         &self.shapes
     }
 
+    /// Enable coupled GPU contacts for single centered spherical bodies.
+    /// The terrain and static mesh solver runs at the same fixed tick;
+    /// interbody contacts exchange impulses between those integrations.
+    ///
+    /// # Errors
+    /// Rejects a compound or anisotropic collider set. General convex
+    /// body-body contacts use a different narrow phase and are not yet
+    /// implemented.
+    pub fn enable_sphere_pairs(&mut self, device: &wgpu::Device) -> io::Result<()> {
+        if !self.sphere_eligible || self.params.stop_at_contact != 0 {
+            return Err(invalid(
+                "coupled contacts require centered spherical bodies and normal stepping",
+            ));
+        }
+        self.sphere_pairs = Some(sphere_pairs::SpherePairs::new(
+            device,
+            &self.bodies,
+            &self.shapes,
+            self.params.count,
+        )?);
+        Ok(())
+    }
+
+    /// Bind a canonical static collision mesh, independent of the render cut.
+    ///
+    /// # Errors
+    /// Rejects material IDs outside the solver's material palette.
+    pub fn set_static_scene(&mut self, scene: StaticScene) -> io::Result<()> {
+        if u64::from(scene.max_material)
+            >= self.materials.size() / std::mem::size_of::<ContactMaterial>() as u64
+        {
+            return Err(invalid("static scene material outside contact palette"));
+        }
+        self.static_scene = scene;
+        Ok(())
+    }
+
     /// Encode a fixed-step batch without synchronizing with the host.
     /// The pinned terrain address must still occupy its slot. Submit command
     /// encoders in the order they were recorded; do not reuse the pinned slot
@@ -403,7 +457,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &TerrainGpu,
+        terrain: &(impl ContactGrid + ?Sized),
         batch: StepBatch,
     ) -> io::Result<()> {
         self.encode_batch(device, encoder, terrain, batch, None)
@@ -425,7 +479,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &TerrainGpu,
+        terrain: &(impl ContactGrid + ?Sized),
         batch: StepBatch,
     ) -> io::Result<RecordedReadback<ContactEvent>> {
         let size = u64::from(batch.steps)
@@ -458,7 +512,7 @@ impl PhysicsGpu {
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        terrain: &TerrainGpu,
+        terrain: &(impl ContactGrid + ?Sized),
         batch: StepBatch,
         contacts: Option<&wgpu::Buffer>,
     ) -> io::Result<()> {
@@ -475,7 +529,13 @@ impl PhysicsGpu {
             .checked_add(u64::from(batch.steps))
             .ok_or_else(|| invalid("physics tick overflow"))?;
         let params = StepConfig {
-            steps: batch.steps,
+            steps: if self.sphere_pairs.is_some() {
+                1
+            } else {
+                batch.steps
+            },
+            first_tick_low: u32::try_from(batch.start_tick & u64::from(u32::MAX))
+                .map_err(io::Error::other)?,
             record_contacts: u32::from(contacts.is_some()),
             ..self.params
         };
@@ -492,14 +552,21 @@ impl PhysicsGpu {
             contacts.unwrap_or(&self.empty_contacts),
             &self.materials,
             &self.material_cells,
+            &self.static_scene.nodes,
+            &self.static_scene.triangles,
         ];
-        self.pipeline.encode(
-            device,
-            encoder,
-            "advance fixed physics ticks",
-            &buffers,
-            [self.params.count.div_ceil(64), 1, 1],
-        )?;
+        let bind = self.pipeline.bind(device, "physics batch", &buffers)?;
+        let groups = [self.params.count.div_ceil(64), 1, 1];
+        if let Some(pairs) = &self.sphere_pairs {
+            for _ in 0..batch.steps {
+                self.pipeline
+                    .dispatch(encoder, "advance one coupled physics tick", &bind, groups);
+                pairs.encode(encoder);
+            }
+        } else {
+            self.pipeline
+                .dispatch(encoder, "advance fixed physics ticks", &bind, groups);
+        }
         self.submitted = end;
         Ok(())
     }

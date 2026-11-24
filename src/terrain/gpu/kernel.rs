@@ -30,6 +30,16 @@ impl Kernel {
         buffers: &[&wgpu::Buffer],
         groups: [u32; 3],
     ) -> std::io::Result<()> {
+        let bind = self.bind(device, label, buffers)?;
+        self.dispatch(encoder, label, &bind, groups);
+        Ok(())
+    }
+    pub(super) fn bind(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        buffers: &[&wgpu::Buffer],
+    ) -> std::io::Result<wgpu::BindGroup> {
         let entries = buffers
             .iter()
             .enumerate()
@@ -40,18 +50,25 @@ impl Kernel {
                 })
             })
             .collect::<std::io::Result<Vec<_>>>()?;
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        Ok(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
             layout: &self.layout,
             entries: &entries,
-        });
+        }))
+    }
+    pub(super) fn dispatch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        bind: &wgpu::BindGroup,
+        groups: [u32; 3],
+    ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some(label),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
+        pass.set_bind_group(0, bind, &[]);
         pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
-        Ok(())
     }
 }

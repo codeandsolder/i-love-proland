@@ -36,8 +36,10 @@
         "src/terrain/gpu/sample.wgsl",
         "src/terrain/gpu/projection.wgsl",
         "src/terrain/gpu/physics/body.wgsl",
+        "src/terrain/gpu/physics/body_math.wgsl",
         "src/terrain/gpu/physics/collider.wgsl",
-        "src/terrain/gpu/physics/step.wgsl"
+        "src/terrain/gpu/physics/step.wgsl",
+        "src/terrain/gpu/physics/static_scene.wgsl"
       ]
     },
     {
@@ -46,6 +48,26 @@
         "src/terrain/gpu/physics/body.wgsl",
         "src/terrain/gpu/physics/pose.wgsl",
         "src/terrain/gpu/physics/presentation.wgsl"
+      ]
+    },
+    {
+      "name": "parallel sphere contacts",
+      "sources": [
+        "src/terrain/gpu/physics/body.wgsl",
+        "src/terrain/gpu/physics/collider.wgsl",
+        "src/terrain/gpu/physics/body_math.wgsl",
+        "src/terrain/gpu/physics/sphere_pair_math.wgsl",
+        "src/terrain/gpu/physics/sphere_pairs.wgsl"
+      ]
+    },
+    {
+      "name": "local sphere contacts",
+      "sources": [
+        "src/terrain/gpu/physics/body.wgsl",
+        "src/terrain/gpu/physics/collider.wgsl",
+        "src/terrain/gpu/physics/body_math.wgsl",
+        "src/terrain/gpu/physics/sphere_pair_math.wgsl",
+        "src/terrain/gpu/physics/sphere_pairs_local.wgsl"
       ]
     }
   ],

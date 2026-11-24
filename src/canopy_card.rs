@@ -15,62 +15,99 @@ fn random(x: u32, y: u32) -> f32 {
     f32::from(u16::from_le_bytes([a, b])) / 65535.0
 }
 
-fn mix(a: f32, b: f32, t: f32) -> f32 {
-    (b - a).mul_add(t, a)
+const LEAF_COUNT: u32 = 640;
+
+struct Leaflet {
+    center: [f32; 2],
+    radii: [f32; 2],
+    basis: [f32; 2],
+    illumination: f32,
 }
 
-fn smooth(t: f32) -> f32 {
-    t * t * 2.0_f32.mul_add(-t, 3.0)
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "bounded card UVs are sampled on a small finite noise lattice"
-)]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "card UVs and lattice frequencies are nonnegative"
-)]
-fn noise(uv: [f32; 2], frequency: f32) -> f32 {
-    let [x, y] = uv.map(|v| v * frequency);
-    let ix = x.floor() as u32;
-    let iy = y.floor() as u32;
-    let tx = smooth(x.fract());
-    let ty = smooth(y.fract());
-    mix(
-        mix(random(ix, iy), random(ix + 1, iy), tx),
-        mix(random(ix, iy + 1), random(ix + 1, iy + 1), tx),
-        ty,
-    )
-}
-
-fn coverage_and_shading(uv: [f32; 2]) -> (f32, f32) {
-    let [x, y] = uv.map(|v| 2.0_f32.mul_add(v, -1.0));
-    let radius = x.hypot(y);
-    let theta = y.atan2(x);
-    // A rounded envelope with multiple independent lobes, fine leaf-scale
-    // silhouette variation and occasional small gaps between leaf groups.
-    let coarse = noise(uv, 7.0);
-    let fine = noise(uv, 27.0);
-    let edge = 0.10_f32.mul_add(
-        fine - 0.5,
-        0.032_f32.mul_add(
-            9.0_f32.mul_add(theta, -1.2).sin(),
-            0.052_f32.mul_add(5.0_f32.mul_add(theta, 0.6).sin(), 0.95),
-        ),
-    );
-    let envelope = ((edge - radius) / 0.025 + 0.5).clamp(0.0, 1.0);
-    let gaps = ((0.6_f32.mul_add(coarse, 0.4 * fine) - 0.18) / 0.12).clamp(0.0, 1.0);
-    // Source-local ambient occlusion and crown-top illumination; the
-    // irregular mottling is in linear light and is stable under motion.
-    let center = radius.mul_add(-radius, 1.0).max(0.0).sqrt();
-    let light = 0.24_f32
-        .mul_add(
+impl Leaflet {
+    fn seeded(index: u32) -> Self {
+        let r = |stream| random(index, stream);
+        let angle = core::f32::consts::TAU * r(0);
+        let (sin, cos) = angle.sin_cos();
+        let boundary = 0.035_f32.mul_add(
+            9.0_f32.mul_add(angle, -1.2).sin(),
+            0.055_f32.mul_add(5.0_f32.mul_add(angle, 0.6).sin(), 0.9),
+        );
+        let radial = boundary * r(1).sqrt();
+        let length = r(2).mul_add(0.065, 0.052);
+        let width = length * r(3).mul_add(0.37, 0.43);
+        let orientation = core::f32::consts::TAU * r(4);
+        let (sin_leaf, cos_leaf) = orientation.sin_cos();
+        let center = [radial * cos, radial * sin];
+        // Independent leaf orientation and shadowing, in linear light.
+        // The upper crown is sunlit; the back layers retain cooler shading.
+        let illumination = 0.16_f32.mul_add(center[1], r(5).mul_add(0.44, 0.44));
+        Self {
             center,
-            0.10_f32.mul_add(y, 0.20_f32.mul_add(coarse, 0.15_f32.mul_add(fine, 0.43))),
-        )
-        .clamp(0.0, 1.0);
-    (envelope * gaps, light)
+            radii: [length, width],
+            basis: [cos_leaf, sin_leaf],
+            illumination,
+        }
+    }
+
+    fn sample(&self, point: [f32; 2]) -> (f32, f32) {
+        let [dx, dy] = std::array::from_fn(|i| point[i] - self.center[i]);
+        let [c, s] = self.basis;
+        let x = dx.mul_add(c, dy * s) / self.radii[0];
+        let y = dy.mul_add(c, -dx * s) / self.radii[1];
+        // Taper the two ends: this is a pointed leaflet, not a circular blob.
+        let shape = y.mul_add(y, x.abs().mul_add(0.2, x * x));
+        let edge = (1.0 - shape) * 3.2;
+        let alpha = edge.clamp(0.0, 1.0);
+        // A gentle central rib and curved lamina create legible texture at
+        // near LOD; both disappear naturally under mip filtering.
+        let rib = y.abs().mul_add(-7.0, 1.0).max(0.0);
+        let curvature = y.mul_add(-y, 1.0).max(0.0);
+        let light = self.illumination * 0.12_f32.mul_add(rib, 0.22_f32.mul_add(curvature, 0.68));
+        (alpha, light.clamp(0.0, 1.0))
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "pixel bounds are explicitly rounded and clamped to the finite card extent"
+    )]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "pixel bounds are clamped to nonnegative coordinates"
+    )]
+    fn composite(&self, texels: &mut [[f32; 2]]) {
+        let half = f32::from(SIDE) * 0.5;
+        let radius = self.radii[0];
+        let minimum = self.center.map(|v| {
+            ((v - radius + 1.0) * half)
+                .floor()
+                .clamp(0.0, f32::from(SIDE)) as u16
+        });
+        let maximum = self.center.map(|v| {
+            ((v + radius + 1.0) * half)
+                .ceil()
+                .clamp(0.0, f32::from(SIDE)) as u16
+        });
+        let inverse = half.recip();
+        for y in minimum[1]..maximum[1] {
+            for x in minimum[0]..maximum[0] {
+                let point = [x, y].map(|v| (f32::from(v) + 0.5).mul_add(inverse, -1.0));
+                let (alpha, light) = self.sample(point);
+                let pixel = &mut texels[usize::from(y) * usize::from(SIDE) + usize::from(x)];
+                // Premultiplied back-to-front compositing of leaf layers.
+                pixel[0] = light.mul_add(alpha, pixel[0] * (1.0 - alpha));
+                pixel[1] = alpha.mul_add(1.0 - pixel[1], pixel[1]);
+            }
+        }
+    }
+}
+
+fn leaf_cluster() -> Vec<[f32; 2]> {
+    let mut texels = vec![[0.0; 2]; usize::from(SIDE).pow(2)];
+    for index in 0..LEAF_COUNT {
+        Leaflet::seeded(index).composite(&mut texels);
+    }
+    texels
 }
 
 /// The immutable CPU representation used for both source baking and upload.
@@ -92,6 +129,7 @@ impl CanopyCard {
     /// Propagates an invalid generated texture.
     pub fn new(source: &SourceImage) -> Result<Self> {
         let original = source.linear_texels();
+        let cluster = leaf_cluster();
         let mut bytes = Vec::with_capacity(usize::from(SIDE).pow(2) * 4);
         let inverse = f32::from(SIDE).recip();
         for y in 0..SIDE {
@@ -101,7 +139,13 @@ impl CanopyCard {
                     (f32::from(y) + 0.5) * inverse,
                 ];
                 let texel = source.sample(&original, uv);
-                let (coverage, light) = coverage_and_shading(uv);
+                let [premultiplied, coverage] =
+                    cluster[usize::from(y) * usize::from(SIDE) + usize::from(x)];
+                let light = if coverage > 0.0 {
+                    premultiplied / coverage
+                } else {
+                    0.0
+                };
                 bytes.extend_from_slice(&[
                     to_byte(linear_to_srgb(texel[0] * light)),
                     to_byte(linear_to_srgb(texel[1] * light)),
@@ -237,7 +281,14 @@ mod tests {
     fn source_alpha_is_retained() -> Result<()> {
         let transparent = SourceImage::new(1, 1, vec![255, 255, 255, 0])?;
         let card = CanopyCard::new(&transparent)?;
-        assert!(card.image.rgba().chunks_exact(4).all(|p| p[3] == 0));
+        assert!(
+            card.image
+                .rgba()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[3] == 0)
+        );
         Ok(())
     }
 }
