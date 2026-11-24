@@ -198,12 +198,14 @@ impl Region {
             .iter()
             .map(|c| f64::from(c.height) * QUANTUM)
             .fold(0.0, f64::max)
-            + ChannelField::MAX_RAISE;
+            + ChannelField::MAX_RAISE
+            + super::MAX_RELIEF;
         let min_elevation = cells
             .iter()
             .map(|c| f64::from(c.height) * QUANTUM)
             .fold(0.0, f64::min)
-            - ChannelField::MAX_CUT;
+            - ChannelField::MAX_CUT
+            - super::MAX_RELIEF;
         let channels = ChannelField::new(chart.extent(), reaches)?;
         Ok(Self {
             chart,
@@ -243,7 +245,6 @@ impl Region {
         let interpolation = self.interpolation(point)?;
         let interpolate = |f: &dyn Fn(RegionCell) -> f64| interpolation.sample(f);
         let (weather, water_kind) = self.weather_at(point, &interpolation);
-        let extent = self.chart.extent();
         let rgb = std::array::from_fn(|i| {
             let base = interpolate(&|c| f64::from(c.rgb[i]) / 255.0);
             let vegetated = lerp(base, [0.19, 0.31, 0.125][i], weather.floodplain * 0.30);
@@ -262,18 +263,28 @@ impl Region {
                     .clamp(0.0, 1.0),
             )
         });
-        let edge = point[0]
-            .min(point[1])
-            .min(extent - point[0])
-            .min(extent - point[1]);
-        let t = (edge / 4000.0_f64.min(extent * 0.25)).clamp(0.0, 1.0);
-        let weight = t * t * 2.0_f64.mul_add(-t, 3.0);
+        let weight = self.blend_weight(point)?;
         Some(RegionSample {
             weather,
             water_kind,
             rgb,
             weight,
         })
+    }
+
+    /// Coarse chart blending weight, independent of procedural refinement.
+    #[must_use = "Use the chart weight before requesting regional refinement"]
+    pub fn blend_weight(&self, point: [f64; 2]) -> Option<f64> {
+        let extent = self.chart.extent();
+        if !point.iter().all(|&v| (0.0..=extent).contains(&v)) {
+            return None;
+        }
+        let edge = point[0]
+            .min(point[1])
+            .min(extent - point[0])
+            .min(extent - point[1]);
+        let t = (edge / 4000.0_f64.min(extent * 0.25)).clamp(0.0, 1.0);
+        Some(t * t * 2.0_f64.mul_add(-t, 3.0))
     }
 
     fn interpolation(&self, point: [f64; 2]) -> Option<CellInterpolation> {
@@ -609,3 +620,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[path = "bounds.rs"]
+mod bounds;
+pub use bounds::HeightEnvelope;

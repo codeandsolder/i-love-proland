@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn validates_sparse_dense_count_and_shader_layout() {
-        assert_eq!(core::mem::size_of::<CandidatePatch>(), 128);
+        assert_eq!(core::mem::size_of::<CandidatePatch>(), 144);
         assert_eq!(core::mem::offset_of!(CandidatePatch, candidate), 16);
         let patch = |slot| CandidatePatch::new(slot, PackedInstance::zeroed());
         assert_eq!(

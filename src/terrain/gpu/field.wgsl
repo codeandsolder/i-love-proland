@@ -3,6 +3,7 @@
 struct Config {
     extent_ticks: u32, control_side: u32, bin_side: u32, grid_side: u32,
     spacing_m: f32, padding0: u32, padding1: u32, padding2: u32,
+    relief: vec4<f32>,
 }
 struct Reach {
     ends: vec4<f32>,       // ax, ay, bx, by
@@ -81,6 +82,40 @@ fn projection(r:Reach,p:vec2<f32>)->vec2<f32>{
     let residual=delta-t*axis;
     return vec2<f32>(dot(residual,residual),t);
 }
+fn mix_hash(v:u32)->u32 {
+    var h=v;
+    h=(h^(h>>16u))*0x7feb352du;
+    h=(h^(h>>15u))*0x846ca68bu;
+    return h^(h>>16u);
+}
+fn relief_lattice(p:vec2<i32>,seed:u32)->f32 {
+    return f32(mix_hash(bitcast<u32>(p.x)*0x9e3779b9u ^ bitcast<u32>(p.y)*0x85ebca6bu ^ seed)>>8u)*(2.0/16777215.0)-1.0;
+}
+fn relief_noise(p:vec2<f32>,seed:u32)->f32{
+    let i=vec2<i32>(floor(p));
+    let f=fract(p);
+    let w=f*f*(3.0-2.0*f);
+    return mix(mix(relief_lattice(i,seed),relief_lattice(i+vec2<i32>(1,0),seed),w.x),
+               mix(relief_lattice(i+vec2<i32>(0,1),seed),relief_lattice(i+vec2<i32>(1,1),seed),w.x),w.y);
+}
+// Oriented ridge detail, progressively reduced on flat, wet and eroded
+// surfaces. The control gradients are used only to rotate the ridges;
+// no tile-local random seed or finite-difference across tile boundaries.
+fn relief(p:vec2<f32>,g:vec2<f32>)->f32 {
+    let slope=length(g);
+    let axis=g/max(slope,0.0001);
+
+    // Continuous world-coordinate noise (the slope-dependent amplitude
+    // fades to zero on flats). Large bands remain anchored to the world.
+    let broad=relief_noise(p/96.0,0x53495445u);
+    let ridge=1.0-abs(relief_noise(p/23.0+vec2<f32>(broad*0.6),0x53495445u^17u));
+    let small=relief_noise(p/5.5,0x53495445u^31u);
+    // Oriented relief is modulated rather than using a rotating coordinate
+    // system as the sole field, which would make slopes unstable.
+    let transverse=vec2<f32>(-axis.y,axis.x);
+    let ribs=relief_noise((p+transverse*18.0)/17.0,0x53495445u^73u)-relief_noise((p-transverse*18.0)/17.0,0x53495445u^73u);
+    return smooth_unit(slope/0.5)*(broad*config.relief.x+(ridge-0.5)*config.relief.y+small*config.relief.z+ribs*config.relief.w);
+}
 fn evaluate(p:vec2<f32>)->TerrainSample{
     let control=evaluate_controls(p);
     var bed=control.x;
@@ -90,6 +125,13 @@ fn evaluate(p:vec2<f32>)->TerrainSample{
     if control.y>bed+0.02 {
         return TerrainSample(bed,control.y,pack4x8unorm(vec4<f32>(color,1.0)),1u);
     }
+    let delta=config.spacing_m*0.5;
+    let g=vec2<f32>(
+        evaluate_controls(p+vec2<f32>(delta,0.0)).x-evaluate_controls(p-vec2<f32>(delta,0.0)).x,
+        evaluate_controls(p+vec2<f32>(0.0,delta)).x-evaluate_controls(p-vec2<f32>(0.0,delta)).x
+    )/(2.0*delta);
+    bed+=relief(p,g)*smooth_unit(bed/30.0);
+    water=bed;
     if bed<=0.0 {return TerrainSample(bed,water,pack4x8unorm(vec4<f32>(color,1.0)),kind);}
     let bin=min(vec2<u32>(p/250.0),vec2<u32>(config.bin_side-1u));
     let bucket=bin.y*config.bin_side+bin.x;

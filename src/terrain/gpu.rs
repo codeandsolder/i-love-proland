@@ -60,6 +60,7 @@ struct Config {
     grid_side: u32,
     spacing_m: f32,
     padding: [u32; 3],
+    relief: [f32; 4],
 }
 
 #[repr(C)]
@@ -222,6 +223,7 @@ impl TerrainGpu {
             grid_side: u32::from(side),
             spacing_m: chart.spacing_m as f32,
             padding: [0; 3],
+            relief: super::REFINEMENT_AMPLITUDES,
         };
         let stride = u64::from(side).pow(2) * 16;
         let bytes = stride * u64::from(slots);
@@ -345,6 +347,36 @@ impl TerrainGpu {
             Resident::Grid(request) => Some(request),
             Resident::Points => None,
         }
+    }
+
+    /// Capture one authoritative sample without copying the entire grid.
+    ///
+    /// # Errors
+    /// Rejects uninitialized slots or an out-of-range sample index.
+    pub fn snapshot_sample(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        slot: u32,
+        index: u32,
+    ) -> io::Result<RecordedReadback<TerrainSample>> {
+        if index >= self.samples_per_slot()
+            || self
+                .resident
+                .get(slot as usize)
+                .and_then(Option::as_ref)
+                .is_none()
+        {
+            return Err(invalid("terrain sample not initialized"));
+        }
+        let offset = (u64::from(slot) * u64::from(self.samples_per_slot()) + u64::from(index)) * 16;
+        Ok(RecordedReadback::copy(
+            device,
+            encoder,
+            &self.samples,
+            offset,
+            16,
+        ))
     }
 
     /// Capture raw samples from either kind of resident slot, in request order.
