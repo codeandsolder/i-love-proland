@@ -8,25 +8,55 @@ pub use clock::{SimulationClock, StepBatch};
 use std::io;
 use wgpu::util::DeviceExt;
 
+pub const COLLIDER_WGSL: &str = include_str!("physics/collider.wgsl");
+
 pub const STEP_WGSL: &str = concat!(
     include_str!("sample.wgsl"),
     include_str!("projection.wgsl"),
     include_str!("physics/body.wgsl"),
+    include_str!("physics/collider.wgsl"),
     include_str!("physics/step.wgsl")
 );
 
-/// A compound collider element: center relative to the body's COM, radius.
+/// Oriented ellipsoid relative to the rigid body's center of mass.
+///
+/// A sphere is the isotropic special case. Semi-axes are positive metres;
+/// rotation is a proper local quaternion (xyzw).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Sphere {
-    pub center: [f32; 3],
-    pub radius: f32,
+pub struct Collider {
+    center: [f32; 4],
+    axes: [f32; 4],
+    rotation: [f32; 4],
+}
+
+impl Collider {
+    #[must_use = "Use the authored sphere geometry in the compound collider"]
+    pub const fn sphere(center: [f32; 3], radius: f32) -> Self {
+        Self::ellipsoid(center, [radius; 3], [0.0, 0.0, 0.0, 1.0])
+    }
+
+    #[must_use = "Use the authored oriented ellipsoid geometry"]
+    pub const fn ellipsoid(center: [f32; 3], axes: [f32; 3], rotation: [f32; 4]) -> Self {
+        Self {
+            center: [center[0], center[1], center[2], 0.0],
+            axes: [axes[0], axes[1], axes[2], 0.0],
+            rotation,
+        }
+    }
+
+    fn valid(self) -> bool {
+        self.center.iter().all(|v| v.is_finite())
+            && self.axes[..3].iter().all(|v| (0.01..=1000.0).contains(v))
+            && self.rotation.iter().all(|v| v.is_finite())
+            && (self.rotation.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-4
+    }
 }
 
 /// A GPU-resident rigid body. Position is tile-relative west/north/up;
 /// rotation is a unit quaternion xyzw. Last components encode properties.
 ///
-/// Metadata is [first sphere, sphere count, status, contact recorded]:
+/// Metadata is [first collider, collider count, status, contact recorded]:
 /// status 0 active, 1 terrain coverage exhausted, 2 step too large.
 /// Status 3 is a successful first-contact prediction stop. Other stops retain
 /// the last successfully integrated state.
@@ -89,8 +119,8 @@ impl RigidBody {
 
 /// Bounded pressure-dependent compliant layer over the rigid triangles.
 ///
-/// The sphere cross-section at its current indentation approximates the
-/// loaded area until authored wheel/pad collision primitives are available.
+/// The ellipsoid cross-section at its current indentation provides the
+/// loaded area on the local supporting plane.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ContactMaterial {
@@ -228,7 +258,7 @@ struct StepConfig {
 pub struct PhysicsGpu {
     pipeline: Kernel,
     bodies: wgpu::Buffer,
-    spheres: wgpu::Buffer,
+    shapes: wgpu::Buffer,
     empty_contacts: wgpu::Buffer,
     materials: wgpu::Buffer,
     material_cells: wgpu::Buffer,
@@ -240,7 +270,7 @@ pub struct PhysicsGpu {
 }
 
 impl PhysicsGpu {
-    /// Upload initial rigid bodies and compound sphere colliders.
+    /// Upload initial rigid bodies and compound ellipsoid colliders.
     ///
     /// # Errors
     /// Rejects invalid configuration, shapes, sizes or an uninitialized slot.
@@ -250,7 +280,7 @@ impl PhysicsGpu {
         slot: u32,
         config: PhysicsConfig<'_>,
         bodies: &[RigidBody],
-        spheres: &[Sphere],
+        shapes: &[Collider],
     ) -> io::Result<Self> {
         if config.hz == 0
             || config.hz > 100_000
@@ -258,14 +288,11 @@ impl PhysicsGpu {
             || !(0.0..=1.0).contains(&config.contact_slop_m)
             || !(1..=32).contains(&config.solver_iterations)
             || bodies.is_empty()
-            || spheres.is_empty()
+            || shapes.is_empty()
             || bodies
                 .iter()
-                .any(|body| !body.valid(spheres.len(), config.initial_tick))
-            || spheres.iter().any(|sphere| {
-                !sphere.center.iter().all(|v| v.is_finite())
-                    || !(0.01..=1000.0).contains(&sphere.radius)
-            })
+                .any(|body| !body.valid(shapes.len(), config.initial_tick))
+            || shapes.iter().any(|shape| !shape.valid())
         {
             return Err(invalid("invalid GPU physics configuration"));
         }
@@ -320,10 +347,10 @@ impl PhysicsGpu {
         Ok(Self {
             pipeline,
             bodies: states,
-            spheres: storage(
+            shapes: storage(
                 device,
-                "compound sphere shapes",
-                bytemuck::cast_slice(spheres),
+                "compound ellipsoid shapes",
+                bytemuck::cast_slice(shapes),
             )?,
             empty_contacts: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("disabled contact telemetry"),
@@ -359,10 +386,10 @@ impl PhysicsGpu {
         &self.bodies
     }
 
-    /// Share immutable compound sphere data with diagnostics and rendering.
+    /// Share immutable compound ellipsoid data with diagnostics and rendering.
     #[must_use = "Bind the exact collider data without uploading a second copy"]
     pub const fn colliders(&self) -> &wgpu::Buffer {
-        &self.spheres
+        &self.shapes
     }
 
     /// Encode a fixed-step batch without synchronizing with the host.
@@ -460,7 +487,7 @@ impl PhysicsGpu {
         let buffers = [
             &self.terrain,
             &self.bodies,
-            &self.spheres,
+            &self.shapes,
             &uniform,
             contacts.unwrap_or(&self.empty_contacts),
             &self.materials,

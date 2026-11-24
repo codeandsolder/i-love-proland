@@ -5,8 +5,8 @@ use i_love_proland::terrain::{
     gpu::{
         TerrainGpu, TerrainRequest,
         physics::{
-            ContactMaterial, ContactMaterialField, PhysicsConfig, PhysicsGpu, RigidBody,
-            SimulationClock, Sphere, StepBatch,
+            Collider, ContactMaterial, ContactMaterialField, PhysicsConfig, PhysicsGpu, RigidBody,
+            SimulationClock, StepBatch,
         },
     },
 };
@@ -61,7 +61,7 @@ fn simulate(
     queue: &wgpu::Queue,
     terrain: &TerrainGpu,
     initial: &[RigidBody],
-    spheres: &[Sphere],
+    spheres: &[Collider],
     batch_size: u32,
 ) -> Result<(Vec<RigidBody>, f64)> {
     let initial_tick = initial[0].completed_tick();
@@ -116,10 +116,7 @@ fn check_presentation(
     terrain: &TerrainGpu,
 ) -> Result<()> {
     use i_love_proland::terrain::gpu::physics::{PresentationHistory, PresentationTime, StepBatch};
-    let sphere = [Sphere {
-        center: [0.0; 3],
-        radius: 0.5,
-    }];
+    let sphere = [Collider::sphere([0.0; 3], 0.5)];
     let mut initial = body([32.0, 32.0, 110.0], [1.0, 0.0, 0.0], 1);
     initial.clock = [u32::MAX - 100, 15, 0, 0];
     let epoch = initial.completed_tick();
@@ -207,7 +204,7 @@ fn check_prediction(
     queue: &wgpu::Queue,
     terrain: &TerrainGpu,
     initial: &[RigidBody],
-    sphere: &[Sphere],
+    sphere: &[Collider],
     expected: Option<u64>,
 ) -> Result<()> {
     let mut predictor = PhysicsGpu::new(
@@ -259,10 +256,7 @@ fn check_compliance(
     queue: &wgpu::Queue,
     terrain: &TerrainGpu,
 ) -> Result<()> {
-    let sphere = [Sphere {
-        center: [0.0; 3],
-        radius: 0.5,
-    }];
+    let sphere = [Collider::sphere([0.0; 3], 0.5)];
     let mut initial = body([32.0, 32.0, 103.0], [0.0; 3], 1);
     initial.position[3] = 0.001; // 1000 kg
     initial.inverse_inertia = [0.01, 0.01, 0.01, 0.0];
@@ -359,10 +353,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     queue.submit([commands.finish()]);
     check_presentation(device, queue, &terrain)?;
     check_compliance(device, queue, &terrain)?;
-    let sphere = [Sphere {
-        center: [0.0; 3],
-        radius: 0.5,
-    }];
+    let sphere = [Collider::sphere([0.0; 3], 0.5)];
     let initial = [body([32.0, 32.0, 103.0], [0.0; 3], 1)];
     let (a, _) = simulate(device, queue, &terrain, &initial, &sphere, 64)?;
     check_prediction(
@@ -387,22 +378,10 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     );
     assert!(a[0].velocity[..3].iter().all(|v| v.abs() < 0.1));
     let feet = [
-        Sphere {
-            center: [-0.6, -0.6, -0.4],
-            radius: 0.25,
-        },
-        Sphere {
-            center: [0.6, -0.6, -0.4],
-            radius: 0.25,
-        },
-        Sphere {
-            center: [-0.6, 0.6, -0.4],
-            radius: 0.25,
-        },
-        Sphere {
-            center: [0.6, 0.6, -0.4],
-            radius: 0.25,
-        },
+        Collider::sphere([-0.6, -0.6, -0.4], 0.25),
+        Collider::sphere([0.6, -0.6, -0.4], 0.25),
+        Collider::sphere([-0.6, 0.6, -0.4], 0.25),
+        Collider::sphere([0.6, 0.6, -0.4], 0.25),
     ];
     let mut lander = body([32.0, 32.0, 103.0], [1.0, 0.0, 0.0], 4);
     lander.rotation = [0.099_833_42, 0.0, 0.0, 0.995_004_2];
@@ -428,7 +407,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     check_slope(device, queue, &sphere)
 }
 
-fn check_slope(device: &wgpu::Device, queue: &wgpu::Queue, sphere: &[Sphere]) -> Result<()> {
+fn check_slope(device: &wgpu::Device, queue: &wgpu::Queue, sphere: &[Collider]) -> Result<()> {
     let region = slope_region(0.1)?;
     let mut sloped = TerrainGpu::new(device, &region, 65, 1)?;
     let mut commands = encoder(device);

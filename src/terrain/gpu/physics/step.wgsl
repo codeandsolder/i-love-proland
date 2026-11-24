@@ -26,7 +26,7 @@ struct ContactEvent{
 }
 @group(0) @binding(0) var<storage,read> terrain:array<TerrainSample>;
 @group(0) @binding(1) var<storage,read_write> bodies:array<Body>;
-@group(0) @binding(2) var<storage,read> spheres:array<vec4<f32>>;
+@group(0) @binding(2) var<storage,read> shapes:array<Collider>;
 @group(0) @binding(3) var<uniform> config:Config;
 @group(0) @binding(4) var<storage,read_write> contact_events:array<ContactEvent>;
 @group(0) @binding(5) var<storage,read> materials:array<vec2<f32>>;
@@ -69,44 +69,91 @@ fn closest_triangle(p:vec3<f32>,a:vec3<f32>,b:vec3<f32>,c:vec3<f32>)->vec3<f32>{
     if dbc<=dca{return bc;}
     return ca;
 }
-fn terrain_contact(center:vec3<f32>,radius:f32)->Contact{
-    // Every projected vertex and every interpolated triangle point is
-    // inside the nominal cell expanded by this conservative displacement.
-    let margin=vec2<f32>(radius)+config.projection.grid.zw;
-    let lo=vec2<i32>(floor((center.xy-margin)/config.spacing));
-    let hi=vec2<i32>(floor((center.xy+margin)/config.spacing));
+struct ShapePose{
+    center:vec3<f32>, radius:f32,
+    rotation:vec4<f32>,
+    axes:vec3<f32>, min_axis:f32,
+}
+fn shape_pose(b:Body,shape:Collider)->ShapePose{
+    let axes=shape.axes.xyz;
+    let radius=max(axes.x,max(axes.y,axes.z));
+    let min_axis=min(axes.x,min(axes.y,axes.z));
+    // Preserve the original sphere metric without unnecessary rotations.
+    let rotation=select(quat_mul(b.rotation,shape.rotation),vec4<f32>(0.0,0.0,0.0,1.0),radius==min_axis);
+    return ShapePose(b.position.xyz+quat_rotate(b.rotation,shape.center.xyz),radius,rotation,axes,min_axis);
+}
+fn inverse_rotate(q:vec4<f32>,v:vec3<f32>)->vec3<f32>{
+    return quat_rotate(vec4<f32>(-q.xyz,q.w),v);
+}
+fn metric(s:ShapePose,v:vec3<f32>)->vec3<f32>{
+    return inverse_rotate(s.rotation,v-s.center)*(s.min_axis/s.axes);
+}
+fn metric_normal(s:ShapePose,n:vec3<f32>)->vec3<f32>{
+    return normalize(quat_rotate(s.rotation,n*(s.min_axis/s.axes)));
+}
+fn world_point(s:ShapePose,v:vec3<f32>)->vec3<f32>{
+    return s.center+quat_rotate(s.rotation,v*(s.axes/s.min_axis));
+}
+fn support_height(s:ShapePose,n:vec3<f32>)->f32{
+    return length(s.axes*inverse_rotate(s.rotation,n));
+}
+fn support_arm(s:ShapePose,n:vec3<f32>)->vec3<f32>{
+    let local=inverse_rotate(s.rotation,n);
+    return quat_rotate(s.rotation,s.axes*s.axes*local/max(length(s.axes*local),1e-12));
+}
+fn loaded_area(s:ShapePose,n:vec3<f32>,depth:f32)->f32{
+    // Exact area of the ellipsoid intersected by its supporting plane:
+    // pi*a*b*c/h * (1 - d²/h²). Use depth instead of subtracting
+    // nearly equal squares for shallow contacts.
+    let h=support_height(s,n);
+    let indentation=clamp(depth,0.0001,h);
+    let fraction=indentation/h;
+    return 3.14159265*s.axes.x*s.axes.y*s.axes.z/h*fraction*(2.0-fraction);
+}
+fn terrain_contact(s:ShapePose)->Contact{
+    // Transform the triangle into the ellipsoid's isotropic metric.
+    // Triangle-sphere intersection there is exact even on edges/slopes.
+    // Convert the contact normal back with the inverse transpose.
+    let margin=vec2<f32>(s.radius)+config.projection.grid.zw;
+    let lo=vec2<i32>(floor((s.center.xy-margin)/config.spacing));
+    let hi=vec2<i32>(floor((s.center.xy+margin)/config.spacing));
     let limit=i32(config.side)-2;
     var best=Contact(vec3<f32>(0.0,0.0,1.0),0.0,vec3<f32>(0.0),0u);
+    let bottom=s.center.z-support_height(s,vec3<f32>(0.0,0.0,1.0));
     for(var y=max(lo.y,0);y<=min(hi.y,limit);y+=1){
         for(var x=max(lo.x,0);x<=min(hi.x,limit);x+=1){
             let a=vertex(u32(x),u32(y));let b=vertex(u32(x+1),u32(y));
             let c=vertex(u32(x),u32(y+1));let d=vertex(u32(x+1),u32(y+1));
-            // Reject cells entirely below the sphere before narrow phase.
-            if center.z-radius>max(max(a.z,b.z),max(c.z,d.z)){continue;}
+            if bottom>max(max(a.z,b.z),max(c.z,d.z)){continue;}
+            let ma=metric(s,a);
             for(var face=0u;face<2u;face+=1u){
                 let v1=select(d,b,face==0u);
                 let v2=select(c,d,face==0u);
-                let n=normalize(cross(v1-a,v2-a));
-                let point=closest_triangle(center,a,v1,v2);
-                let delta=center-point;
-                let distance=length(delta);
-                let signed=dot(delta,n);
-                // Heightfield is solid below the surface. Detect a deeply
-                // embedded center if its vertical projection is in the face.
-                let penetration=radius-distance;
-                if penetration>best.depth && signed>=0.0{
-                    best=Contact(select(n,delta/max(distance,1e-8),distance>1e-6),penetration,point,cell_material(u32(x),u32(y)));
+                let mb=metric(s,v1);let mc=metric(s,v2);
+                let mn=normalize(cross(mb-ma,mc-ma));
+                let point=closest_triangle(vec3<f32>(0.0),ma,mb,mc);
+                let distance=length(point);
+                let signed=dot(-point,mn);
+                let material=cell_material(u32(x),u32(y));
+                if distance<s.min_axis && signed>=0.0{
+                    let normal=metric_normal(s,select(mn,-point/max(distance,1e-8),distance>1e-6));
+                    let support=world_point(s,point);
+                    let depth=support_height(s,normal)-dot(s.center-support,normal);
+                    if depth>best.depth{best=Contact(normal,depth,support,material);}
                 }else if signed<0.0{
-                    let planar=center.xy;
+                    // Solid heightfield below the top surface. Recover
+                    // embedded centers via the actual triangle plane.
+                    let normal=normalize(cross(v1-a,v2-a));
                     let edge0=v1.xy-a.xy;let edge1=v2.xy-a.xy;
-                    let q=planar-a.xy;
+                    let q=s.center.xy-a.xy;
                     let denom=edge0.x*edge1.y-edge0.y*edge1.x;
                     if abs(denom)<1e-12 {continue;}
                     let u=(q.x*edge1.y-q.y*edge1.x)/denom;
                     let v=(edge0.x*q.y-edge0.y*q.x)/denom;
                     if u>=0.0&&v>=0.0&&u+v<=1.0{
-                        let depth=radius-dot(center-a,n);
-                        if depth>best.depth{best=Contact(n,depth,center-n*dot(center-a,n),cell_material(u32(x),u32(y)));}
+                        let signed_depth=dot(s.center-a,normal);
+                        let depth=support_height(s,normal)-signed_depth;
+                        if depth>best.depth{best=Contact(normal,depth,s.center-normal*signed_depth,material);}
                     }
                 }
             }
@@ -124,23 +171,20 @@ fn apply_impulse(b:ptr<function,Body>,r:vec3<f32>,impulse:vec3<f32>){
 // Generate contact geometry once at the integrated pose. Solver
 // iterations change velocities only; there is no reason to traverse the
 // terrain repeatedly for precisely the same pose.
-fn prepare(b:Body,sphere:vec4<f32>,shape:u32)->Constraint{
-    let center=b.position.xyz+quat_rotate(b.rotation,sphere.xyz);
-    let contact=terrain_contact(center,sphere.w);
+fn prepare(b:Body,collider:Collider,shape:u32)->Constraint{
+    let s=shape_pose(b,collider);
+    let contact=terrain_contact(s);
     if contact.depth<=0.0{
         return Constraint(vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,0.0,shape,0.0,0u);
     }
     let n=contact.normal;
-    let arm=center-n*sphere.w-b.position.xyz;
+    let arm=s.center-support_arm(s,n)-b.position.xyz;
     let velocity=b.velocity.xyz+cross(b.angular.xyz,arm);
     let vn=dot(velocity,n);
     let slip=velocity-n*vn;
     let bias=min(2.0,max(contact.depth-config.slop,0.0)*0.22/config.dt);
     let bounce=select(0.0,-vn*b.angular.w,vn < -0.8);
-    // Approximate loaded area of a sphere by its circular intersection
-    // with the supporting plane. A small floor avoids singular pressure.
-    let indentation=clamp(contact.depth,0.0001,sphere.w);
-    let area=3.14159265*indentation*(2.0*sphere.w-indentation);
+    let area=loaded_area(s,n,contact.depth);
     return Constraint(n,max(bias,bounce),arm,1.0/max(effective_mass(b,arm,n),1e-8),vec3<f32>(0.0),0.0,contact.point,contact.depth,slip,0.0,area,shape,bounce,contact.material);
 }
 // The normal impulse enters both velocity and the pressure-dependent
@@ -199,10 +243,9 @@ fn solve(b:ptr<function,Body>,constraint:Constraint)->Constraint{
 fn covered(b:Body)->bool{
     let extent=f32(config.side-1u)*config.spacing;
     for(var j=0u;j<b.metadata.y;j+=1u){
-        let s=spheres[b.metadata.x+j];
-        let center=b.position.xyz+quat_rotate(b.rotation,s.xyz);
-        let margin=vec2<f32>(s.w)+config.projection.grid.zw;
-        if any(center.xy-margin<vec2<f32>(0.0))||any(center.xy+margin>=vec2<f32>(extent)){return false;}
+        let s=shape_pose(b,shapes[b.metadata.x+j]);
+        let margin=vec2<f32>(support_height(s,vec3<f32>(1.0,0.0,0.0)),support_height(s,vec3<f32>(0.0,1.0,0.0)))+config.projection.grid.zw;
+        if any(s.center.xy-margin<vec2<f32>(0.0))||any(s.center.xy+margin>=vec2<f32>(extent)){return false;}
     }
     return true;
 }
@@ -213,7 +256,10 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
     if b.metadata.z!=0u{return;}
     var min_radius=1e20;var max_arm=0.0;
     for(var j=0u;j<b.metadata.y;j+=1u){
-        let s=spheres[b.metadata.x+j];min_radius=min(min_radius,s.w);max_arm=max(max_arm,length(s.xyz)+s.w);
+        let s=shapes[b.metadata.x+j];
+        let axes=s.axes.xyz;
+        min_radius=min(min_radius,min(axes.x,min(axes.y,axes.z)));
+        max_arm=max(max_arm,length(s.center.xyz)+max(axes.x,max(axes.y,axes.z)));
     }
     for(var tick=0u;tick<config.steps;tick+=1u){
         let previous=b;
@@ -232,7 +278,7 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
         var constraints:array<Constraint,64>;
         var count=0u;
         for(var j=0u;j<b.metadata.y;j+=1u){
-            let c=prepare(b,spheres[b.metadata.x+j],j);
+            let c=prepare(b,shapes[b.metadata.x+j],j);
             if c.inv_effective_mass>0.0{
                 constraints[count]=c;
                 count+=1u;
