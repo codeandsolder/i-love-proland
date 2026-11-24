@@ -1131,6 +1131,25 @@ struct DrawPipelines {
     impostor: wgpu::RenderPipeline,
 }
 
+fn placeholder_texture(device: &wgpu::Device) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("i-love-proland unused impostor source texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 impl TreePipelines {
     /// Compile once for every compatible render-target configuration.
     ///
@@ -1212,22 +1231,7 @@ impl TreePipelines {
             contents: bytemuck::cast_slice(&[0_u32, 1, 2, 2, 1, 3]),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let placeholder = device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("i-love-proland unused impostor source texture"),
-                size: wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let placeholder = placeholder_texture(device);
         Ok(Self {
             compaction: compaction.clone(),
             config,
@@ -1543,7 +1547,7 @@ impl TreeRenderer {
         self.draw_using(pass, &self.pipelines.normal);
     }
 
-    /// Count rasterized triangle coverage in a single-sample RGBA16Float
+    /// Count rasterized triangle coverage in a single-sample `RGBA16Float`
     /// additive pass cleared to zero, with no depth or alpha rejection.
     /// Red counts mesh/module coverage; green counts impostor coverage.
     /// Integer half-float counts are exact up to 2048.
