@@ -224,7 +224,7 @@ pub struct CompiledModuleBank {
     pub variant_ids: Vec<u64>,
     pub modules_per_variant: u32,
     /// Conservative local physical culling radii, indexed by the same dense
-    /// visual form slot as \`variant_ids\`. Bounds are measured about the
+    /// visual form slot as `variant_ids`. Bounds are measured about the
     /// *shared source frame center*, not each plant's private center, so
     /// instances keep one immutable physical anchor through all LOD tiers.
     /// Each value also encloses the full source geometry under this module

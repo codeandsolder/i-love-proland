@@ -18,7 +18,7 @@ scatter system or an automatic replacement for the current KSP assets.
   explicit; use CompiledModuleBank::model_slot_for_seed(source_id, stable_seed)
   to select a visual form using persistent object/biome context.
   Source colors and geometric bounds survive. Each selected visual slot has
-  a separate conservative radius in \`CompiledModuleBank.variant_culling_radii\`,
+  a separate conservative radius in `CompiledModuleBank.variant_culling_radii`,
   measured about the **shared** source-frame center; the host applies that
   radius to its GPU culling/LOD sphere without modifying source-frame
   normalization, physical transform, source anchor, or canonical object ID.
@@ -36,7 +36,7 @@ scatter system or an automatic replacement for the current KSP assets.
   visual form must apply its own conservative physical culling/LOD radius
   from the compiled bank; this changes neither the atlas billboard size
   (derived from the invariant axis radii), nor the original object pose.
-  The headless \`forest_render\` smoke verifies the per-form bounds path.
+  The headless `forest_render` smoke verifies the per-form bounds path.
 - TreeMaterial contains TreeGeometry::Mesh or TreeGeometry::Modules. This is
   an intentional API change, not a compatibility wrapper. Normal source
   materials continue to draw exactly as before; the module variant uses its
