@@ -4,7 +4,10 @@ use i_love_proland::terrain::{
     Region, RegionCell, RegionChart,
     gpu::{
         TerrainGpu, TerrainRequest,
-        physics::{PhysicsConfig, PhysicsGpu, RigidBody, SimulationClock, Sphere, StepBatch},
+        physics::{
+            ContactMaterial, PhysicsConfig, PhysicsGpu, RigidBody, SimulationClock, Sphere,
+            StepBatch,
+        },
     },
 };
 use std::{
@@ -50,6 +53,7 @@ const CONFIG: PhysicsConfig = PhysicsConfig {
     gravity_m_s2: 9.81,
     contact_slop_m: 0.001,
     solver_iterations: 5,
+    material: ContactMaterial::RIGID,
     stop_at_contact: false,
 };
 fn simulate(

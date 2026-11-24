@@ -5,19 +5,30 @@
 struct Config {
     side:u32, slot:u32, count:u32, steps:u32,
     spacing:f32, dt:f32, gravity:f32, slop:f32,
-    iterations:u32, stop_at_contact:u32, padding1:u32, padding2:u32,
+    iterations:u32, stop_at_contact:u32, record_contacts:u32, padding:u32,
+    material:vec4<f32>,
     projection:GridProjection,
 }
-struct Contact { normal:vec3<f32>, depth:f32 }
+struct Contact { normal:vec3<f32>, depth:f32, point:vec3<f32>, padding:f32 }
 struct Constraint {
     normal:vec3<f32>, desired_speed:f32,
     arm:vec3<f32>, inv_effective_mass:f32,
     friction_impulse:vec3<f32>, normal_impulse:f32,
+    point:vec3<f32>, depth:f32,
+    area:f32, shape:u32, bounce:f32, padding:f32,
+}
+struct ContactEvent{
+    position_force:vec4<f32>,
+    normal_depth:vec4<f32>,
+    rotation:vec4<f32>,
+    slip_area:vec4<f32>,
+    metadata:vec4<u32>,
 }
 @group(0) @binding(0) var<storage,read> terrain:array<TerrainSample>;
 @group(0) @binding(1) var<storage,read_write> bodies:array<Body>;
 @group(0) @binding(2) var<storage,read> spheres:array<vec4<f32>>;
 @group(0) @binding(3) var<uniform> config:Config;
+@group(0) @binding(4) var<storage,read_write> contact_events:array<ContactEvent>;
 
 fn quat_rotate(q:vec4<f32>,v:vec3<f32>)->vec3<f32>{
     let t=2.0*cross(q.xyz,v);
@@ -59,7 +70,7 @@ fn terrain_contact(center:vec3<f32>,radius:f32)->Contact{
     let lo=vec2<i32>(floor((center.xy-margin)/config.spacing));
     let hi=vec2<i32>(floor((center.xy+margin)/config.spacing));
     let limit=i32(config.side)-2;
-    var best=Contact(vec3<f32>(0.0,0.0,1.0),0.0);
+    var best=Contact(vec3<f32>(0.0,0.0,1.0),0.0,vec3<f32>(0.0),0.0);
     for(var y=max(lo.y,0);y<=min(hi.y,limit);y+=1){
         for(var x=max(lo.x,0);x<=min(hi.x,limit);x+=1){
             let a=vertex(u32(x),u32(y));let b=vertex(u32(x+1),u32(y));
@@ -78,7 +89,7 @@ fn terrain_contact(center:vec3<f32>,radius:f32)->Contact{
                 // embedded center if its vertical projection is in the face.
                 let penetration=radius-distance;
                 if penetration>best.depth && signed>=0.0{
-                    best=Contact(select(n,delta/max(distance,1e-8),distance>1e-6),penetration);
+                    best=Contact(select(n,delta/max(distance,1e-8),distance>1e-6),penetration,point,0.0);
                 }else if signed<0.0{
                     let planar=center.xy;
                     let edge0=v1.xy-a.xy;let edge1=v2.xy-a.xy;
@@ -89,7 +100,7 @@ fn terrain_contact(center:vec3<f32>,radius:f32)->Contact{
                     let v=(edge0.x*q.y-edge0.y*q.x)/denom;
                     if u>=0.0&&v>=0.0&&u+v<=1.0{
                         let depth=radius-dot(center-a,n);
-                        if depth>best.depth{best=Contact(n,depth);}
+                        if depth>best.depth{best=Contact(n,depth,center-n*dot(center-a,n),0.0);}
                     }
                 }
             }
@@ -107,18 +118,22 @@ fn apply_impulse(b:ptr<function,Body>,r:vec3<f32>,impulse:vec3<f32>){
 // Generate contact geometry once at the integrated pose. Solver
 // iterations change velocities only; there is no reason to traverse the
 // terrain repeatedly for precisely the same pose.
-fn prepare(b:Body,sphere:vec4<f32>)->Constraint{
+fn prepare(b:Body,sphere:vec4<f32>,shape:u32)->Constraint{
     let center=b.position.xyz+quat_rotate(b.rotation,sphere.xyz);
     let contact=terrain_contact(center,sphere.w);
     if contact.depth<=0.0{
-        return Constraint(vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0);
+        return Constraint(vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,0.0,shape,0.0,0.0);
     }
     let n=contact.normal;
     let arm=center-n*sphere.w-b.position.xyz;
     let vn=dot(b.velocity.xyz+cross(b.angular.xyz,arm),n);
     let bias=min(2.0,max(contact.depth-config.slop,0.0)*0.22/config.dt);
     let bounce=select(0.0,-vn*b.angular.w,vn < -0.8);
-    return Constraint(n,max(bias,bounce),arm,1.0/max(effective_mass(b,arm,n),1e-8),vec3<f32>(0.0),0.0);
+    // Approximate loaded area of a sphere by its circular intersection
+    // with the supporting plane. A small floor avoids singular pressure.
+    let indentation=clamp(contact.depth,0.0001,sphere.w);
+    let area=3.14159265*indentation*(2.0*sphere.w-indentation);
+    return Constraint(n,max(bias,bounce),arm,1.0/max(effective_mass(b,arm,n),1e-8),vec3<f32>(0.0),0.0,contact.point,contact.depth,area,shape,bounce,0.0);
 }
 fn solve(b:ptr<function,Body>,constraint:Constraint)->Constraint{
     var c=constraint;
@@ -128,7 +143,23 @@ fn solve(b:ptr<function,Body>,constraint:Constraint)->Constraint{
     let vn=dot(relative,n);
     // Project the accumulated normal impulse onto the unilateral cone.
     // Subsequent iterations can undo an excessive prior impulse.
-    let next_normal=max(0.0,c.normal_impulse+(c.desired_speed-vn)*c.inv_effective_mass);
+    var target=c.desired_speed;
+    var mass=c.inv_effective_mass;
+    if config.material.x>0.0{
+        // Solve the load-dependent rest offset implicitly. The derivative
+        // is positive in the residual, stabilizing the pressure feedback.
+        let half_impulse=config.material.y*c.area*config.dt;
+        let denominator=max(c.normal_impulse+half_impulse,1e-12);
+        let sinkage=config.material.x*c.normal_impulse/denominator;
+        let raw=(c.depth-config.slop-sinkage)*0.22/config.dt;
+        let bias=clamp(raw,-2.0,2.0);
+        target=select(bias,max(bias,c.bounce),c.bounce>0.0);
+        if abs(raw)<2.0 && (c.bounce<=0.0 || bias>=c.bounce){
+            let derivative=config.material.x*half_impulse/(denominator*denominator)*0.22/config.dt;
+            mass=1.0/(1.0/c.inv_effective_mass+derivative);
+        }
+    }
+    let next_normal=max(0.0,c.normal_impulse+(target-vn)*mass);
     apply_impulse(b,r,n*(next_normal-c.normal_impulse));
     c.normal_impulse=next_normal;
     let after=(*b).velocity.xyz+cross((*b).angular.xyz,r);
@@ -183,7 +214,7 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
         var constraints:array<Constraint,64>;
         var count=0u;
         for(var j=0u;j<b.metadata.y;j+=1u){
-            let c=prepare(b,spheres[b.metadata.x+j]);
+            let c=prepare(b,spheres[b.metadata.x+j],j);
             if c.inv_effective_mass>0.0{
                 constraints[count]=c;
                 count+=1u;
@@ -194,6 +225,17 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
         }
         b.clock.x+=1u;
         if b.clock.x==0u{b.clock.y+=1u;}
+        if config.record_contacts!=0u{
+            for(var j=0u;j<count;j+=1u){
+                let c=constraints[j];
+                let velocity=b.velocity.xyz+cross(b.angular.xyz,c.arm);
+                let slip=velocity-c.normal*dot(velocity,c.normal);
+                let index=(tick*config.count+id.x)*64u+c.shape;
+                contact_events[index]=ContactEvent(vec4<f32>(c.point,c.normal_impulse/config.dt),
+                    vec4<f32>(c.normal,c.depth),b.rotation,vec4<f32>(slip,c.area),
+                    vec4<u32>(b.clock.xy,b.metadata.x+c.shape,1u));
+            }
+        }
         if count>0u && b.metadata.w==0u {
             b.metadata.w=1u;
             b.clock.z=b.clock.x;

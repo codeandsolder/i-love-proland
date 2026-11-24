@@ -87,6 +87,58 @@ impl RigidBody {
     }
 }
 
+/// Bounded pressure-dependent compliant layer over the rigid triangles.
+/// The sphere cross-section at its current indentation approximates the
+/// loaded area until authored wheel/pad collision primitives are available.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ContactMaterial {
+    pub max_sinkage_m: f32,
+    pub half_sinkage_pressure_pa: f32,
+}
+
+impl ContactMaterial {
+    pub const RIGID: Self = Self {
+        max_sinkage_m: 0.0,
+        half_sinkage_pressure_pa: 1.0,
+    };
+
+    fn valid(self) -> bool {
+        self.max_sinkage_m.is_finite()
+            && self.max_sinkage_m >= 0.0
+            && self.half_sinkage_pressure_pa.is_finite()
+            && self.half_sinkage_pressure_pa > 0.0
+    }
+}
+
+/// Optional per-tick contact telemetry. Position/normal/orientation use
+/// the solver's metric tangent coordinates. A zero active flag is an
+/// explicit contact gap. Only completed integrated ticks produce records.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ContactEvent {
+    /// xyz: actual terrain support point, w: normal force in newtons.
+    pub position_force: [f32; 4],
+    /// xyz: normal, w: measured indentation relative to rigid triangles.
+    pub normal_depth: [f32; 4],
+    pub rotation: [f32; 4],
+    /// xyz: tangential velocity at the loaded point, w: contact area in m².
+    pub slip_area: [f32; 4],
+    /// [completed tick low, completed tick high, global shape ID, active].
+    pub metadata: [u32; 4],
+}
+
+impl ContactEvent {
+    #[must_use]
+    pub const fn tick(&self) -> u64 {
+        (self.metadata[1] as u64) << 32 | self.metadata[0] as u64
+    }
+}
+
+/// Body-major within each integrated tick; each body has a fixed stride
+/// of 64 collider slots, including explicit gaps. Readback is opt-in.
+pub const CONTACTS_PER_BODY: u32 = 64;
+
 /// Bounded integration configuration, independent of render cadence.
 #[derive(Clone, Copy, Debug)]
 pub struct PhysicsConfig {
@@ -95,6 +147,7 @@ pub struct PhysicsConfig {
     pub gravity_m_s2: f32,
     pub contact_slop_m: f32,
     pub solver_iterations: u32,
+    pub material: ContactMaterial,
     /// Finish a predictive calculation at the first discrete contact.
     pub stop_at_contact: bool,
 }
@@ -112,7 +165,10 @@ struct StepConfig {
     slop: f32,
     iterations: u32,
     stop_at_contact: u32,
-    padding: [u32; 2],
+    record_contacts: u32,
+    padding: u32,
+    material: ContactMaterial,
+    material_padding: [u32; 2],
     projection: GridProjection,
 }
 
@@ -125,6 +181,7 @@ pub struct PhysicsGpu {
     pipeline: Kernel,
     bodies: wgpu::Buffer,
     spheres: wgpu::Buffer,
+    empty_contacts: wgpu::Buffer,
     terrain: wgpu::Buffer,
     request: TerrainRequest,
     params: StepConfig,
@@ -150,6 +207,7 @@ impl PhysicsGpu {
             || !(0.0..=1000.0).contains(&config.gravity_m_s2)
             || !(0.0..=1.0).contains(&config.contact_slop_m)
             || !(1..=32).contains(&config.solver_iterations)
+            || !config.material.valid()
             || bodies.is_empty()
             || spheres.is_empty()
             || bodies
@@ -201,7 +259,10 @@ impl PhysicsGpu {
             slop: config.contact_slop_m,
             iterations: config.solver_iterations,
             stop_at_contact: u32::from(config.stop_at_contact),
-            padding: [0; 2],
+            record_contacts: 0,
+            padding: 0,
+            material: config.material,
+            material_padding: [0; 2],
             projection: terrain.grid_projection(slot)?,
         };
         Ok(Self {
@@ -212,6 +273,12 @@ impl PhysicsGpu {
                 "compound sphere shapes",
                 bytemuck::cast_slice(spheres),
             )?,
+            empty_contacts: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("disabled contact telemetry"),
+                size: std::mem::size_of::<ContactEvent>() as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
             terrain: terrain.samples().clone(),
             request,
             params,
@@ -258,6 +325,55 @@ impl PhysicsGpu {
         terrain: &TerrainGpu,
         batch: StepBatch,
     ) -> io::Result<()> {
+        self.encode_batch(device, encoder, terrain, batch, None)
+    }
+
+    /// Record a bounded batch of authoritative contact observations.
+    /// This does not change integration or require synchronizing every tick.
+    ///
+    /// # Errors
+    /// Rejects invalid batch or telemetry allocation beyond adapter limits.
+    pub fn encode_contacts(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        terrain: &TerrainGpu,
+        batch: StepBatch,
+    ) -> io::Result<RecordedReadback<ContactEvent>> {
+        let size = u64::from(batch.steps)
+            .checked_mul(u64::from(self.params.count))
+            .and_then(|v| v.checked_mul(u64::from(CONTACTS_PER_BODY)))
+            .and_then(|v| v.checked_mul(std::mem::size_of::<ContactEvent>() as u64))
+            .ok_or_else(|| invalid("contact telemetry size overflow"))?;
+        if size == 0
+            || size
+                > device
+                    .limits()
+                    .max_storage_buffer_binding_size
+                    .min(device.limits().max_buffer_size)
+        {
+            return Err(invalid(
+                "contact telemetry exceeds adapter limit; shorten batch",
+            ));
+        }
+        let contacts = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bounded physics contact observations"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.encode_batch(device, encoder, terrain, batch, Some(&contacts))?;
+        Ok(RecordedReadback::copy(device, encoder, &contacts, 0, size))
+    }
+
+    fn encode_batch(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        terrain: &TerrainGpu,
+        batch: StepBatch,
+        contacts: Option<&wgpu::Buffer>,
+    ) -> io::Result<()> {
         if terrain.samples() != &self.terrain
             || terrain.grid_request(self.request.slot) != Some(self.request)
             || batch.hz != self.hz
@@ -272,6 +388,7 @@ impl PhysicsGpu {
             .ok_or_else(|| invalid("physics tick overflow"))?;
         let params = StepConfig {
             steps: batch.steps,
+            record_contacts: u32::from(contacts.is_some()),
             ..self.params
         };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -279,7 +396,13 @@ impl PhysicsGpu {
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let buffers = [&self.terrain, &self.bodies, &self.spheres, &uniform];
+        let buffers = [
+            &self.terrain,
+            &self.bodies,
+            &self.spheres,
+            &uniform,
+            contacts.unwrap_or(&self.empty_contacts),
+        ];
         self.pipeline.encode(
             device,
             encoder,
