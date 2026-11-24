@@ -165,6 +165,10 @@ pub struct ContactEvent {
     pub slip_area: [f32; 4],
     /// [completed tick low, completed tick high, global shape ID, material index + 1].
     pub metadata: [u32; 4],
+    /// Pre-solve closing normal speed (m/s), normal impulse (N s),
+    /// friction impulse magnitude (N s), reserved. Never infer crash
+    /// severity from post-solve velocity or penetration bias.
+    pub impact: [f32; 4],
 }
 
 impl ContactEvent {

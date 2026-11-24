@@ -15,7 +15,7 @@ struct Constraint {
     arm:vec3<f32>, inv_effective_mass:f32,
     friction_impulse:vec3<f32>, normal_impulse:f32,
     point:vec3<f32>, depth:f32,
-    incident_slip:vec3<f32>, reserved:f32,
+    incident_slip:vec3<f32>, incident_normal_speed:f32,
     area:f32, shape:u32, bounce:f32, material:u32,
 }
 struct ContactEvent{
@@ -24,6 +24,7 @@ struct ContactEvent{
     rotation:vec4<f32>,
     slip_area:vec4<f32>,
     metadata:vec4<u32>,
+    impact:vec4<f32>,
 }
 @group(0) @binding(0) var<storage,read> terrain:array<TerrainSample>;
 @group(0) @binding(1) var<storage,read_write> bodies:array<Body>;
@@ -177,7 +178,7 @@ fn prepare(b:Body,collider:Collider,shape:u32)->Constraint{
     let bias=min(2.0,max(contact.depth-config.slop,0.0)*0.22/config.dt);
     let bounce=select(0.0,-vn*b.angular.w,vn < -0.8);
     let area=loaded_area(s,n,contact.depth);
-    return Constraint(n,max(bias,bounce),arm,1.0/max(effective_mass(b,arm,n),1e-8),vec3<f32>(0.0),0.0,contact.point,contact.depth,slip,0.0,area,shape,bounce,contact.material);
+    return Constraint(n,max(bias,bounce),arm,1.0/max(effective_mass(b,arm,n),1e-8),vec3<f32>(0.0),0.0,contact.point,contact.depth,slip,max(-vn,0.0),area,shape,bounce,contact.material);
 }
 // The normal impulse enters both velocity and the pressure-dependent
 // equilibrium depth. Solve the monotone rational equation exactly rather
@@ -288,7 +289,8 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
                 let index=(batch_tick*config.count+id.x)*config.contact_stride+c.shape;
                 contact_events[index]=ContactEvent(vec4<f32>(c.point,c.normal_impulse/config.dt),
                     vec4<f32>(c.normal,c.depth),b.rotation,vec4<f32>(c.incident_slip,c.area),
-                    vec4<u32>(b.clock.xy,b.metadata.x+c.shape,select(0u,c.material+1u,c.normal_impulse>0.0)));
+                    vec4<u32>(b.clock.xy,b.metadata.x+c.shape,select(0u,c.material+1u,c.normal_impulse>0.0)),
+                    vec4<f32>(c.incident_normal_speed,c.normal_impulse,length(c.friction_impulse),0.0));
             }
         }
         if count>0u && b.metadata.w==0u {
