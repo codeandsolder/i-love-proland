@@ -3,11 +3,13 @@
 //! Render/scatter consumers can bind the resident sample buffer directly;
 //! diagnostic consumers can request asynchronous snapshots.
 //! The chart lattice is integer-addressed (1/16 m), not camera-relative.
-use super::Region;
+use super::{Region, RegionChart};
 use std::io;
 mod kernel;
 mod points;
+mod projection;
 pub use points::TerrainPointRequest;
+pub use projection::{GRID_PROJECTION_WGSL, GridProjection};
 mod readback;
 use kernel::Kernel;
 pub use readback::{PendingReadback, RecordedReadback};
@@ -173,9 +175,22 @@ pub struct TerrainGpu {
     samples: wgpu::Buffer,
     config: Config,
     resident: Vec<Option<Resident>>,
+    chart: RegionChart,
+    elevation_bound: f64,
 }
 
 impl TerrainGpu {
+    /// Exact local spherical mesh projection for a resident lattice.
+    ///
+    /// # Errors
+    /// Rejects missing grids and patches too large for bounded local contacts.
+    pub fn grid_projection(&self, slot: u32) -> io::Result<GridProjection> {
+        let request = self
+            .grid_request(slot)
+            .ok_or_else(|| invalid("terrain slot is not a regular grid"))?;
+        GridProjection::new(self.chart, request, self.side(), self.elevation_bound)
+    }
+
     /// Create a generator and resident pool for one region and grid size.
     /// A different collision grid resolution may use the same field in a
     /// separate pool on the same device. Both evaluate the canonical region.
@@ -236,6 +251,8 @@ impl TerrainGpu {
             samples,
             config,
             resident: vec![None; usize::try_from(slots).map_err(io::Error::other)?],
+            chart,
+            elevation_bound: region.max_elevation().max(region.min_elevation().abs()),
         })
     }
 

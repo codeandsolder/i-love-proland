@@ -6,6 +6,7 @@ struct Config {
     side:u32, slot:u32, count:u32, steps:u32,
     spacing:f32, dt:f32, gravity:f32, slop:f32,
     iterations:u32, stop_at_contact:u32, padding1:u32, padding2:u32,
+    projection:GridProjection,
 }
 struct Contact { normal:vec3<f32>, depth:f32 }
 struct Constraint {
@@ -31,7 +32,7 @@ fn inverse_world_inertia(b:Body,v:vec3<f32>)->vec3<f32>{
 }
 fn vertex(x:u32,y:u32)->vec3<f32>{
     let i=config.slot*config.side*config.side+y*config.side+x;
-    return vec3<f32>(vec2<f32>(f32(x),f32(y))*config.spacing,terrain[i].bed);
+    return grid_position(config.projection,vec2<u32>(x,y),terrain[i].bed);
 }
 fn segment_point(p:vec3<f32>,a:vec3<f32>,b:vec3<f32>)->vec3<f32>{
     let edge=b-a;
@@ -52,8 +53,11 @@ fn closest_triangle(p:vec3<f32>,a:vec3<f32>,b:vec3<f32>,c:vec3<f32>)->vec3<f32>{
     return ca;
 }
 fn terrain_contact(center:vec3<f32>,radius:f32)->Contact{
-    let lo=vec2<i32>(floor((center.xy-vec2<f32>(radius))/config.spacing));
-    let hi=vec2<i32>(floor((center.xy+vec2<f32>(radius))/config.spacing));
+    // Every projected vertex and every interpolated triangle point is
+    // inside the nominal cell expanded by this conservative displacement.
+    let margin=vec2<f32>(radius)+config.projection.grid.zw;
+    let lo=vec2<i32>(floor((center.xy-margin)/config.spacing));
+    let hi=vec2<i32>(floor((center.xy+margin)/config.spacing));
     let limit=i32(config.side)-2;
     var best=Contact(vec3<f32>(0.0,0.0,1.0),0.0);
     for(var y=max(lo.y,0);y<=min(hi.y,limit);y+=1){
@@ -80,6 +84,7 @@ fn terrain_contact(center:vec3<f32>,radius:f32)->Contact{
                     let edge0=v1.xy-a.xy;let edge1=v2.xy-a.xy;
                     let q=planar-a.xy;
                     let denom=edge0.x*edge1.y-edge0.y*edge1.x;
+                    if abs(denom)<1e-12 {continue;}
                     let u=(q.x*edge1.y-q.y*edge1.x)/denom;
                     let v=(edge0.x*q.y-edge0.y*q.x)/denom;
                     if u>=0.0&&v>=0.0&&u+v<=1.0{
@@ -147,7 +152,8 @@ fn covered(b:Body)->bool{
     for(var j=0u;j<b.metadata.y;j+=1u){
         let s=spheres[b.metadata.x+j];
         let center=b.position.xyz+quat_rotate(b.rotation,s.xyz);
-        if any(center.xy-vec2<f32>(s.w)<vec2<f32>(0.0))||any(center.xy+vec2<f32>(s.w)>=vec2<f32>(extent)){return false;}
+        let margin=vec2<f32>(s.w)+config.projection.grid.zw;
+        if any(center.xy-margin<vec2<f32>(0.0))||any(center.xy+margin>=vec2<f32>(extent)){return false;}
     }
     return true;
 }
@@ -162,7 +168,9 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
     }
     for(var tick=0u;tick<config.steps;tick+=1u){
         let previous=b;
-        b.velocity.z-=config.gravity*config.dt;
+        let radial=vec3<f32>(b.position.xy-vec2<f32>(config.projection.grid.y),
+                             b.position.z+config.projection.sphere.x);
+        b.velocity=vec4<f32>(b.velocity.xyz-normalize(radial)*config.gravity*config.dt,b.velocity.w);
         // Bounded discrete integration: refuse steps that could traverse
         // more than half a sphere radius. A future swept solver can remove
         // this restriction; never silently tunnel through a terrain tile.

@@ -152,6 +152,7 @@ pub struct Region {
     cells: Vec<RegionCell>,
     channels: ChannelField,
     max_elevation: f64,
+    min_elevation: f64,
 }
 
 struct CellInterpolation {
@@ -198,12 +199,18 @@ impl Region {
             .map(|c| f64::from(c.height) * QUANTUM)
             .fold(0.0, f64::max)
             + ChannelField::MAX_RAISE;
+        let min_elevation = cells
+            .iter()
+            .map(|c| f64::from(c.height) * QUANTUM)
+            .fold(0.0, f64::min)
+            - ChannelField::MAX_CUT;
         let channels = ChannelField::new(chart.extent(), reaches)?;
         Ok(Self {
             chart,
             cells,
             channels,
             max_elevation,
+            min_elevation,
         })
     }
 
@@ -214,6 +221,11 @@ impl Region {
     #[must_use = "Use the conservative terrain bound"]
     pub const fn max_elevation(&self) -> f64 {
         self.max_elevation
+    }
+    /// Conservative lower bound for the solid regional field.
+    #[must_use = "Use the conservative terrain bound"]
+    pub const fn min_elevation(&self) -> f64 {
+        self.min_elevation
     }
     #[must_use = "Use the directed channel segments"]
     pub fn reaches(&self) -> &[Reach] {

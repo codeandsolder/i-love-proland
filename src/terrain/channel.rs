@@ -224,6 +224,7 @@ impl ChannelField {
     }
 
     pub const MAX_RAISE: f64 = 6.0;
+    pub(super) const MAX_CUT: f64 = 42.0;
 
     fn profile(&self, point: [f64; 2]) -> Option<Profile> {
         let candidates = self.candidates(point);
@@ -372,7 +373,7 @@ impl ChannelField {
         let support = 1.0 - unit((cross - radius - bank_width) / terrace_width);
         let local = lerp(base, target, support);
         result.bed = local.clamp(
-            42.0f64.mul_add(-support, base),
+            Self::MAX_CUT.mul_add(-support, base),
             f64::mul_add(Self::MAX_RAISE, support, base),
         );
         result.bank = (1.0 - unit((cross - radius).abs() / bank_width)) * support;

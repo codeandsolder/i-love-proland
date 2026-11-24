@@ -1,13 +1,16 @@
 //! Experimental fixed-step GPU rigid-body terrain solver. This is a local
 //! chart-space sandbox, not yet a full planetary multi-body physics engine.
 mod clock;
-use super::{Kernel, RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage};
+use super::{
+    GridProjection, Kernel, RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage,
+};
 pub use clock::{SimulationClock, StepBatch};
 use std::io;
 use wgpu::util::DeviceExt;
 
 pub const STEP_WGSL: &str = concat!(
     include_str!("sample.wgsl"),
+    include_str!("projection.wgsl"),
     include_str!("physics/body.wgsl"),
     include_str!("physics/step.wgsl")
 );
@@ -110,6 +113,7 @@ struct StepConfig {
     iterations: u32,
     stop_at_contact: u32,
     padding: [u32; 2],
+    projection: GridProjection,
 }
 
 /// One batch of independent rigid bodies over a pinned terrain slot.
@@ -198,6 +202,7 @@ impl PhysicsGpu {
             iterations: config.solver_iterations,
             stop_at_contact: u32::from(config.stop_at_contact),
             padding: [0; 2],
+            projection: terrain.grid_projection(slot)?,
         };
         Ok(Self {
             pipeline,
@@ -213,6 +218,18 @@ impl PhysicsGpu {
             submitted: config.initial_tick,
             hz: config.hz,
         })
+    }
+
+    /// Geometry used by both the solver and its terrain draw.
+    #[must_use = "Use the same projection for the contact mesh"]
+    pub const fn projection(&self) -> GridProjection {
+        self.params.projection
+    }
+
+    /// Resident terrain slot used by the solver.
+    #[must_use = "Use the actual resident slot"]
+    pub const fn terrain_slot(&self) -> u32 {
+        self.request.slot
     }
 
     /// Bind state directly to a GPU rendering or telemetry kernel.
