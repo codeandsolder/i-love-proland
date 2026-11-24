@@ -345,7 +345,13 @@ fn check_slope(device: &wgpu::Device, queue: &wgpu::Queue, sphere: &[Sphere]) ->
             slot: 0,
         }],
     )?;
+    let snapshot = sloped.snapshot(device, &mut commands, 0)?;
     queue.submit([commands.finish()]);
+    let mut pending = snapshot.begin();
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let grid = pending
+        .try_take()?
+        .ok_or_else(|| io::Error::other("missing slope terrain samples"))?;
     let mut rolling = body([32.0, 32.0, 106.0], [0.0; 3], 1);
     rolling.clock = [u32::MAX - 100, 15, 0, 0];
     let start = rolling.completed_tick();
@@ -358,13 +364,15 @@ fn check_slope(device: &wgpu::Device, queue: &wgpu::Queue, sphere: &[Sphere]) ->
             .first_contact_tick()
             .is_some_and(|tick| tick > start && tick <= result.completed_tick())
     );
-    let distance =
-        0.1_f32.mul_add(-result.position[0], result.position[2] - 100.0) / 1.01_f32.sqrt();
+    let distance = geometry::sphere_clearance(&grid, region.chart(), result.position)?;
     assert!(
         (distance - 0.5).abs() < 0.035,
         "slope contact distance {distance}"
     );
-    assert!(result.position[0] < 30.0);
-    println!("GPU_PHYSICS slope={result:?} tick_rollover=true");
+    assert!(result.position[0] < 32.0);
+    println!("GPU_PHYSICS slope={result:?} contact_distance_m={distance:.6} tick_rollover=true");
     Ok(())
 }
+
+#[path = "physics_geometry.rs"]
+mod geometry;

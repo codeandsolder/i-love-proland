@@ -1,9 +1,52 @@
 {
   "format": 1,
   "modules": [
-    {"name": "visibility and LOD compaction", "sources": ["src/gpu_instance.wgsl", "src/compact.wgsl"]},
-    {"name": "impostor rendering", "sources": ["src/gpu_instance.wgsl", "src/impostor.wgsl", "src/module.wgsl"]},
-    {"name": "candidate patching", "sources": ["src/gpu_instance.wgsl", "src/patch_candidates.wgsl"]}
+    {
+      "name": "visibility and LOD compaction",
+      "sources": [
+        "src/gpu_instance.wgsl",
+        "src/compact.wgsl"
+      ]
+    },
+    {
+      "name": "impostor rendering",
+      "sources": [
+        "src/gpu_instance.wgsl",
+        "src/impostor.wgsl",
+        "src/module.wgsl"
+      ]
+    },
+    {
+      "name": "candidate patching",
+      "sources": [
+        "src/gpu_instance.wgsl",
+        "src/patch_candidates.wgsl"
+      ]
+    },
+    {
+      "name": "regional field generation",
+      "sources": [
+        "src/terrain/gpu/sample.wgsl",
+        "src/terrain/gpu/field.wgsl"
+      ]
+    },
+    {
+      "name": "spherical terrain physics",
+      "sources": [
+        "src/terrain/gpu/sample.wgsl",
+        "src/terrain/gpu/projection.wgsl",
+        "src/terrain/gpu/physics/body.wgsl",
+        "src/terrain/gpu/physics/step.wgsl"
+      ]
+    },
+    {
+      "name": "physics presentation",
+      "sources": [
+        "src/terrain/gpu/physics/body.wgsl",
+        "src/terrain/gpu/physics/pose.wgsl",
+        "src/terrain/gpu/physics/presentation.wgsl"
+      ]
+    }
   ],
   "negative_tests": []
 }
