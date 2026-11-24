@@ -3,7 +3,7 @@
 struct JointRecord {
     anchor_a:vec4<f32>,anchor_b:vec4<f32>,
     frame_a:vec4<f32>,frame_b:vec4<f32>,
-    limits:vec4<f32>,drive:vec4<f32>,meta:vec4<u32>,
+    limits:vec4<f32>,drive:vec4<f32>,indices:vec4<u32>,
 }
 struct ArticulationScratch{
     contact:Constraint,
@@ -71,7 +71,7 @@ fn free_linear(a:ptr<function,Body>,b:ptr<function,Body>,axis:LinearAxis,joint:J
     var next=old;
     next.x=motor_impulse(joint,position,linear_speed(*a,*b,axis),mass,old.x);
     apply_linear(a,b,axis,next.x-old.x);
-    if joint.meta.w!=0u{
+    if joint.indices.w!=0u{
         next.y=limit_impulse(position,linear_speed(*a,*b,axis),mass,joint.limits.x,old.y,1.0);
         apply_linear(a,b,axis,next.y-old.y);
         next.z=limit_impulse(position,linear_speed(*a,*b,axis),mass,joint.limits.y,old.z,-1.0);
@@ -84,13 +84,13 @@ fn free_angular(a:ptr<function,Body>,b:ptr<function,Body>,axis:vec3<f32>,joint:J
     var next=old;
     // Position targets use shortest angular error for unlimited hinges.
     var adjusted=joint;
-    if joint.meta.w==0u{
+    if joint.indices.w==0u{
         let delta=joint.drive.x-position;
         adjusted.drive.x=position+atan2(sin(delta),cos(delta));
     }
     next.x=motor_impulse(adjusted,position,dot((*b).angular.xyz-(*a).angular.xyz,axis),mass,old.x);
     apply_angular(a,b,axis*(next.x-old.x));
-    if joint.meta.w!=0u{
+    if joint.indices.w!=0u{
         next.y=limit_impulse(position,dot((*b).angular.xyz-(*a).angular.xyz,axis),mass,joint.limits.x,old.y,1.0);
         apply_angular(a,b,axis*(next.y-old.y));
         next.z=limit_impulse(position,dot((*b).angular.xyz-(*a).angular.xyz,axis),mass,joint.limits.y,old.z,-1.0);
@@ -99,8 +99,8 @@ fn free_angular(a:ptr<function,Body>,b:ptr<function,Body>,axis:vec3<f32>,joint:J
     return next;
 }
 fn solve_joint(index:u32,joint:JointRecord){
-    var a=bodies[joint.meta.x];
-    var b=bodies[joint.meta.y];
+    var a=bodies[joint.indices.x];
+    var b=bodies[joint.indices.y];
     let qa=quat_mul(a.rotation,joint.frame_a);
     let qb=quat_mul(b.rotation,joint.frame_b);
     let rb=quat_rotate(b.rotation,joint.anchor_b.xyz);
@@ -111,7 +111,7 @@ fn solve_joint(index:u32,joint:JointRecord){
     // moving-axis derivative, i.e. apply the reaction at B's anchor.
     let ra=pb-a.position.xyz;
     let axes=array<vec3<f32>,3>(quat_rotate(qa,vec3<f32>(1.0,0.0,0.0)),quat_rotate(qa,vec3<f32>(0.0,1.0,0.0)),quat_rotate(qa,vec3<f32>(0.0,0.0,1.0)));
-    let kind=joint.meta.z;
+    let kind=joint.indices.z;
     let first=select(0u,1u,kind==1u);
     for(var axis=first;axis<3u;axis+=1u){
         lock_linear(&a,&b,LinearAxis(axes[axis],ra,rb),dot(delta,axes[axis]));
@@ -136,8 +136,8 @@ fn solve_joint(index:u32,joint:JointRecord){
         let angle=atan2(dot(by,axes[2]),dot(by,axes[1]));
         scratch[index].impulses=free_angular(&a,&b,axes[0],joint,angle,scratch[index].impulses);
     }
-    bodies[joint.meta.x]=a;
-    bodies[joint.meta.y]=b;
+    bodies[joint.indices.x]=a;
+    bodies[joint.indices.y]=b;
 }
 struct Integrated{body:Body,status:u32}
 fn propose(b:Body)->Integrated{
@@ -161,9 +161,9 @@ fn propose(b:Body)->Integrated{
 
 @compute @workgroup_size(1)
 fn advance_island(@builtin(global_invocation_id) invocation:vec3<u32>){
-    let header=topology[0].meta;
+    let header=topology[0].indices;
     if invocation.x>=header.x{return;}
-    let island=topology[1u+invocation.x].meta;
+    let island=topology[1u+invocation.x].indices;
     let body_end=island.x+island.y;
     let joint_end=island.z+island.w;
     let joint_base=1u+header.x;
