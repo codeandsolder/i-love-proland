@@ -143,7 +143,7 @@ fn solve(b:ptr<function,Body>,constraint:Constraint)->Constraint{
     let vn=dot(relative,n);
     // Project the accumulated normal impulse onto the unilateral cone.
     // Subsequent iterations can undo an excessive prior impulse.
-    var target=c.desired_speed;
+    var desired=c.desired_speed;
     var mass=c.inv_effective_mass;
     if config.material.x>0.0{
         // Solve the load-dependent rest offset implicitly. The derivative
@@ -153,13 +153,13 @@ fn solve(b:ptr<function,Body>,constraint:Constraint)->Constraint{
         let sinkage=config.material.x*c.normal_impulse/denominator;
         let raw=(c.depth-config.slop-sinkage)*0.22/config.dt;
         let bias=clamp(raw,-2.0,2.0);
-        target=select(bias,max(bias,c.bounce),c.bounce>0.0);
+        desired=select(bias,max(bias,c.bounce),c.bounce>0.0);
         if abs(raw)<2.0 && (c.bounce<=0.0 || bias>=c.bounce){
             let derivative=config.material.x*half_impulse/(denominator*denominator)*0.22/config.dt;
             mass=1.0/(1.0/c.inv_effective_mass+derivative);
         }
     }
-    let next_normal=max(0.0,c.normal_impulse+(target-vn)*mass);
+    let next_normal=max(0.0,c.normal_impulse+(desired-vn)*mass);
     apply_impulse(b,r,n*(next_normal-c.normal_impulse));
     c.normal_impulse=next_normal;
     let after=(*b).velocity.xyz+cross((*b).angular.xyz,r);
