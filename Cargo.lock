@@ -387,7 +387,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "lorax-rs"
 version = "0.1.0"
-source = "git+https://github.com/codeandsolder/lorax-rs?rev=dd2af133c259eb0eb35d58b08305365db71b209f#dd2af133c259eb0eb35d58b08305365db71b209f"
+source = "git+https://github.com/codeandsolder/lorax-rs?rev=a20e2b5058dc88524131aeb68d609e6a4194936e#a20e2b5058dc88524131aeb68d609e6a4194936e"
 
 [[package]]
 name = "naga"
