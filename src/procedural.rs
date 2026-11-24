@@ -605,6 +605,39 @@ mod module_tests {
             assert!(radius.is_finite() && *radius > 0.0);
         }
         assert!(bank.model_slot_for_seed(900, 6).is_some());
+
+        // Both forms have identical world transforms and GPU source-frame
+        // dimensions, but independently conservative projected diameters.
+        // Their visible material, impostor billboard size, canonical source
+        // metadata and handoff anchor are deliberately unchanged.
+        use crate::gpu::{GpuView, MeshLod, MeshLods, PackedInstance, VisualLod, classify_cpu};
+        let mature = PackedInstance {
+            position_radius: [0.0, 0.0, 300.0, *large],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            axis_radii: [frame.radius, frame.radius, frame.radius, 0.0],
+            object_id: [37, 0, 0, 0],
+            metadata: [900, 0, 0, 0],
+            render_model: [0; 4],
+            tint: [1.0; 4],
+            handoff_anchor_rank: [0.0, 0.0, 300.0, 0.5],
+        };
+        let shrub = PackedInstance {
+            position_radius: [0.0, 0.0, 300.0, *small],
+            render_model: [1, 0, 0, 0],
+            ..mature
+        };
+        let lods = MeshLods::new(vec![MeshLod {
+            start_m: 0.0,
+            index_count: 12,
+            prefer_mesh: false,
+        }])?
+        .with_projected_diameters(vec![0.0])?;
+        let view = GpuView::unculled(300.0, *large + *small, 0.15)?;
+        assert_eq!(classify_cpu(&mature, view, &lods), VisualLod::Mesh(0));
+        assert_eq!(classify_cpu(&shrub, view, &lods), VisualLod::Impostor);
+        assert_eq!(mature.axis_radii, shrub.axis_radii);
+        assert_eq!(mature.object_id, shrub.object_id);
+        assert_eq!(mature.handoff_anchor_rank, shrub.handoff_anchor_rank);
         Ok(())
     }
 
