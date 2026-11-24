@@ -1,10 +1,12 @@
 //! Experimental fixed-step GPU rigid-body terrain solver. This is a local
 //! chart-space sandbox, not yet a full planetary multi-body physics engine.
 mod clock;
+mod static_scene;
 use super::{
     GridProjection, Kernel, RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage,
 };
 pub use clock::{SimulationClock, StepBatch};
+pub use static_scene::{StaticScene, StaticTriangle};
 use std::io;
 use wgpu::util::DeviceExt;
 
@@ -15,7 +17,8 @@ pub const STEP_WGSL: &str = concat!(
     include_str!("projection.wgsl"),
     include_str!("physics/body.wgsl"),
     include_str!("physics/collider.wgsl"),
-    include_str!("physics/step.wgsl")
+    include_str!("physics/step.wgsl"),
+    include_str!("physics/static_scene.wgsl")
 );
 
 /// Oriented ellipsoid relative to the rigid body's center of mass.
@@ -257,6 +260,7 @@ struct StepConfig {
 /// intentionally outside this first terrain-contact solver.
 pub struct PhysicsGpu {
     pipeline: Kernel,
+    static_scene: StaticScene,
     bodies: wgpu::Buffer,
     shapes: wgpu::Buffer,
     empty_contacts: wgpu::Buffer,
@@ -346,6 +350,7 @@ impl PhysicsGpu {
         };
         Ok(Self {
             pipeline,
+            static_scene: StaticScene::new(device, &[])?,
             bodies: states,
             shapes: storage(
                 device,
@@ -390,6 +395,20 @@ impl PhysicsGpu {
     #[must_use = "Bind the exact collider data without uploading a second copy"]
     pub const fn colliders(&self) -> &wgpu::Buffer {
         &self.shapes
+    }
+
+    /// Bind a canonical static collision mesh, independent of the render cut.
+    ///
+    /// # Errors
+    /// Rejects material IDs outside the solver's material palette.
+    pub fn set_static_scene(&mut self, scene: StaticScene) -> io::Result<()> {
+        if u64::from(scene.max_material)
+            >= self.materials.size() / std::mem::size_of::<ContactMaterial>() as u64
+        {
+            return Err(invalid("static scene material outside contact palette"));
+        }
+        self.static_scene = scene;
+        Ok(())
     }
 
     /// Encode a fixed-step batch without synchronizing with the host.
@@ -492,6 +511,8 @@ impl PhysicsGpu {
             contacts.unwrap_or(&self.empty_contacts),
             &self.materials,
             &self.material_cells,
+            &self.static_scene.nodes,
+            &self.static_scene.triangles,
         ];
         self.pipeline.encode(
             device,

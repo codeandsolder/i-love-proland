@@ -173,7 +173,9 @@ fn apply_impulse(b:ptr<function,Body>,r:vec3<f32>,impulse:vec3<f32>){
 // terrain repeatedly for precisely the same pose.
 fn prepare(b:Body,collider:Collider,shape:u32)->Constraint{
     let s=shape_pose(b,collider);
-    let contact=terrain_contact(s);
+    var contact=terrain_contact(s);
+    let obstacle=static_contact(s);
+    if obstacle.depth>contact.depth {contact=obstacle;}
     if contact.depth<=0.0{
         return Constraint(vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,vec3<f32>(0.0),0.0,0.0,shape,0.0,0u);
     }
