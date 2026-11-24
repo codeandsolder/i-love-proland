@@ -34,9 +34,9 @@ fn read_state(
     queue.submit([commands.finish()]);
     let mut pending = snapshot.begin();
     device.poll(wgpu::PollType::wait_indefinitely())?;
-    pending
+    Ok(pending
         .try_take()?
-        .ok_or_else(|| io::Error::other("articulated snapshot unfinished"))
+        .ok_or_else(|| io::Error::other("articulated snapshot unfinished"))?)
 }
 
 fn suspension(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) -> Result<()> {
