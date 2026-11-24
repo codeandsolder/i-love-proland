@@ -69,8 +69,11 @@ impl Leaflet {
 
     #[expect(
         clippy::cast_possible_truncation,
+        reason = "pixel bounds are explicitly rounded and clamped to the finite card extent"
+    )]
+    #[expect(
         clippy::cast_sign_loss,
-        reason = "pixel bounds are explicitly clamped to the finite card extent"
+        reason = "pixel bounds are clamped to nonnegative coordinates"
     )]
     fn composite(&self, texels: &mut [[f32; 2]]) {
         let half = f32::from(SIDE) * 0.5;
