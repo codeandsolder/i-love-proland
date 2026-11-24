@@ -25,8 +25,11 @@ fn smooth(t: f32) -> f32 {
 
 #[expect(
     clippy::cast_possible_truncation,
+    reason = "bounded card UVs are sampled on a small finite noise lattice"
+)]
+#[expect(
     clippy::cast_sign_loss,
-    reason = "positive bounded card UVs are sampled on a small finite noise lattice"
+    reason = "card UVs and lattice frequencies are nonnegative"
 )]
 fn noise(uv: [f32; 2], frequency: f32) -> f32 {
     let [x, y] = uv.map(|v| v * frequency);
@@ -61,7 +64,12 @@ fn coverage_and_shading(uv: [f32; 2]) -> (f32, f32) {
     // Source-local ambient occlusion and crown-top illumination; the
     // irregular mottling is in linear light and is stable under motion.
     let center = radius.mul_add(-radius, 1.0).max(0.0).sqrt();
-    let light = (0.24 * center + 0.10 * y + 0.20 * coarse + 0.15 * fine + 0.43).clamp(0.0, 1.0);
+    let light = 0.24_f32
+        .mul_add(
+            center,
+            0.10_f32.mul_add(y, 0.20_f32.mul_add(coarse, 0.15_f32.mul_add(fine, 0.43))),
+        )
+        .clamp(0.0, 1.0);
     (envelope * gaps, light)
 }
 
