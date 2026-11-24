@@ -11,7 +11,7 @@ use std::{io, time::Instant};
 
 const HZ: u32 = 240;
 
-fn body(position: [f32; 3], velocity: [f32; 3], restitution: f32) -> RigidBody {
+const fn body(position: [f32; 3], velocity: [f32; 3], restitution: f32) -> RigidBody {
     RigidBody {
         position: [position[0], position[1], position[2], 1.0],
         rotation: [0.0, 0.0, 0.0, 1.0],
@@ -23,7 +23,7 @@ fn body(position: [f32; 3], velocity: [f32; 3], restitution: f32) -> RigidBody {
     }
 }
 
-fn config(gravity: f32) -> PhysicsConfig<'static> {
+const fn config(gravity: f32) -> PhysicsConfig<'static> {
     PhysicsConfig {
         initial_tick: 0,
         hz: HZ,
@@ -101,20 +101,20 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) -> 
         bounced[0].velocity[0] < -6.3 && bounced[0].position[0] < 35.5,
         "{bounced:?}"
     );
-    assert!(bounced[0].completed_tick() == 180);
+    assert_eq!(bounced[0].completed_tick(), 180);
     println!("GPU_MARBLES static wall velocity={:?}", bounced[0].velocity);
 
     let initial = (0..50_u16)
         .map(|i| {
             body(
                 [
-                    24.0 + f32::from(i % 5) * 1.15,
-                    20.0 + f32::from((i / 5) % 5) * 1.15,
-                    104.0 + f32::from(i / 25) * 1.15,
+                    f32::from(i % 5).mul_add(1.15, 24.0),
+                    f32::from((i / 5) % 5).mul_add(1.15, 20.0),
+                    f32::from(i / 25).mul_add(1.15, 104.0),
                 ],
                 [
-                    4.0 + f32::from(i % 3) * 0.25,
-                    0.2 * f32::from(i % 7) - 0.6,
+                    f32::from(i % 3).mul_add(0.25, 4.0),
+                    0.2_f32.mul_add(f32::from(i % 7), -0.6),
                     0.0,
                 ],
                 0.65,
