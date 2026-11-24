@@ -7,6 +7,7 @@ struct Config {
     spacing:f32, dt:f32, gravity:f32, slop:f32,
     iterations:u32, stop_at_contact:u32, record_contacts:u32, contact_stride:u32,
     projection:GridProjection,
+    first_tick_low:u32, pad0:u32, pad1:u32, pad2:u32,
 }
 struct Contact { normal:vec3<f32>, depth:f32, point:vec3<f32>, material:u32 }
 struct Constraint {
@@ -36,17 +37,6 @@ fn cell_material(x:u32,y:u32)->u32{
     return material_cells[y*(config.side-1u)+x];
 }
 
-fn quat_rotate(q:vec4<f32>,v:vec3<f32>)->vec3<f32>{
-    let t=2.0*cross(q.xyz,v);
-    return v+q.w*t+cross(q.xyz,t);
-}
-fn quat_mul(a:vec4<f32>,b:vec4<f32>)->vec4<f32>{
-    return vec4<f32>(a.w*b.xyz+b.w*a.xyz+cross(a.xyz,b.xyz),a.w*b.w-dot(a.xyz,b.xyz));
-}
-fn inverse_world_inertia(b:Body,v:vec3<f32>)->vec3<f32>{
-    let inverse=vec4<f32>(-b.rotation.xyz,b.rotation.w);
-    return quat_rotate(b.rotation,quat_rotate(inverse,v)*b.inverse_inertia.xyz);
-}
 fn vertex(x:u32,y:u32)->vec3<f32>{
     let i=config.slot*config.side*config.side+y*config.side+x;
     return grid_position(config.projection,vec2<u32>(x,y),terrain[i].bed);
@@ -294,7 +284,8 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
         if config.record_contacts!=0u{
             for(var j=0u;j<count;j+=1u){
                 let c=constraints[j];
-                let index=(tick*config.count+id.x)*config.contact_stride+c.shape;
+                let batch_tick=b.clock.x-config.first_tick_low-1u;
+                let index=(batch_tick*config.count+id.x)*config.contact_stride+c.shape;
                 contact_events[index]=ContactEvent(vec4<f32>(c.point,c.normal_impulse/config.dt),
                     vec4<f32>(c.normal,c.depth),b.rotation,vec4<f32>(c.incident_slip,c.area),
                     vec4<u32>(b.clock.xy,b.metadata.x+c.shape,select(0u,c.material+1u,c.normal_impulse>0.0)));

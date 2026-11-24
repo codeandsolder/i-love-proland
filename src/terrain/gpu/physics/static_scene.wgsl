@@ -4,7 +4,7 @@ struct StaticNode {
     upper:vec3<f32>, count:u32,
     escape:u32, pad0:u32, pad1:u32, pad2:u32,
 }
-struct StaticTriangle { a:vec4<f32>, b:vec4<f32>, c:vec4<f32> }
+struct StaticTriangle { a:vec3<f32>, material:u32, b:vec4<f32>, c:vec4<f32> }
 @group(0) @binding(7) var<storage,read> static_nodes:array<StaticNode>;
 @group(0) @binding(8) var<storage,read> static_triangles:array<StaticTriangle>;
 
@@ -41,7 +41,7 @@ fn static_contact(s:ShapePose)->Contact {
             let support=world_point(s,point);
             let depth=support_height(s,normal)-dot(s.center-support,normal);
             if depth>best.depth {
-                best=Contact(normal,depth,support,bitcast<u32>(tri.a.w));
+                best=Contact(normal,depth,support,tri.material);
             }
         }
         i=node.escape;

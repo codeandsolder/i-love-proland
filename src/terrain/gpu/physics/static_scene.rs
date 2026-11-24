@@ -16,7 +16,8 @@ pub struct StaticTriangle {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Triangle {
-    a: [f32; 4],
+    a: [f32; 3],
+    material: u32,
     b: [f32; 4],
     c: [f32; 4],
 }
@@ -25,7 +26,8 @@ impl Triangle {
     fn new(t: StaticTriangle) -> Self {
         let [a, b, c] = t.vertices;
         Self {
-            a: [a[0], a[1], a[2], f32::from_bits(t.material)],
+            a,
+            material: t.material,
             b: [b[0], b[1], b[2], 0.0],
             c: [c[0], c[1], c[2], 0.0],
         }
