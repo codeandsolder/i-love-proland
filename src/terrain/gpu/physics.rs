@@ -135,10 +135,6 @@ impl ContactEvent {
     }
 }
 
-/// Body-major within each integrated tick; each body has a fixed stride
-/// of 64 collider slots, including explicit gaps. Readback is opt-in.
-pub const CONTACTS_PER_BODY: u32 = 64;
-
 /// Bounded integration configuration, independent of render cadence.
 #[derive(Clone, Copy, Debug)]
 pub struct PhysicsConfig {
@@ -166,7 +162,7 @@ struct StepConfig {
     iterations: u32,
     stop_at_contact: u32,
     record_contacts: u32,
-    padding: u32,
+    contact_stride: u32,
     material: ContactMaterial,
     material_padding: [u32; 2],
     projection: GridProjection,
@@ -260,7 +256,11 @@ impl PhysicsGpu {
             iterations: config.solver_iterations,
             stop_at_contact: u32::from(config.stop_at_contact),
             record_contacts: 0,
-            padding: 0,
+            contact_stride: bodies
+                .iter()
+                .map(|body| body.metadata[1])
+                .max()
+                .unwrap_or(1),
             material: config.material,
             material_padding: [0; 2],
             projection: terrain.grid_projection(slot)?,
@@ -328,6 +328,13 @@ impl PhysicsGpu {
         self.encode_batch(device, encoder, terrain, batch, None)
     }
 
+    /// Number of collider entries per body per integrated tick in the
+    /// optional observation buffer. Unused entries are explicit gaps.
+    #[must_use]
+    pub const fn contact_stride(&self) -> u32 {
+        self.params.contact_stride
+    }
+
     /// Record a bounded batch of authoritative contact observations.
     /// This does not change integration or require synchronizing every tick.
     ///
@@ -342,7 +349,7 @@ impl PhysicsGpu {
     ) -> io::Result<RecordedReadback<ContactEvent>> {
         let size = u64::from(batch.steps)
             .checked_mul(u64::from(self.params.count))
-            .and_then(|v| v.checked_mul(u64::from(CONTACTS_PER_BODY)))
+            .and_then(|v| v.checked_mul(u64::from(self.params.contact_stride)))
             .and_then(|v| v.checked_mul(std::mem::size_of::<ContactEvent>() as u64))
             .ok_or_else(|| invalid("contact telemetry size overflow"))?;
         if size == 0

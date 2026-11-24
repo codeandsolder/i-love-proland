@@ -252,6 +252,90 @@ fn check_prediction(
     Ok(())
 }
 
+// Real solver regression: same initial state and fixed triangles, with
+// rigid and compliant material; logged support/force must match equilibrium.
+fn check_compliance(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    terrain: &TerrainGpu,
+) -> Result<()> {
+    let sphere = [Sphere {
+        center: [0.0; 3],
+        radius: 0.5,
+    }];
+    let mut initial = body([32.0, 32.0, 103.0], [0.0; 3], 1);
+    initial.position[3] = 0.001; // 1000 kg
+    initial.inverse_inertia = [0.01, 0.01, 0.01, 0.0];
+    let material = ContactMaterial {
+        max_sinkage_m: 0.06,
+        half_sinkage_pressure_pa: 35_000.0,
+    };
+    let (rigid, _) = simulate(device, queue, terrain, &[initial], &sphere, 64)?;
+    let mut physics = PhysicsGpu::new(
+        device,
+        terrain,
+        0,
+        PhysicsConfig { material, ..CONFIG },
+        &[initial],
+        &sphere,
+    )?;
+    let mut commands = encoder(device);
+    physics.encode(
+        device,
+        &mut commands,
+        terrain,
+        StepBatch {
+            start_tick: 0,
+            steps: 1024,
+            hz: CONFIG.hz,
+        },
+    )?;
+    let events = physics.encode_contacts(
+        device,
+        &mut commands,
+        terrain,
+        StepBatch {
+            start_tick: 1024,
+            steps: 416,
+            hz: CONFIG.hz,
+        },
+    )?;
+    let state = physics.snapshot(device, &mut commands);
+    queue.submit([commands.finish()]);
+    let mut events = events.begin();
+    let mut state = state.begin();
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let events = events
+        .try_take()?
+        .ok_or_else(|| io::Error::other("contact observations unfinished"))?;
+    let state = state
+        .try_take()?
+        .ok_or_else(|| io::Error::other("compliant state unfinished"))?;
+    assert_eq!(events.len(), 416);
+    let last = events
+        .last()
+        .ok_or_else(|| io::Error::other("no final contact"))?;
+    assert_eq!(last.metadata[3], 1);
+    assert_eq!(last.tick(), 1440);
+    let force = last.position_force[3];
+    let area = last.slip_area[3];
+    let depth = last.normal_depth[3];
+    let expected = CONFIG.contact_slop_m
+        + material.max_sinkage_m * force / (force + material.half_sinkage_pressure_pa * area);
+    let actual = rigid[0].position[2] - state[0].position[2];
+    println!(
+        "GPU_COMPLIANT_CONTACT rigid_z={:.6} compliant_z={:.6} delta={actual:.6} force_n={force:.3} area_m2={area:.6} depth_m={depth:.6} predicted_m={expected:.6} events={}",
+        rigid[0].position[2],
+        state[0].position[2],
+        events.len()
+    );
+    assert!(actual > 0.005 && actual < material.max_sinkage_m + 0.005);
+    assert!((force - 9810.0).abs() < 100.0);
+    assert!((depth - expected).abs() < 0.002);
+    assert!(state[0].velocity[..3].iter().all(|v| v.abs() < 0.1));
+    Ok(())
+}
+
 pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = slope_region(0.0)?;
     let mut terrain = TerrainGpu::new(device, &region, 65, 1)?;
@@ -267,6 +351,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     )?;
     queue.submit([commands.finish()]);
     check_presentation(device, queue, &terrain)?;
+    check_compliance(device, queue, &terrain)?;
     let sphere = [Sphere {
         center: [0.0; 3],
         radius: 0.5,

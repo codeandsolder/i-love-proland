@@ -5,7 +5,7 @@
 struct Config {
     side:u32, slot:u32, count:u32, steps:u32,
     spacing:f32, dt:f32, gravity:f32, slop:f32,
-    iterations:u32, stop_at_contact:u32, record_contacts:u32, padding:u32,
+    iterations:u32, stop_at_contact:u32, record_contacts:u32, contact_stride:u32,
     material:vec4<f32>,
     projection:GridProjection,
 }
@@ -230,10 +230,10 @@ fn advance(@builtin(global_invocation_id) id:vec3<u32>){
                 let c=constraints[j];
                 let velocity=b.velocity.xyz+cross(b.angular.xyz,c.arm);
                 let slip=velocity-c.normal*dot(velocity,c.normal);
-                let index=(tick*config.count+id.x)*64u+c.shape;
+                let index=(tick*config.count+id.x)*config.contact_stride+c.shape;
                 contact_events[index]=ContactEvent(vec4<f32>(c.point,c.normal_impulse/config.dt),
                     vec4<f32>(c.normal,c.depth),b.rotation,vec4<f32>(slip,c.area),
-                    vec4<u32>(b.clock.xy,b.metadata.x+c.shape,1u));
+                    vec4<u32>(b.clock.xy,b.metadata.x+c.shape,u32(c.normal_impulse>0.0)));
             }
         }
         if count>0u && b.metadata.w==0u {
