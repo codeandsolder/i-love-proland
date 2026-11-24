@@ -350,6 +350,51 @@ fn check_compliance(
     Ok((actual, area))
 }
 
+fn check_ellipsoid_compliance(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    terrain: &TerrainGpu,
+) -> Result<()> {
+    let (sphere_sinkage, _) = check_compliance(
+        device,
+        queue,
+        terrain,
+        Collider::sphere([0.0; 3], 0.5),
+        [0.5; 3],
+        0.5,
+    )?;
+    let axes = [0.9, 0.6, 0.2];
+    let (wide_sinkage, wide_area) = check_compliance(
+        device,
+        queue,
+        terrain,
+        Collider::ellipsoid([0.0; 3], axes, [0.0, 0.0, 0.0, 1.0]),
+        axes,
+        0.2,
+    )?;
+    let axes = [0.5, 0.5, 0.13];
+    let rotation = [
+        std::f32::consts::FRAC_1_SQRT_2,
+        0.0,
+        0.0,
+        std::f32::consts::FRAC_1_SQRT_2,
+    ];
+    let (wheel_sinkage, wheel_area) = check_compliance(
+        device,
+        queue,
+        terrain,
+        Collider::ellipsoid([0.0; 3], axes, rotation),
+        axes,
+        0.5,
+    )?;
+    assert!(wide_sinkage < sphere_sinkage && sphere_sinkage < wheel_sinkage);
+    assert!(wide_area > wheel_area);
+    println!(
+        "GPU_ELLIPSOID_COMPLIANCE wide_sinkage_m={wide_sinkage:.6} wheel_sinkage_m={wheel_sinkage:.6} wide_area_m2={wide_area:.6} wheel_area_m2={wheel_area:.6}"
+    );
+    Ok(())
+}
+
 pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let region = slope_region(0.0)?;
     let mut terrain = TerrainGpu::new(device, &region, 65, 1)?;
@@ -365,43 +410,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     )?;
     queue.submit([commands.finish()]);
     check_presentation(device, queue, &terrain)?;
-    let (sphere_sinkage, _) = check_compliance(
-        device,
-        queue,
-        &terrain,
-        Collider::sphere([0.0; 3], 0.5),
-        [0.5; 3],
-        0.5,
-    )?;
-    let axes = [0.9, 0.6, 0.2];
-    let (wide_sinkage, wide_area) = check_compliance(
-        device,
-        queue,
-        &terrain,
-        Collider::ellipsoid([0.0; 3], axes, [0.0, 0.0, 0.0, 1.0]),
-        axes,
-        0.2,
-    )?;
-    let axes = [0.5, 0.5, 0.13];
-    let rotation = [
-        std::f32::consts::FRAC_1_SQRT_2,
-        0.0,
-        0.0,
-        std::f32::consts::FRAC_1_SQRT_2,
-    ];
-    let (wheel_sinkage, wheel_area) = check_compliance(
-        device,
-        queue,
-        &terrain,
-        Collider::ellipsoid([0.0; 3], axes, rotation),
-        axes,
-        0.5,
-    )?;
-    assert!(wide_sinkage < sphere_sinkage && sphere_sinkage < wheel_sinkage);
-    assert!(wide_area > wheel_area);
-    println!(
-        "GPU_ELLIPSOID_COMPLIANCE wide_sinkage_m={wide_sinkage:.6} wheel_sinkage_m={wheel_sinkage:.6} wide_area_m2={wide_area:.6} wheel_area_m2={wheel_area:.6}"
-    );
+    check_ellipsoid_compliance(device, queue, &terrain)?;
     let sphere = [Collider::sphere([0.0; 3], 0.5)];
     let initial = [body([32.0, 32.0, 103.0], [0.0; 3], 1)];
     let (a, _) = simulate(device, queue, &terrain, &initial, &sphere, 64)?;
