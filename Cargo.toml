@@ -36,3 +36,7 @@ required-features = ["gpu"]
 [[example]]
 name = "foliage_lab"
 required-features = ["gpu"]
+
+[[example]]
+name = "gpu_terrain"
+required-features = ["gpu"]
