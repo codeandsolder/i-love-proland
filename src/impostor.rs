@@ -315,25 +315,76 @@ impl AtlasImage {
         &self.rgba
     }
 
-    /// Upload each angular view as an independent, coverage-filtered
-    /// texture-array layer. The disk/CPU atlas retains its original layout.
+    /// Upload the ordinary single-source angular atlas. Authored trees use
+    /// the same view at all object IDs; no local seed catalogue is needed.
     ///
     /// # Errors
-    /// Rejects dimensions unsupported by the selected device.
+    /// Rejects a device that cannot hold all angular views.
     pub fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<AtlasTexture> {
+        Self::upload_layers(device, queue, &[self], None)
+    }
+
+    /// Upload one independently baked angular atlas per dense visual form.
+    /// The sequence and canonical IDs must agree with the procedural module
+    /// bank. Repeated canonical IDs are valid for different visual seeds.
+    ///
+    /// # Errors
+    /// Rejects empty or mismatched atlas dimensions, insufficient GPU texture
+    /// layers, or texture-array and byte-count overflows.
+    pub fn upload_variants(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        variants: &[(u64, &Self)],
+    ) -> Result<AtlasTexture> {
+        if variants.is_empty() {
+            return Err(Error::InvalidConfiguration("empty impostor variant atlas"));
+        }
+        let images = variants.iter().map(|(_, image)| *image).collect::<Vec<_>>();
+        let ids = variants.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        Self::upload_layers(device, queue, &images, Some(ids))
+    }
+
+    fn upload_layers(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        images: &[&Self],
+        variant_ids: Option<Vec<u64>>,
+    ) -> Result<AtlasTexture> {
+        let first = images
+            .first()
+            .ok_or(Error::InvalidConfiguration("empty impostor atlas source"))?;
         let limits = device.limits();
-        let side = self.tile_size - 2 * self.gutter;
-        let layers = AZIMUTH_VIEWS * ELEVATION_VIEWS;
-        if side > limits.max_texture_dimension_2d || layers > limits.max_texture_array_layers {
+        let side = first.tile_size - 2 * first.gutter;
+        let layers_per_model = AZIMUTH_VIEWS * ELEVATION_VIEWS;
+        let models = u32::try_from(images.len()).map_err(|_| Error::IndexOverflow)?;
+        let layers = models
+            .checked_mul(layers_per_model)
+            .ok_or(Error::IndexOverflow)?;
+        if images
+            .iter()
+            .any(|image| image.tile_size != first.tile_size || image.gutter != first.gutter)
+            || side > limits.max_texture_dimension_2d
+            || layers > limits.max_texture_array_layers
+        {
             return Err(Error::InvalidConfiguration(
-                "impostor view array exceeds GPU texture limit",
+                "impostor variant atlas shape or GPU texture limit mismatch",
             ));
         }
-        let (mip_level_count, data) = self.isolated_mips();
+        let mut data = Vec::new();
+        let mut mip_level_count = 0;
+        for image in images {
+            let (levels, bytes) = image.isolated_mips();
+            if mip_level_count == 0 {
+                mip_level_count = levels;
+            }
+            data.try_reserve(bytes.len())
+                .map_err(|_| Error::IndexOverflow)?;
+            data.extend_from_slice(&bytes);
+        }
         let texture = device.create_texture_with_data(
             queue,
             &wgpu::TextureDescriptor {
-                label: Some("i-love-proland independently filtered angular views"),
+                label: Some("i-love-proland per-variant filtered angular foliage views"),
                 size: wgpu::Extent3d {
                     width: side,
                     height: side,
@@ -356,6 +407,7 @@ impl AtlasImage {
         Ok(AtlasTexture {
             _texture: texture,
             view,
+            variant_ids,
         })
     }
 
@@ -442,6 +494,7 @@ fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &m
 pub struct AtlasTexture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
+    variant_ids: Option<Vec<u64>>,
 }
 
 /// Explicit camera-relative projection. The application owns view rotation.
@@ -1164,6 +1217,14 @@ impl TreeRenderer {
                     None => module_variant_ids = Some(modules.variant_ids().to_vec()),
                 }
             }
+        }
+        if module_variant_ids
+            .as_deref()
+            .is_some_and(|catalog| atlas.variant_ids.as_deref() != Some(catalog))
+        {
+            return Err(Error::InvalidConfiguration(
+                "module geometry requires per-form angular atlases in canonical slot order",
+            ));
         }
         let impostor_bin = compactor
             .bin(compactor.mesh_lods().impostor_bin())

@@ -136,6 +136,7 @@ struct ImpostorOutput {
     @location(1) view_indices: vec4<f32>, // azimuth0, azimuth1, elevation0, elevation1
     @location(2) blend: vec2<f32>,
     @location(3) tint: vec4<f32>,
+    @location(4) @interpolate(flat) atlas_base: u32,
 }
 
 @vertex
@@ -187,11 +188,12 @@ fn impostor_vs(
     // Tiny deterministic visual variation without redefining the world ID.
     let variation = 0.90 + object.axis_radii.w * 0.10;
     out.tint = vec4<f32>(object.tint.rgb * variation, object.tint.a);
+    out.atlas_base = object.render_model.x * 32u;
     return out;
 }
 
-fn atlas_sample(tile: vec2<f32>, uv: vec2<f32>) -> vec4<f32> {
-    let layer = i32(tile.y * AZIMUTH_VIEWS + tile.x);
+fn atlas_sample(tile: vec2<f32>, uv: vec2<f32>, model_base: u32) -> vec4<f32> {
+    let layer = i32(model_base + u32(tile.y * AZIMUTH_VIEWS + tile.x));
     return textureSample(atlas_texture, atlas_sampler, uv, layer);
 }
 
@@ -202,13 +204,13 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
     let e0 = input.view_indices.z;
     let e1 = input.view_indices.w;
     let lower = mix(
-        atlas_sample(vec2<f32>(a0, e0), input.uv),
-        atlas_sample(vec2<f32>(a1, e0), input.uv),
+        atlas_sample(vec2<f32>(a0, e0), input.uv, input.atlas_base),
+        atlas_sample(vec2<f32>(a1, e0), input.uv, input.atlas_base),
         input.blend.x
     );
     let upper = mix(
-        atlas_sample(vec2<f32>(a0, e1), input.uv),
-        atlas_sample(vec2<f32>(a1, e1), input.uv),
+        atlas_sample(vec2<f32>(a0, e1), input.uv, input.atlas_base),
+        atlas_sample(vec2<f32>(a1, e1), input.uv, input.atlas_base),
         input.blend.x
     );
     let color = mix(lower, upper, input.blend.y);

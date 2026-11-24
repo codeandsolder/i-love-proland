@@ -28,6 +28,8 @@ pub mod impostor;
 #[cfg(feature = "gpu")]
 pub mod material;
 #[cfg(feature = "gpu")]
+mod module_bake;
+#[cfg(feature = "gpu")]
 pub mod procedural;
 #[cfg(feature = "gpu")]
 pub mod wind;
