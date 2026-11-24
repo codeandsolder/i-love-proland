@@ -272,6 +272,38 @@ impl Region {
         })
     }
 
+    /// Macro controls only, without channel profiles or procedural noise.
+    /// This is for conservative host queries and temporary coarse geometry;
+    /// the GPU field defines the actual refined physical surface.
+    #[must_use = "Use the coarse controls for host-side sampling"]
+    pub fn coarse_sample(&self, direction: [f64; 3]) -> Option<RegionSample> {
+        let point = self.chart.project(direction)?;
+        let interpolation = self.interpolation(point)?;
+        let height = interpolation.sample(|cell| f64::from(cell.height) * QUANTUM);
+        let water = interpolation.sample(|cell| {
+            let ground = f64::from(cell.height) * QUANTUM;
+            if cell.lake == NO_LAKE {
+                ground.max(0.0)
+            } else {
+                ground.max(f64::from(cell.lake) * QUANTUM)
+            }
+        });
+        let wet = water > height + 0.02;
+        Some(RegionSample {
+            weather: Weathered {
+                bed: height,
+                water: wet.then_some(water),
+                depth: if wet { water - height } else { 0.0 },
+                ..Weathered::default()
+            },
+            water_kind: wet.then_some(WaterKind::Standing),
+            rgb: std::array::from_fn(|i| {
+                interpolation.sample(|cell| f64::from(cell.rgb[i]) / 255.0)
+            }),
+            weight: self.blend_weight(point)?,
+        })
+    }
+
     /// Coarse chart blending weight, independent of procedural refinement.
     #[must_use = "Use the chart weight before requesting regional refinement"]
     pub fn blend_weight(&self, point: [f64; 2]) -> Option<f64> {
