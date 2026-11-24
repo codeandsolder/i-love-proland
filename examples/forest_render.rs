@@ -996,7 +996,17 @@ fn module_grove_candidates(
         let slot = bank
             .model_slot_for_seed(object.variant_id(), grove_seed)
             .ok_or("missing visual source variant slot")?;
-        selected.push(object.with_render_model(slot));
+        let radius = *bank
+            .variant_culling_radii
+            .get(usize::try_from(slot)?)
+            .ok_or("missing per-form source bound")?;
+        let scale = radius / bank.source_frame.radius;
+        let mut candidate = object.with_render_model(slot);
+        candidate.position_radius[3] *= scale;
+        if !candidate.position_radius[3].is_finite() || candidate.position_radius[3] <= 0.0 {
+            return Err("unrepresentable per-form physical radius".into());
+        }
+        selected.push(candidate);
     }
     Ok(selected)
 }

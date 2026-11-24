@@ -32,7 +32,11 @@ scatter system or an automatic replacement for the current KSP assets.
   from canonical metadata variant_id** and 128-bit stable object ID. Assign
   it with PackedInstance::with_render_model. TreeRenderer validates all
   full-batch and sparse-patch slots against the canonical variant catalog.
-  The packed instance ABI is now 128 bytes, up from 112.
+  The packed instance ABI is now 128 bytes, up from 112. Each selected
+  visual form must apply its own conservative physical culling/LOD radius
+  from the compiled bank; this changes neither the atlas billboard size
+  (derived from the invariant axis radii), nor the original object pose.
+  The headless \`forest_render\` smoke verifies the per-form bounds path.
 - TreeMaterial contains TreeGeometry::Mesh or TreeGeometry::Modules. This is
   an intentional API change, not a compatibility wrapper. Normal source
   materials continue to draw exactly as before; the module variant uses its
