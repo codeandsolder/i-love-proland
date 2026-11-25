@@ -52,12 +52,18 @@ fn prequalify(@builtin(global_invocation_id) id:vec3<u32>){
     candidates[slot]=i;
 }
 
+fn scan_pair(pair:Pair,lane:u32)->Contact{
+    return scan(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],config.margin,lane);
+}
+fn contain_pair(pair:Pair,lane:u32)->Contact{
+    return containment(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],lane);
+}
 fn query_pair(i:u32,lane:u32){
     let pair=pairs[i];
-    let local=scan(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],config.margin,lane);
+    let local=scan_pair(pair,lane);
     var result=orient_contact(pair.meshes,reduce_contact(local,lane));
     if (config.mode&4u)!=0u && result.features.z==0u && result.features.w==0u {
-        let inside=reduce_contact(containment(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],lane),lane);
+        let inside=reduce_contact(contain_pair(pair,lane),lane);
         result.features.w=inside.features.w;
         result.statistics.w=inside.statistics.w;
     }
@@ -70,4 +76,31 @@ fn query(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index)
 @compute @workgroup_size(64)
 fn query_compact(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) lane:u32){
     query_pair(candidates[group.x],lane);
+}
+
+// Independent pair groups share the physical workgroup. The tail lanes
+// contribute empty records; no partial workgroup skips a barrier.
+@compute @workgroup_size(64)
+fn query_packed(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) lane:u32){
+    let i=group.x*(64u/LANES)+lane/LANES;
+    let sublane=lane&(LANES-1u);
+    let live=i<config.count;
+    var pair:Pair;
+    var local=empty();
+    if live{
+        pair=pairs[i];
+        local=scan_pair(pair,sublane);
+    }
+    var result=reduce_packed(local,lane);
+    if live{result=orient_contact(pair.meshes,result);}
+    if (config.mode&4u)!=0u{
+        var inside=empty();
+        if live&&result.features.z==0u&&result.features.w==0u{
+            inside=contain_pair(pair,sublane);
+        }
+        inside=reduce_packed(inside,lane);
+        result.features.w|=inside.features.w;
+        result.statistics.w+=inside.statistics.w;
+    }
+    if live&&sublane==0u{contacts[i]=result;}
 }

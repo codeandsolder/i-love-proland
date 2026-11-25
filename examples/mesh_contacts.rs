@@ -9,8 +9,14 @@ mod envelope;
 mod impact;
 #[path = "mesh_contacts/order.rs"]
 mod order;
+#[path = "mesh_contacts/packed.rs"]
+mod packed;
+#[path = "mesh_contacts/planes.rs"]
+mod planes;
 #[path = "mesh_contacts/sweep.rs"]
 mod sweep;
+#[path = "mesh_contacts/timing.rs"]
+mod timing;
 use i_love_proland::terrain::gpu::mesh_contacts::{
     CandidateDispatch, Domain, MeshCatalog, MeshContact, MeshPair, MeshQueries, MeshSource,
     Midphase, QuerySettings,
@@ -196,6 +202,8 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     compact::check(device, queue, &geometry)?;
     envelope::check(device, queue, &geometry)?;
     order::check(device, queue, &geometry)?;
+    planes::check(device, queue, &geometry)?;
+    packed::check(device, queue, &geometry)?;
     let catalog = MeshCatalog::new(
         device,
         &geometry.iter().map(Geometry::source).collect::<Vec<_>>(),
@@ -355,7 +363,8 @@ fn main() -> Result<()> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(descriptor);
-    let adapter = if let Some(name) = std::env::args().nth(1) {
+    let packed_only = std::env::args().any(|arg| arg == "--packed-only");
+    let adapter = if let Some(name) = std::env::args().skip(1).find(|arg| arg != "--packed-only") {
         pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
             .into_iter()
             .find(|adapter| adapter.get_info().name.contains(&name))
@@ -364,7 +373,20 @@ fn main() -> Result<()> {
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?
     };
     println!("MESH_GPU adapter={}", adapter.get_info().name);
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
-    check(&device, &queue)
+    let optional =
+        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    let required_features = if adapter.features().contains(optional) {
+        optional
+    } else {
+        wgpu::Features::empty()
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features,
+        ..Default::default()
+    }))?;
+    if packed_only {
+        packed::check(&device, &queue, &geometry()?)
+    } else {
+        check(&device, &queue)
+    }
 }

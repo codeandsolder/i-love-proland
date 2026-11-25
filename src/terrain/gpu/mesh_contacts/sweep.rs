@@ -133,6 +133,7 @@ impl MeshCatalog {
             bind,
             output,
             count,
+            groups: count,
             kernel: Arc::clone(kernel),
             marker: PhantomData,
             label: "mesh continuous candidate search",
