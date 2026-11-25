@@ -168,11 +168,7 @@ struct QueryFrame {
 }
 struct Bounds { lo:vec3<f32>, hi:vec3<f32> }
 fn node_bounds(n:Node,f:QueryFrame)->Bounds{
-    let center=(n.lo+n.hi)*0.5;
-    let half=(n.hi-n.lo)*0.5;
-    let c=f.local_linear*center+f.local_offset;
-    let r=abs(f.local_linear[0])*half.x+abs(f.local_linear[1])*half.y+abs(f.local_linear[2])*half.z+f.padding;
-    return Bounds(c-r,c+r);
+    return box_bounds(n.lo,n.hi,f);
 }
 fn tri_bounds(t:Triangle,f:QueryFrame)->Bounds{
     let local=transformed(t,f.local_linear,f.local_offset);
@@ -280,8 +276,7 @@ fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     }
     return result;
 }
-fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
-    var result=empty();
+fn query_frame(a:mat4x4<f32>,b:mat4x4<f32>,root_a:Node,margin:f32)->QueryFrame{
     let la=linear(a);
     let lb=linear(b);
     let r0=cross(lb[1],lb[2]);
@@ -294,15 +289,6 @@ fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u
     let pad=margin*row_norm;
     let local_linear=inverse*la;
     let local_offset=inverse*relative;
-    let mesh_a=meshes[mesh_ids.x];
-    let mesh_b=meshes[mesh_ids.y];
-    // Reject entire transformed A root before walking any triangles.
-    let root_a=nodes[mesh_a.nodes.x];
-    let root_b=nodes[mesh_b.nodes.x];
-    let center=(root_a.lo+root_a.hi)*0.5;
-    let half=(root_a.hi-root_a.lo)*0.5;
-    let transformed_center=local_linear*center+local_offset;
-    let transformed_half=abs(local_linear[0])*half.x+abs(local_linear[1])*half.y+abs(local_linear[2])*half.z;
     // Bound roundoff of both the relative transform and inverse. For
     // ill-conditioned transforms this increases candidates rather than
     // shrinking their conservative query envelope.
@@ -311,10 +297,24 @@ fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u
         +abs(local_linear[1])*max(abs(root_a.lo.y),abs(root_a.hi.y))
         +abs(local_linear[2])*max(abs(root_a.lo.z),abs(root_a.hi.z));
     let error=(scale+vec3<f32>(1.0))*0.000008*max(condition,1.0);
-    if any(transformed_center+transformed_half+pad+error<root_b.lo)||any(transformed_center-transformed_half-pad-error>root_b.hi){
-        return result;
-    }
-    let frame=QueryFrame(la,lb,relative,local_linear,local_offset,pad+error,b[3].xyz,margin*margin);
+    return QueryFrame(la,lb,relative,local_linear,local_offset,pad+error,b[3].xyz,margin*margin);
+}
+fn box_bounds(lo:vec3<f32>,hi:vec3<f32>,f:QueryFrame)->Bounds{
+    let center=(lo+hi)*0.5;
+    let half=(hi-lo)*0.5;
+    let c=f.local_linear*center+f.local_offset;
+    let r=abs(f.local_linear[0])*half.x+abs(f.local_linear[1])*half.y+abs(f.local_linear[2])*half.z+f.padding;
+    return Bounds(c-r,c+r);
+}
+fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
+    let mesh_a=meshes[mesh_ids.x];
+    let mesh_b=meshes[mesh_ids.y];
+    let root_a=nodes[mesh_a.nodes.x];
+    let root_b=nodes[mesh_b.nodes.x];
+    let frame=query_frame(a,b,root_a,margin);
+    let bounds=box_bounds(root_a.lo,root_a.hi,frame);
+    if any(bounds.hi<root_b.lo)||any(bounds.lo>root_b.hi){return empty();}
+
     if DUAL{return scan_dual(mesh_a,mesh_b,frame,lane);}
     return scan_triangles(mesh_a,mesh_b,frame,lane);
 }
