@@ -1246,6 +1246,23 @@ fn placeholder_texture(device: &wgpu::Device) -> wgpu::TextureView {
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+// The primitive-index extension belongs to the complete optional
+// shader, not to the shared WGSL fragment.
+fn tree_shader(device: &wgpu::Device, triangle_ids: bool) -> wgpu::ShaderModule {
+    let source = if triangle_ids {
+        format!(
+            "enable primitive_index;\n{SHADER}\n{}",
+            include_str!("triangle_ids.wgsl.inc")
+        )
+    } else {
+        SHADER.to_owned()
+    };
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("i-love-proland mesh and 32-angle impostor shader"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    })
+}
+
 impl TreePipelines {
     /// Compile once for every compatible render-target configuration.
     ///
@@ -1294,18 +1311,7 @@ impl TreePipelines {
             ..Default::default()
         });
         let source_sampler = make_source_sampler(device);
-        let source = if triangle_ids {
-            format!(
-                "enable primitive_index;\n{SHADER}\n{}",
-                include_str!("triangle_ids.wgsl")
-            )
-        } else {
-            SHADER.to_owned()
-        };
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("i-love-proland mesh and 32-angle impostor shader"),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+        let shader = tree_shader(device, triangle_ids);
         let material_layout = render_layout(device);
         let instance_layout = instance_layout(device);
         let module_layout = module_layout(device);
@@ -1781,13 +1787,13 @@ mod tests {
     fn primitive_identity_shader_parses_and_validates_with_production_entries() {
         let source = format!(
             "enable primitive_index;\n{SHADER}\n{}",
-            include_str!("triangle_ids.wgsl")
+            include_str!("triangle_ids.wgsl.inc")
         );
-        let module =
-            naga::front::wgsl::parse_str(&source).expect("primitive-ID shader WGSL must parse");
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
+        let module = wgpu::naga::front::wgsl::parse_str(&source)
+            .expect("primitive-ID shader WGSL must parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
         )
         .validate(&module)
         .expect("production and primitive-ID shader entries must validate");
