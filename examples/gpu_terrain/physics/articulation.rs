@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    CONFIG, Collider, PhysicsConfig, PhysicsGpu, Result, RigidBody, StepBatch, TerrainGpu, body,
+    encoder, io,
+};
 use i_love_proland::terrain::gpu::physics::{
     ArticulationLayout, Island, Joint, JointDrive, JointFrame, JointKind,
 };
@@ -227,6 +230,17 @@ fn hinges(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) -> R
     assert!((states[0].angular[0] + states[1].angular[0]).abs() < 1e-4);
     assert!((angle(states[3]) - angle(states[2])).abs() < 1e-4);
     assert!((angle(states[5]) - angle(states[4]) + 2.0).abs() < 0.01);
+    reverse_hinge(device, queue, terrain, &mut physics, drive)
+}
+
+fn reverse_hinge(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    terrain: &TerrainGpu,
+    physics: &mut PhysicsGpu,
+    drive: JointDrive,
+) -> Result<()> {
+    let angle = |state: RigidBody| 2.0 * state.rotation[0].atan2(state.rotation[3]);
     let mut commands = encoder(device);
     physics.encode_joint_drive(
         device,
@@ -260,11 +274,90 @@ fn hinges(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) -> R
     Ok(())
 }
 
+// A third body hits one end of a fixed assembly. The impulse must
+// propagate into the other linked body, but overlapping colliders inside
+// the same island must never generate internal pair corrections.
+fn external_contact(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    terrain: &TerrainGpu,
+) -> Result<()> {
+    let shape = Collider::sphere([0.0; 3], 0.5);
+    let mut bodies = [
+        body([30.0, 32.0, 108.0], [0.0; 3], 1),
+        body([30.7, 32.0, 108.0], [0.0; 3], 1),
+        body([32.0, 32.0, 108.0], [-2.0, 0.0, 0.0], 1),
+    ];
+    for b in &mut bodies {
+        b.velocity[3] = 0.0;
+    }
+    let joints = [Joint {
+        bodies: [0, 1],
+        kind: JointKind::Fixed,
+        frames: [
+            JointFrame {
+                anchor: [0.7, 0.0, 0.0],
+                ..JointFrame::IDENTITY
+            },
+            JointFrame::IDENTITY,
+        ],
+        limits: None,
+        drive: JointDrive::PASSIVE,
+    }];
+    let islands = [
+        Island {
+            first_body: 0,
+            body_count: 2,
+            first_joint: 0,
+            joint_count: 1,
+        },
+        Island {
+            first_body: 2,
+            body_count: 1,
+            first_joint: 1,
+            joint_count: 0,
+        },
+    ];
+    let mut physics = PhysicsGpu::articulated(
+        device,
+        terrain,
+        0,
+        PhysicsConfig {
+            gravity_m_s2: 0.0,
+            solver_iterations: 12,
+            ..CONFIG
+        },
+        &bodies,
+        &[shape],
+        ArticulationLayout {
+            islands: &islands,
+            joints: &joints,
+        },
+    )?;
+    physics.enable_body_pairs(device)?;
+    let before = read_state(device, queue, &mut physics, terrain, 0, 24)?;
+    assert!((before[1].position[0] - before[0].position[0] - 0.7).abs() < 0.001);
+    assert!(before[0].velocity[0].abs() < 0.001 && before[1].velocity[0].abs() < 0.001);
+    let after = read_state(device, queue, &mut physics, terrain, 24, 216)?;
+    let momentum = after.iter().map(|b| b.velocity[0]).sum::<f32>();
+    assert!((momentum + 2.0).abs() < 0.001, "{after:?}");
+    assert!(after[0].velocity[0]<-0.2&&after[1].velocity[0]<-0.2,"{after:?}");
+    assert!((after[1].position[0] - after[0].position[0] - 0.7).abs() < 0.01);
+    assert!((after[1].velocity[0] - after[0].velocity[0]).abs() < 0.01);
+    println!(
+        "GPU_ARTICULATED_PAIR velocities={:?} momentum={momentum:.6} spacing={:.6}",
+        after.iter().map(|b| b.velocity[0]).collect::<Vec<_>>(),
+        after[1].position[0] - after[0].position[0]
+    );
+    Ok(())
+}
+
 pub(super) fn check(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     terrain: &TerrainGpu,
 ) -> Result<()> {
     suspension(device, queue, terrain)?;
-    hinges(device, queue, terrain)
+    hinges(device, queue, terrain)?;
+    external_contact(device, queue, terrain)
 }
