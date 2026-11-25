@@ -35,7 +35,8 @@ fn tick_origin(center: [f64; 2], limit: u32) -> [u32; 2] {
     )]
     #[expect(clippy::cast_sign_loss, reason = "clamped nonnegative coordinate")]
     let origin = center.map(|value| {
-        (value - f64::from(SPAN / SPACING) * 0.5)
+        f64::from(SPAN / SPACING)
+            .mul_add(-0.5, value)
             .floor()
             .clamp(0.0, f64::from(limit / SPACING)) as u32
             * SPACING
@@ -91,7 +92,7 @@ fn capture(
     queue.submit([commands.finish()]);
     let pending = snapshots
         .into_iter()
-        .map(|snapshot| snapshot.begin())
+        .map(i_love_proland::terrain::gpu::TerrainSnapshot::begin)
         .collect::<Vec<_>>();
     device.poll(wgpu::PollType::wait_indefinitely())?;
     pending
@@ -286,7 +287,7 @@ fn latency(
     Ok(())
 }
 
-pub(super) fn run(
+pub fn run(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     region: &Region,
