@@ -107,23 +107,28 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
             .iter()
             .all(|r| r.features[2] == 0 && r.features[3] == 0)
     );
-    let solid = catalog.queries(
-        device,
-        &buffer,
-        &pairs,
-        QuerySettings {
-            margin: 0.001,
-            mode: Midphase::VoxelBvh,
-            domain: Domain::ClosedSolid,
-            dispatch: CandidateDispatch::Direct,
-        },
-    )?;
-    let result = sample(device, queue, &solid)?;
-    assert_eq!(
-        result.iter().map(|r| r.features[3]).collect::<Vec<_>>(),
-        [4, 4, 4, 0, 4, 4],
-        "{result:?}"
-    );
+    for dispatch in [
+        CandidateDispatch::Direct,
+        CandidateDispatch::CompactEnvelope,
+    ] {
+        let solid = catalog.queries(
+            device,
+            &buffer,
+            &pairs,
+            QuerySettings {
+                margin: 0.001,
+                mode: Midphase::VoxelBvh,
+                domain: Domain::ClosedSolid,
+                dispatch,
+            },
+        )?;
+        let result = sample(device, queue, &solid)?;
+        assert_eq!(
+            result.iter().map(|r| r.features[3]).collect::<Vec<_>>(),
+            [4, 4, 4, 0, 4, 4],
+            "{result:?}"
+        );
+    }
     println!(
         "MESH_CONTAINMENT nested_both_orders=true disconnected_component=true mixed_open_closed=true separated=true"
     );

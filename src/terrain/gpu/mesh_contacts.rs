@@ -41,6 +41,7 @@ pub enum Midphase {
     VoxelBvh,
     DualBvh,
     DualVoxelBvh,
+    ClusteredVoxelBvh,
 }
 
 /// Surface-only distance or physical closed-shell containment as well.
@@ -133,7 +134,7 @@ pub struct MeshCatalog {
     triangles: wgpu::Buffer,
     meshes: wgpu::Buffer,
     count: u32,
-    kernels: [OnceLock<Arc<Kernel>>; 8],
+    kernels: [OnceLock<Arc<Kernel>>; 10],
     prefilters: [OnceLock<Arc<Kernel>>; 2],
     sweep_kernel: OnceLock<Arc<Kernel>>,
 }
@@ -176,8 +177,9 @@ impl MeshCatalog {
             Midphase::VoxelBvh => 1,
             Midphase::DualBvh => 2,
             Midphase::DualVoxelBvh => 3,
+            Midphase::ClusteredVoxelBvh => 4,
         };
-        self.kernels[mode_index + 4 * usize::from(compact)].get_or_init(|| {
+        self.kernels[mode_index + 5 * usize::from(compact)].get_or_init(|| {
             Arc::new(Kernel::specialized(
                 device,
                 "specialized mesh contact query",
@@ -189,7 +191,11 @@ impl MeshCatalog {
                 if compact { "query_compact" } else { "query" },
                 &[
                     ("DUAL", f64::from(u32::from(mode_index & 2 != 0))),
-                    ("VOXELS", f64::from(u32::from(mode_index & 1 != 0))),
+                    (
+                        "VOXELS",
+                        f64::from(u32::from(mode_index & 1 != 0 || mode_index == 4)),
+                    ),
+                    ("CLUSTERS", f64::from(u32::from(mode_index == 4))),
                 ],
             ))
         })

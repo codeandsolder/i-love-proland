@@ -1,5 +1,6 @@
 override DUAL:bool=false;
 override VOXELS:bool=true;
+override CLUSTERS:bool=false;
 struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, flags:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
@@ -204,9 +205,9 @@ fn test_triangle(ta:Triangle,wa:mat3x3<f32>,tb:Triangle,bounds:Bounds,f:QueryFra
         }
     }
 }
-fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
+fn scan_triangle_range(mesh_b:Mesh,f:QueryFrame,first:u32,end:u32,stride:u32)->Contact{
     var result=empty();
-    for(var ai=mesh_a.triangles.x+lane;ai<mesh_a.triangles.y;ai+=64u){
+    for(var ai=first;ai<end;ai+=stride){
         let ta=triangles[ai];
         let bounds=tri_bounds(ta,f);
         let wa=transformed(ta,f.la,f.relative);
@@ -223,21 +224,41 @@ fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     }
     return result;
 }
+fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
+    return scan_triangle_range(mesh_b,f,mesh_a.triangles.x+lane,mesh_a.triangles.y,64u);
+}
+// Divide the source into disjoint existing BVH subtrees. Entire
+// clusters outside the target's conservative voxel envelope are
+// discarded before reading even one source triangle.
+fn cluster_root(mesh:Mesh,lane:u32)->u32{
+    var root=mesh.nodes.x;
+    for(var depth=0u;depth<6u;depth+=1u){
+        if nodes[root].count!=0u{
+            if (lane>>depth)!=0u{return 0xffffffffu;}
+            break;
+        }
+        let left=root+1u;
+        root=select(left,nodes[left].escape,((lane>>depth)&1u)!=0u);
+    }
+    return root;
+}
+fn scan_clusters(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
+    if mesh_a.triangles.y-mesh_a.triangles.x<512u{return scan_triangles(mesh_a,mesh_b,f,lane);}
+    var result=empty();
+    let root=cluster_root(mesh_a,lane);
+    if root==0xffffffffu{return result;}
+    let cluster=nodes[root];
+    if !accepts(nodes[mesh_b.nodes.x],node_bounds(cluster,f),&result){return result;}
+    return choose(result,scan_triangle_range(mesh_b,f,cluster.first,cluster.end,1u));
+}
 // Cut A's balanced hierarchy into at most 64 disjoint subtrees. Each
 // invocation walks pairs of nodes depth-first, splitting the larger
 // remaining triangle range. The median-built tree has depth <32 even
 // for u32-sized triangle arrays; the combined stack cannot exceed 64.
 fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     var result=empty();
-    var root=mesh_a.nodes.x;
-    for(var depth=0u;depth<6u;depth+=1u){
-        if nodes[root].count!=0u{
-            if (lane>>depth)!=0u{return result;}
-            break;
-        }
-        let left=root+1u;
-        root=select(left,nodes[left].escape,((lane>>depth)&1u)!=0u);
-    }
+    let root=cluster_root(mesh_a,lane);
+    if root==0xffffffffu{return result;}
     var stack:array<vec2<u32>,64>;
     stack[0]=vec2<u32>(root,mesh_b.nodes.x);
     var top=1u;
@@ -316,6 +337,7 @@ fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u
     if any(bounds.hi<root_b.lo)||any(bounds.lo>root_b.hi){return empty();}
 
     if DUAL{return scan_dual(mesh_a,mesh_b,frame,lane);}
+    if CLUSTERS{return scan_clusters(mesh_a,mesh_b,frame,lane);}
     return scan_triangles(mesh_a,mesh_b,frame,lane);
 }
 // Use the smaller authored triangle range as the query side. Each
