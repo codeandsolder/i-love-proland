@@ -49,6 +49,8 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         body([2., 10.005, 0.], [0.; 3], [0.; 3]),
         body([0., 20., 0.], [0., 0., 1.], [0.; 3]),
         body([0., 20., 0.], [0., 0., -1.], [0.; 3]),
+        body([0., 30., 0.], [0.; 3], [0.; 3]),
+        body([2., 30.005, 0.], [0.; 3], [0.; 3]),
     ];
     let bodies = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("authoritative test rigid bodies"),
@@ -57,10 +59,16 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC,
     });
-    let instances = (0..6_u32)
+    let instances = (0..8_u32)
         .map(|i| BodyMeshInstance {
             metadata: [i, 0, 0, 0],
             local: IDENTITY,
+            local_rate: if i == 6 {
+                // Unit-speed prescribed rotation around the local Z axis.
+                [[0., 1., 0., 0.], [-1., 0., 0., 0.], [0.; 4], [0.; 4]]
+            } else {
+                [[0.; 4]; 4]
+            },
         })
         .collect::<Vec<_>>();
     let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -69,19 +77,26 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         usage: wgpu::BufferUsages::STORAGE,
     });
     let poses = BodyMeshPoses::new(device, &bodies, &instances)?;
-    let links = [[0, 1], [2, 3], [4, 5]];
+    let links = [[0, 1], [2, 3], [4, 5], [6, 7]].map(|pair| MeshImpactLink {
+        bodies: pair,
+        instances: pair,
+    });
     let pairs = [
         MeshPair {
             meshes: [0, 0],
-            transforms: links[0],
+            transforms: links[0].instances,
         },
         MeshPair {
             meshes: [1, 2],
-            transforms: links[1],
+            transforms: links[1].instances,
         },
         MeshPair {
             meshes: [0, 0],
-            transforms: links[2],
+            transforms: links[2].instances,
+        },
+        MeshPair {
+            meshes: [1, 2],
+            transforms: links[3].instances,
         },
     ];
     let queries = catalog.queries(
@@ -95,7 +110,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
             dispatch: CandidateDispatch::Direct,
         },
     )?;
-    let solver = MeshImpulses::new(device, &bodies, queries.results(), &links)?;
+    let solver = MeshImpulses::new(device, &bodies, &instances, queries.results(), &links)?;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     // Three GPU stages in queue order, no CPU transform or witness readback.
     poses.encode(&mut encoder);
@@ -120,7 +135,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
 fn validate(states: &[RigidBody], output: &[RigidBody], impacts: &[MeshImpact]) {
     assert_eq!(
         impacts.iter().map(|e| e.metadata[0]).collect::<Vec<_>>(),
-        [1, 1, 3],
+        [1, 1, 3, 1],
         "{impacts:?}"
     );
     assert!((output[0].velocity[2] + 1.0).abs() < 1e-5);
@@ -134,6 +149,13 @@ fn validate(states: &[RigidBody], output: &[RigidBody], impacts: &[MeshImpact]) 
     assert_eq!(
         bytemuck::bytes_of(&output[4]),
         bytemuck::bytes_of(&states[4])
+    );
+    assert!((impacts[3].point_speed[3] - 2.0).abs() < 1e-5);
+    assert!((impacts[3].impulse_normal[3] - expected).abs() < 1e-5);
+    assert!((output[6].angular[2] + 4.0 / 3.0).abs() < 1e-5);
+    println!(
+        "MESH_MOTOR_IMPACT stationary_owner=true local_panel_speed={:.6} impulse={:.6} owner_spin={:.6}",
+        impacts[3].point_speed[3], impacts[3].impulse_normal[3], output[6].angular[2]
     );
     println!(
         "MESH_IMPACT elastic_exchange=true panel_speed={:.6} impulse={:.6} panel_spin={:.6} crossing_requires_refinement=true",

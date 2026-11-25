@@ -1,4 +1,4 @@
-struct MeshInstance { metadata:vec4<u32>, local:mat4x4<f32> }
+struct MeshInstance { metadata:vec4<u32>, local:mat4x4<f32>, local_rate:mat4x4<f32> }
 @group(0) @binding(0) var<storage,read> bodies:array<Body>;
 @group(0) @binding(1) var<storage,read> instances:array<MeshInstance>;
 @group(0) @binding(2) var<storage,read_write> matrices:array<mat4x4<f32>>;

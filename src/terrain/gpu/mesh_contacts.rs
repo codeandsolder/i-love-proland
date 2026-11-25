@@ -13,7 +13,9 @@ use std::{
 use wgpu::util::DeviceExt;
 mod body_response;
 mod build;
-pub use body_response::{BodyMeshInstance, BodyMeshPoses, MeshImpact, MeshImpulses};
+pub use body_response::{
+    BodyMeshInstance, BodyMeshPoses, MeshImpact, MeshImpactLink, MeshImpulses,
+};
 mod sweep;
 mod topology;
 pub use sweep::{MeshSweeps, RigidPose, SweepPair, SweepResult, SweepSettings};

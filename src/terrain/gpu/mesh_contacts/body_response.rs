@@ -14,6 +14,11 @@ pub struct BodyMeshInstance {
     pub metadata: [u32; 4],
     /// Mesh-local to body-local transform, including animated node pose.
     pub local: [[f32; 4]; 4],
+    /// Instantaneous derivative of the local affine matrix (per second).
+    /// Zero for an ordinary rigid-body collider. For a prescribed
+    /// motor or animation this adds the surface velocity relative to
+    /// the owning body's rigid motion.
+    pub local_rate: [[f32; 4]; 4],
 }
 
 /// Compose resident physics bodies and animated local matrices directly
@@ -100,9 +105,10 @@ fn buffer_count<T>(device: &wgpu::Device, buffer: &wgpu::Buffer) -> io::Result<u
     Ok(count)
 }
 
-fn adjacency(count: u32, links: &[[u32; 2]]) -> io::Result<(Vec<u32>, Vec<u32>)> {
+fn adjacency(count: u32, links: &[MeshImpactLink]) -> io::Result<(Vec<u32>, Vec<u32>)> {
     let mut lists = vec![Vec::new(); count as usize];
-    for (i, &[a, b]) in links.iter().enumerate() {
+    for (i, link) in links.iter().enumerate() {
+        let [a, b] = link.bodies;
         if a == b || a >= count || b >= count {
             return Err(invalid("invalid mesh response body mapping"));
         }
@@ -117,6 +123,14 @@ fn adjacency(count: u32, links: &[[u32; 2]]) -> io::Result<(Vec<u32>, Vec<u32>)>
         offsets.push(u32::try_from(ids.len()).map_err(io::Error::other)?);
     }
     Ok((offsets, ids))
+}
+
+/// The two owning bodies and their corresponding animated mesh instances.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MeshImpactLink {
+    pub bodies: [u32; 2],
+    pub instances: [u32; 2],
 }
 
 /// One symmetric Jacobi impact sweep. Body poses remain unchanged;
@@ -141,12 +155,19 @@ impl MeshImpulses {
     pub fn new(
         device: &wgpu::Device,
         states: &wgpu::Buffer,
+        instances: &wgpu::Buffer,
         contacts: &wgpu::Buffer,
-        links: &[[u32; 2]],
+        links: &[MeshImpactLink],
     ) -> io::Result<Self> {
         let bodies = buffer_count::<RigidBody>(device, states)?;
         let pairs = buffer_count::<MeshContact>(device, contacts)?;
-        if links.len() != pairs as usize || !states.usage().contains(wgpu::BufferUsages::COPY_DST) {
+        let instance_count = buffer_count::<BodyMeshInstance>(device, instances)?;
+        if links.len() != pairs as usize
+            || !states.usage().contains(wgpu::BufferUsages::COPY_DST)
+            || links
+                .iter()
+                .any(|link| link.instances.iter().any(|&i| i >= instance_count))
+        {
             return Err(invalid("invalid mesh impact buffer mapping"));
         }
         let (offsets, ids) = adjacency(bodies, links)?;
@@ -170,11 +191,17 @@ impl MeshImpulses {
         let scratch = output_buffer::<RigidBody>(device, bodies, "mesh impulse body snapshot")?;
         let prediction = Kernel::new(device, "predict mesh impulses", SOURCE, "predict_impulses");
         let gather = Kernel::new(device, "gather mesh impulses", SOURCE, "gather_impulses");
-        let predict_bind = prediction.bind(
+        let predict_bind = prediction.bind_numbered(
             device,
             "mesh impulse inputs",
-            &[states, contacts, &links, &raw],
-        )?;
+            &[
+                (0, states),
+                (1, contacts),
+                (2, &links),
+                (3, &raw),
+                (8, instances),
+            ],
+        );
         let gather_bind = gather.bind_numbered(
             device,
             "mesh impulse gather",
