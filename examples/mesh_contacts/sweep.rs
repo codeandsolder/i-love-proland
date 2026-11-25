@@ -44,7 +44,7 @@ fn check_comoving(
     queue: &wgpu::Queue,
     catalog: &MeshCatalog,
     settings: SweepSettings,
-    pairs: [SweepPair; 2],
+    pairs: &[SweepPair; 2],
     reference: &[SweepResult],
 ) -> Result<()> {
     let mut clear = pairs[1];
@@ -131,7 +131,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue, panel: &Geometry) -> Re
     );
     assert!(result[0].interval[1] - result[0].interval[0] <= settings.time_tolerance);
     assert_eq!(result[1].status[0], 0);
-    check_comoving(device, queue, &catalog, settings, pairs, &result)?;
+    check_comoving(device, queue, &catalog, settings, &pairs, &result)?;
     let limited = run(
         device,
         queue,
