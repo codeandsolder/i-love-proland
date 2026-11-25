@@ -52,10 +52,14 @@ fn module_vs(
         out.uv = vec2<f32>(0.0);
         out.kind = 0u;
         out.stable_id = 0u;
+        out.triangle_seed = 0u;
+        out.normal = vec3<f32>(0.0,1.0,0.0);
+        out.up = out.normal;
         return out;
     }
 
     var position:vec3<f32>;
+    var local_normal:vec3<f32>;
     if module_data.metadata.x == 1u {
         let start = module_data.origin_radius.xyz;
         let end = module_data.extent_radius.xyz;
@@ -66,6 +70,7 @@ fn module_vs(
         let normal = select(normal_a, normal_b, side != 0u);
         let r = mix(module_data.origin_radius.w, module_data.extent_radius.w, corner.y);
         position = mix(start, end, corner.y) + normal * (corner.x * r);
+        local_normal = cross(normal,direction);
     } else {
         // One source cluster expands to two orthogonal lobes. Its original
         // material membership, conservative shape envelope and source ID
@@ -76,6 +81,7 @@ fn module_vs(
         let c = cos(theta);
         let x = corner.x * module_data.origin_radius.w;
         let y = (2.0 * corner.y - 1.0) * module_data.extent_radius.x;
+        local_normal = normalize(vec3<f32>(-s * module_data.extent_radius.y,0.0,c * module_data.origin_radius.w));
         position = module_data.origin_radius.xyz
             + vec3<f32>(c * x, y, s * x * module_data.extent_radius.y / module_data.origin_radius.w);
     }
@@ -89,13 +95,16 @@ fn module_vs(
     let uv_x = 0.5 + 0.5 * corner.x;
     let mirror = module_data.metadata.x == 2u && (module_hash(module_data.metadata.y) & 0x10000u) != 0u;
     out.uv = vec2<f32>(select(uv_x, 1.0 - uv_x, mirror), corner.y);
+    out.up = rotate(object.rotation,vec3<f32>(0.0,1.0,0.0));
+    out.normal = rotate(object.rotation,safe_normal(local_normal/object.axis_radii.xyz,vec3<f32>(0.0,1.0,0.0)));
     out.kind = module_data.metadata.x;
+    out.triangle_seed = object.object_id.x ^ (object.object_id.y * 0x9e3779b9u) ^
+        (object.object_id.z * 0x85ebca6bu) ^ (object.object_id.w * 0xc2b2ae35u);
     out.stable_id = module_hash(object.object_id.x ^ module_data.metadata.y);
     return out;
 }
 
-@fragment
-fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
+fn module_material(input:MeshOutput)->vec4<f32> {
     let dx = dpdx(input.uv);
     let dy = dpdy(input.uv);
     if input.kind == 0u {
@@ -120,4 +129,10 @@ fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
         if alpha < threshold {discard;}
     }
     return vec4<f32>(texel.rgb / texel.a * input.color.rgb, alpha);
+}
+
+@fragment
+fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
+    let material = module_material(input);
+    return vec4<f32>(material.rgb * foliage_light(input.normal,input.up), material.a);
 }

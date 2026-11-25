@@ -29,12 +29,20 @@ const SHADER: &str = concat!(
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TreeVertex {
     pub position: [f32; 4],
+    /// Unit source-space surface normal (w is padding).
+    pub normal: [f32; 4],
     pub color: [f32; 4],
     /// Source UVs are normalized texture coordinates (may repeat outside 0..1).
     pub uv: [f32; 2],
 }
 
 impl TreeVertex {
+    #[must_use = "Reject invalid normals before baking or uploading geometry"]
+    pub fn valid_normal(normal: [f32; 4]) -> bool {
+        let length_squared: f32 = normal[..3].iter().map(|x| x * x).sum();
+        normal.iter().all(|x| x.is_finite()) && (length_squared - 1.0).abs() < 0.001
+    }
+
     /// Validate floating-point source-material color, not a normalized
     /// vertex attribute: linear RGB multipliers may legitimately exceed 1.
     /// The alpha channel remains ordinary fractional coverage.
@@ -67,6 +75,7 @@ impl TreeMesh {
             !v.position.iter().all(|p| p.is_finite())
                 || !v.uv.iter().all(|p| p.is_finite())
                 || !TreeVertex::valid_color(v.color)
+                || !TreeVertex::valid_normal(v.normal)
         }) || indices
             .iter()
             .any(|i| usize::try_from(*i).map_or(true, |i| i >= vertices.len()))
@@ -266,6 +275,7 @@ pub struct AtlasImage {
     tile_size: u32,
     gutter: u32,
     rgba: Vec<u8>,
+    normals_rgba: Vec<u8>,
 }
 
 /// An angular image and its physical scale relative to the common mesh
@@ -280,7 +290,7 @@ pub struct ModelAtlas {
 impl AtlasImage {
     /// # Errors
     /// Rejects inconsistent image byte lengths and inadequate tile padding.
-    pub fn new(tile_size: u32, gutter: u32, rgba: Vec<u8>) -> Result<Self> {
+    pub fn new(tile_size: u32, gutter: u32, rgba: Vec<u8>, normals_rgba: Vec<u8>) -> Result<Self> {
         if !(8..=512).contains(&tile_size)
             || gutter == 0
             || u64::from(gutter) * 4 >= u64::from(tile_size)
@@ -291,7 +301,15 @@ impl AtlasImage {
         }
         let pixels =
             u64::from(tile_size).pow(2) * u64::from(AZIMUTH_VIEWS) * u64::from(ELEVATION_VIEWS) * 4;
-        if usize::try_from(pixels).ok() != Some(rgba.len()) {
+        if usize::try_from(pixels).ok() != Some(rgba.len())
+            || normals_rgba.len() != rgba.len()
+            || !rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(normals_rgba.as_chunks::<4>().0)
+                .all(|(a, b)| a[3] == b[3])
+        {
             return Err(Error::InvalidConfiguration(
                 "impostor atlas RGBA length mismatch",
             ));
@@ -300,6 +318,7 @@ impl AtlasImage {
             tile_size,
             gutter,
             rgba,
+            normals_rgba,
         })
     }
 
@@ -326,6 +345,13 @@ impl AtlasImage {
     #[must_use = "Use the returned texels when uploading the atlas"]
     pub fn rgba(&self) -> &[u8] {
         &self.rgba
+    }
+
+    /// Linear source-normal XYZ mapped from [-1,1] to [0,1], and the
+    /// identical coverage in alpha. Filtering is coverage-weighted.
+    #[must_use = "Use the paired normal plane for directional impostor lighting"]
+    pub fn normals_rgba(&self) -> &[u8] {
+        &self.normals_rgba
     }
 
     /// Upload the ordinary single-source angular atlas. Authored trees use
@@ -395,51 +421,61 @@ impl AtlasImage {
                 "impostor variant atlas shape or GPU texture limit mismatch",
             ));
         }
-        let mut data = Vec::new();
-        let mut mip_level_count = 0;
-        for image in images {
-            let (levels, bytes) = image.isolated_mips();
-            if mip_level_count == 0 {
+        let upload = |format, srgb| -> Result<_> {
+            let mut data = Vec::new();
+            let mut mip_level_count = 0;
+            for image in images {
+                let pixels = if srgb {
+                    image.rgba()
+                } else {
+                    image.normals_rgba()
+                };
+                let (levels, bytes) = image.isolated_mips(pixels, srgb);
                 mip_level_count = levels;
+                data.try_reserve(bytes.len())
+                    .map_err(|_| Error::IndexOverflow)?;
+                data.extend_from_slice(&bytes);
             }
-            data.try_reserve(bytes.len())
-                .map_err(|_| Error::IndexOverflow)?;
-            data.extend_from_slice(&bytes);
-        }
-        let texture = device.create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
-                label: Some("i-love-proland per-variant filtered angular foliage views"),
-                size: wgpu::Extent3d {
-                    width: side,
-                    height: side,
-                    depth_or_array_layers: layers,
+            let texture = device.create_texture_with_data(
+                queue,
+                &wgpu::TextureDescriptor {
+                    label: Some("i-love-proland per-variant filtered angular foliage views"),
+                    size: wgpu::Extent3d {
+                        width: side,
+                        height: side,
+                        depth_or_array_layers: layers,
+                    },
+                    mip_level_count,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
                 },
-                mip_level_count,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &data,
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &data,
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            Ok((texture, view))
+        };
+        let (color, view) = upload(wgpu::TextureFormat::Rgba8UnormSrgb, true)?;
+        let (normal, normal_view) = upload(wgpu::TextureFormat::Rgba8Unorm, false)?;
         let scale_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("i-love-proland per-model impostor radius scales"),
             contents: bytemuck::cast_slice(&radius_scales),
             usage: wgpu::BufferUsages::STORAGE,
         });
         Ok(AtlasTexture {
-            _texture: texture,
+            _color: color,
             view,
             variant_ids,
             radius_scales,
             scale_buffer,
+            _normal: normal,
+            normal_view,
         })
     }
 
@@ -448,14 +484,18 @@ impl AtlasImage {
     /// including arbitrary (non-power-of-two and odd) source dimensions.
     /// Derive every level from the unquantized base, never from a quantized
     /// intermediate. No angular neighbours can contribute to a view's mip.
-    fn isolated_mips(&self) -> (u32, Vec<u8>) {
+    fn isolated_mips(&self, pixels: &[u8], srgb: bool) -> (u32, Vec<u8>) {
         let side = self.tile_size - 2 * self.gutter;
         let pitch = self.width() as usize;
         let levels = side.bit_width();
         let mut data = Vec::new();
         let mut linear = [0.0; 256];
         for (slot, byte) in linear.iter_mut().zip(0..=u8::MAX) {
-            *slot = srgb_to_linear(byte);
+            *slot = if srgb {
+                srgb_to_linear(byte)
+            } else {
+                f32::from(byte) / 255.0
+            };
         }
         let mut base = Vec::with_capacity((side * side) as usize);
         for elevation in 0..ELEVATION_VIEWS {
@@ -466,7 +506,7 @@ impl AtlasImage {
                 for y in y0..y0 + side {
                     for x in x0..x0 + side {
                         let i = 4 * (y as usize * pitch + x as usize);
-                        let p = &self.rgba[i..i + 4];
+                        let p = &pixels[i..i + 4];
                         let a = f32::from(p[3]) / 255.0;
                         base.push([
                             linear[p[0] as usize] * a,
@@ -477,7 +517,7 @@ impl AtlasImage {
                     }
                 }
                 for level in 0..levels {
-                    append_area_mip(&base, side, side >> level, &mut data);
+                    append_area_mip(&base, side, side >> level, &mut data, srgb);
                 }
             }
         }
@@ -487,7 +527,13 @@ impl AtlasImage {
 
 // Coordinates use exact integer overlap lengths in units of 1/dest_side
 // of an original texel. Each output square has total weight source_side².
-fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &mut Vec<u8>) {
+fn append_area_mip(
+    base: &[[f32; 4]],
+    source_side: u32,
+    dest_side: u32,
+    data: &mut Vec<u8>,
+    srgb: bool,
+) {
     let norm = f64::from(source_side).powi(2).recip();
     for y in 0..dest_side {
         let y0 = y * source_side;
@@ -512,10 +558,11 @@ fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &m
                 reason = "normalized area averages are converted to the f32 color transfer function before 8-bit quantization"
             )]
             let average = sum.map(|v| (v * norm) as f32);
+            let encode = |v| to_byte(if srgb { linear_to_srgb(v) } else { v });
             data.extend_from_slice(&[
-                to_byte(linear_to_srgb(average[0])),
-                to_byte(linear_to_srgb(average[1])),
-                to_byte(linear_to_srgb(average[2])),
+                encode(average[0]),
+                encode(average[1]),
+                encode(average[2]),
                 to_byte(average[3]),
             ]);
         }
@@ -524,11 +571,13 @@ fn append_area_mip(base: &[[f32; 4]], source_side: u32, dest_side: u32, data: &m
 
 /// Owns the texture used by a live GPU renderer.
 pub struct AtlasTexture {
-    _texture: wgpu::Texture,
+    _color: wgpu::Texture,
     view: wgpu::TextureView,
     variant_ids: Option<Vec<u64>>,
     radius_scales: Vec<f32>,
     scale_buffer: wgpu::Buffer,
+    _normal: wgpu::Texture,
+    normal_view: wgpu::TextureView,
 }
 
 /// Explicit camera-relative projection. The application owns view rotation.
@@ -538,6 +587,7 @@ pub struct TreeCamera {
     forward: [f32; 3],
     wind: Option<WindFrame>,
     eye: [f32; 3],
+    sun: [f32; 3],
 }
 
 impl TreeCamera {
@@ -556,6 +606,7 @@ impl TreeCamera {
             forward,
             wind: None,
             eye: [0.0; 3],
+            sun: [0.64, 0.60, 0.48],
         })
     }
 
@@ -569,6 +620,18 @@ impl TreeCamera {
             return Err(Error::InvalidConfiguration("nonfinite tree camera eye"));
         }
         self.eye = eye;
+        Ok(self)
+    }
+
+    /// Direction towards the shared directional sun in resident-local space.
+    /// # Errors
+    /// Rejects nonfinite or non-unit directions.
+    pub fn with_sun(mut self, direction: [f32; 3]) -> Result<Self> {
+        let length_squared: f32 = direction.iter().map(|v| v * v).sum();
+        if !length_squared.is_finite() || (length_squared - 1.0).abs() > 1e-4 {
+            return Err(Error::InvalidConfiguration("invalid directional light"));
+        }
+        self.sun = direction;
         Ok(self)
     }
 
@@ -625,6 +688,7 @@ struct DrawUniform {
     camera_forward: [f32; 4],
     billboard_source: [f32; 4],
     eye: [f32; 4],
+    sun: [f32; 4],
 }
 
 /// Render targets and material alpha-cutoff semantics.
@@ -632,6 +696,8 @@ struct DrawUniform {
 pub struct TreeRenderConfig {
     pub color_format: wgpu::TextureFormat,
     pub depth_format: wgpu::TextureFormat,
+    /// Match the caller-owned camera projection and depth clear value.
+    pub depth_compare: wgpu::CompareFunction,
     pub sample_count: u32,
     /// Allocate optional single-sample raw triangle-coverage pipelines.
     pub triangle_coverage: bool,
@@ -712,6 +778,13 @@ pub struct TreeRenderer {
     impostor_indirect_offset: u64,
 }
 
+#[derive(Clone, Copy)]
+enum PassOutput {
+    Color,
+    Coverage,
+    PrimitiveIds,
+}
+
 fn render_pipeline(
     device: &wgpu::Device,
     pipeline_layout: &wgpu::PipelineLayout,
@@ -719,14 +792,14 @@ fn render_pipeline(
     pass_kind: PassKind,
     vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     config: TreeRenderConfig,
-    coverage: bool,
+    output: PassOutput,
 ) -> wgpu::RenderPipeline {
     let (name, vertex_entry, fragment_entry, alpha_to_coverage) = match pass_kind {
         PassKind::Mesh => (
             "i-love-proland instanced source trees",
             "mesh_vs",
             "mesh_fs",
-            false,
+            config.sample_count > 1,
         ),
         PassKind::Module => (
             "i-love-proland GPU-expanded tapered branches and canopy modules",
@@ -741,16 +814,24 @@ fn render_pipeline(
             config.sample_count > 1,
         ),
     };
-    let (fragment_entry, alpha_to_coverage) = if coverage {
-        (
+    let coverage = matches!(output, PassOutput::Coverage);
+    let (fragment_entry, alpha_to_coverage) = match output {
+        PassOutput::Color => (fragment_entry, alpha_to_coverage),
+        PassOutput::Coverage => (
             match pass_kind {
                 PassKind::Mesh | PassKind::Module => "mesh_coverage_fs",
                 PassKind::Impostor => "impostor_coverage_fs",
             },
             false,
-        )
-    } else {
-        (fragment_entry, alpha_to_coverage)
+        ),
+        PassOutput::PrimitiveIds => (
+            match pass_kind {
+                PassKind::Mesh => "mesh_ids_fs",
+                PassKind::Module => "module_ids_fs",
+                PassKind::Impostor => "impostor_ids_fs",
+            },
+            false,
+        ),
     };
     let additive = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
@@ -774,7 +855,7 @@ fn render_pipeline(
         depth_stencil: (!coverage).then_some(wgpu::DepthStencilState {
             format: config.depth_format,
             depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_compare: Some(config.depth_compare),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -850,6 +931,16 @@ fn render_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 binding: 5,
                 visibility: ShaderStages::VERTEX_FRAGMENT,
                 ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
                 count: None,
             },
             BindGroupLayoutEntry {
@@ -985,6 +1076,10 @@ fn make_draw_bind(
                 resource: wgpu::BindingResource::TextureView(&materials.atlas.view),
             },
             wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&materials.atlas.normal_view),
+            },
+            wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(materials.atlas_sampler),
             },
@@ -1015,7 +1110,8 @@ fn make_source_sampler(device: &wgpu::Device) -> wgpu::Sampler {
         address_mode_v: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: 8,
         ..Default::default()
     })
 }
@@ -1150,12 +1246,59 @@ fn placeholder_texture(device: &wgpu::Device) -> wgpu::TextureView {
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+// The primitive-index extension belongs to the complete optional
+// shader, not to the shared WGSL fragment.
+fn tree_shader(device: &wgpu::Device, triangle_ids: bool) -> wgpu::ShaderModule {
+    let source = if triangle_ids {
+        format!(
+            "enable primitive_index;\n{SHADER}\n{}",
+            include_str!("triangle_ids.wgsl.inc")
+        )
+    } else {
+        SHADER.to_owned()
+    };
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("i-love-proland mesh and 32-angle impostor shader"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    })
+}
+
 impl TreePipelines {
     /// Compile once for every compatible render-target configuration.
     ///
     /// # Errors
     /// Rejects an invalid multisample count.
     pub fn new(compaction: &CompactionPipeline, config: TreeRenderConfig) -> Result<Self> {
+        Self::compile(compaction, config, false)
+    }
+
+    /// Build a diagnostic pipeline that writes primitive IDs instead of color.
+    /// Requires the `wgpu::Features::PRIMITIVE_INDEX` feature and a single-sample target.
+    ///
+    /// # Errors
+    /// Rejects unsupported sample settings or a device without the feature.
+    pub fn new_triangle_ids(
+        compaction: &CompactionPipeline,
+        config: TreeRenderConfig,
+    ) -> Result<Self> {
+        if config.sample_count != 1
+            || !compaction
+                .device()
+                .features()
+                .contains(wgpu::Features::PRIMITIVE_INDEX)
+        {
+            return Err(Error::InvalidConfiguration(
+                "triangle identity capture requires one sample and PRIMITIVE_INDEX",
+            ));
+        }
+        Self::compile(compaction, config, true)
+    }
+
+    fn compile(
+        compaction: &CompactionPipeline,
+        config: TreeRenderConfig,
+        triangle_ids: bool,
+    ) -> Result<Self> {
         if config.sample_count == 0 || !config.sample_count.is_power_of_two() {
             return Err(Error::InvalidConfiguration("invalid tree sample count"));
         }
@@ -1168,10 +1311,7 @@ impl TreePipelines {
             ..Default::default()
         });
         let source_sampler = make_source_sampler(device);
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("i-love-proland mesh and 32-angle impostor shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-        });
+        let shader = tree_shader(device, triangle_ids);
         let material_layout = render_layout(device);
         let instance_layout = instance_layout(device);
         let module_layout = module_layout(device);
@@ -1193,9 +1333,9 @@ impl TreePipelines {
         let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: core::mem::size_of::<TreeVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x2],
         })];
-        let make = |coverage| DrawPipelines {
+        let make = |output| DrawPipelines {
             mesh: render_pipeline(
                 device,
                 &pipeline_layout,
@@ -1203,7 +1343,7 @@ impl TreePipelines {
                 PassKind::Mesh,
                 &vertex_layout,
                 config,
-                coverage,
+                output,
             ),
             modules: render_pipeline(
                 device,
@@ -1212,7 +1352,7 @@ impl TreePipelines {
                 PassKind::Module,
                 &[],
                 config,
-                coverage,
+                output,
             ),
             impostor: render_pipeline(
                 device,
@@ -1221,11 +1361,15 @@ impl TreePipelines {
                 PassKind::Impostor,
                 &[],
                 config,
-                coverage,
+                output,
             ),
         };
-        let normal = make(false);
-        let coverage = config.triangle_coverage.then(|| make(true));
+        let normal = make(if triangle_ids {
+            PassOutput::PrimitiveIds
+        } else {
+            PassOutput::Color
+        });
+        let coverage = config.triangle_coverage.then(|| make(PassOutput::Coverage));
         let quad_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("i-love-proland billboard quad 6 indices"),
             contents: bytemuck::cast_slice(&[0_u32, 1, 2, 2, 1, 3]),
@@ -1487,9 +1631,17 @@ impl TreeRenderer {
             camera_forward: [camera.forward[0], camera.forward[1], camera.forward[2], 0.0],
             billboard_source: [0.0; 4],
             eye: [camera.eye[0], camera.eye[1], camera.eye[2], 0.0],
+            sun: [camera.sun[0], camera.sun[1], camera.sun[2], 0.0],
         };
-        for material in &self.mesh_draws {
+        for (material_id, material) in self.mesh_draws.iter().enumerate() {
             uniform.material[0] = material.cutoff;
+            // Diagnostic-only immutable draw identity, not used by production shading.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "one material draw ordinal per GPU binding, always much smaller than 2^24"
+            )]
+            let draw_id = material_id as f32;
+            uniform.material[2] = draw_id;
             uniform.billboard_source = material.billboard.map_or([0.0; 4], |b| {
                 let [x, y, z] = b.center();
                 [x, y, z, b.radius()]
@@ -1513,6 +1665,7 @@ impl TreeRenderer {
             queue.write_buffer(&material.uniforms, 0, bytemuck::bytes_of(&uniform));
         }
         uniform.material[0] = 0.0;
+        uniform.material[2] = -1.0; // composite impostor is a different primitive namespace
         uniform.wind_parameters = [0.0; 4];
         queue.write_buffer(&self.impostor_uniforms, 0, bytemuck::bytes_of(&uniform));
     }
@@ -1618,14 +1771,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn impostor_shader_validates_without_an_adapter() {
+        use wgpu::naga::{
+            front::wgsl,
+            valid::{Capabilities, ValidationFlags, Validator},
+        };
+        let module = wgsl::parse_str(SHADER)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(SHADER)));
+        Validator::new(ValidationFlags::all(), Capabilities::all())
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(SHADER)));
+    }
+
+    #[test]
+    fn primitive_identity_shader_parses_and_validates_with_production_entries() {
+        let source = format!(
+            "enable primitive_index;\n{SHADER}\n{}",
+            include_str!("triangle_ids.wgsl.inc")
+        );
+        let module = wgpu::naga::front::wgsl::parse_str(&source)
+            .expect("primitive-ID shader WGSL must parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("production and primitive-ID shader entries must validate");
+    }
+
+    #[test]
     fn atlas_size_validation() {
         let len = 8 * 4 * 16 * 16 * 4;
-        let image = AtlasImage::new(16, 2, vec![0; len]).unwrap();
+        let image = AtlasImage::new(16, 2, vec![0; len], vec![0; len]).unwrap();
         assert_eq!((image.width(), image.height()), (128, 64));
         assert_eq!(image.rgba().len(), len);
-        assert!(AtlasImage::new(4, 1, vec![]).is_err());
-        assert!(AtlasImage::new(16, 4, vec![]).is_err());
-        assert!(AtlasImage::new(16, 2, vec![]).is_err());
+        assert!(AtlasImage::new(4, 1, vec![], vec![]).is_err());
+        assert!(AtlasImage::new(16, 4, vec![], vec![]).is_err());
+        assert!(AtlasImage::new(16, 2, vec![], vec![]).is_err());
     }
 
     #[test]
@@ -1655,8 +1837,26 @@ mod tests {
                 }
             }
         }
-        let atlas = AtlasImage::new(tile, gutter, rgba).unwrap();
-        let (levels, bytes) = atlas.isolated_mips();
+        let normals = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [128, 255, 128, p[3]])
+            .collect();
+        let atlas = AtlasImage::new(tile, gutter, rgba, normals).unwrap();
+        let (levels, bytes) = atlas.isolated_mips(atlas.rgba(), true);
+        let (normal_levels, normal_bytes) = atlas.isolated_mips(atlas.normals_rgba(), false);
+        assert_eq!(levels, normal_levels);
+        for (color, normal) in bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(normal_bytes.as_chunks::<4>().0)
+        {
+            assert_eq!(color[3], normal[3]);
+            assert_eq!(normal[1], normal[3]);
+            assert!((i16::from(normal[0]) * 2 - i16::from(normal[3])).abs() <= 2);
+        }
         assert_eq!(levels, 4);
         let layer_bytes: usize = (0..levels).map(|l| ((side >> l).pow(2) * 4) as usize).sum();
         assert_eq!(bytes.len(), layer_bytes * 32);
