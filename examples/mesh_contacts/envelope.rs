@@ -99,7 +99,7 @@ fn clusters(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     Ok(())
 }
 
-fn compare(expected: &[super::MeshContact], actual: &[super::MeshContact]) {
+pub fn compare(expected: &[super::MeshContact], actual: &[super::MeshContact]) {
     for (i, (a, b)) in expected.iter().zip(actual).enumerate() {
         assert_eq!(a.features, b.features, "envelope features {i}");
         assert_eq!(a.point_a, b.point_a, "envelope point A {i}");

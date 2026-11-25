@@ -142,13 +142,13 @@ fn mask(triangles: &[Triangle], lo: [f32; 3], hi: [f32; 3]) -> [u32; 2] {
 // Sealed cavities and disconnected open surfaces may overfill, never
 // carve holes in the authoritative closed shell.
 fn solid_cover(surface: [u32; 2]) -> [u32; 2] {
-    let occupied = u64::from(surface[0]) | (u64::from(surface[1]) << 32);
     const X0: u64 = 0x1111_1111_1111_1111;
     const X3: u64 = X0 << 3;
     const Y0: u64 = 0x000f_000f_000f_000f;
     const Y3: u64 = Y0 << 12;
     const Z0: u64 = 0xffff;
     const Z3: u64 = Z0 << 48;
+    let occupied = u64::from(surface[0]) | (u64::from(surface[1]) << 32);
     let empty = !occupied;
     let mut exterior = empty & (X0 | X3 | Y0 | Y3 | Z0 | Z3);
     loop {
