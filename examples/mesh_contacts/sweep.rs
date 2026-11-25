@@ -20,7 +20,7 @@ fn run(
 ) -> Result<Vec<SweepResult>> {
     let sweeps = catalog.sweeps(device, pairs, settings)?;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    catalog.encode_sweeps(&mut encoder, &sweeps);
+    sweeps.encode(&mut encoder);
     let snapshot = sweeps.snapshot(device, &mut encoder);
     queue.submit([encoder.finish()]);
     let mut pending = snapshot.begin();

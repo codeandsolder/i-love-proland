@@ -12,7 +12,7 @@ pub(super) struct Topology {
     pub closed: bool,
     pub representatives: Vec<bool>,
 }
-fn root(parent: &mut [usize], mut x: usize) -> usize {
+const fn root(parent: &mut [usize], mut x: usize) -> usize {
     while parent[x] != x {
         let next = parent[x];
         parent[x] = parent[next];
@@ -50,8 +50,8 @@ pub(super) fn classify(source: &MeshSource<'_>) -> io::Result<Topology> {
         .0
         .iter()
         .map(|face| {
-            let p = face.map(|i| ids.get(i as usize).copied());
-            let [Some(a), Some(b), Some(c)] = p else {
+            let vertices = face.map(|i| ids.get(i as usize).copied());
+            let [Some(a), Some(b), Some(c)] = vertices else {
                 return Err(super::invalid("collision index out of range"));
             };
             unite(&mut parent, a, b);
@@ -60,9 +60,9 @@ pub(super) fn classify(source: &MeshSource<'_>) -> io::Result<Topology> {
                 closed = false;
             }
             for (a, b) in [(a, b), (b, c), (c, a)] {
-                let e = edges.entry((a.min(b), a.max(b))).or_default();
-                e.0 += 1;
-                e.1 += if a < b { 1 } else { -1 };
+                let edge = edges.entry((a.min(b), a.max(b))).or_default();
+                edge.0 += 1;
+                edge.1 += if a < b { 1 } else { -1 };
             }
             Ok(a)
         })

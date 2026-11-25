@@ -5,7 +5,11 @@
 //! resident affine transforms allow animated and articulated parts to move
 //! without rebuilding their collision acceleration.
 use super::{Kernel, RecordedReadback, invalid, storage};
-use std::io;
+use std::{
+    io,
+    marker::PhantomData,
+    sync::{Arc, OnceLock},
+};
 use wgpu::util::DeviceExt;
 mod build;
 mod sweep;
@@ -104,8 +108,8 @@ pub struct MeshCatalog {
     triangles: wgpu::Buffer,
     meshes: wgpu::Buffer,
     count: u32,
-    kernel: Kernel,
-    sweep_kernel: Kernel,
+    kernels: [OnceLock<Arc<Kernel>>; 4],
+    sweep_kernel: OnceLock<Arc<Kernel>>,
 }
 
 impl MeshCatalog {
@@ -128,26 +132,8 @@ impl MeshCatalog {
                 bytemuck::cast_slice(&meshes),
             )?,
             count: u32::try_from(meshes.len()).map_err(io::Error::other)?,
-            kernel: Kernel::new(
-                device,
-                "mesh contact query",
-                concat!(
-                    include_str!("mesh_contacts/common.wgsl"),
-                    include_str!("mesh_contacts/containment.wgsl"),
-                    include_str!("mesh_contacts/query.wgsl")
-                ),
-                "query",
-            ),
-            sweep_kernel: Kernel::new(
-                device,
-                "mesh swept query",
-                concat!(
-                    include_str!("mesh_contacts/common.wgsl"),
-                    include_str!("mesh_contacts/containment.wgsl"),
-                    include_str!("mesh_contacts/sweep.wgsl")
-                ),
-                "sweep",
-            ),
+            kernels: std::array::from_fn(|_| OnceLock::new()),
+            sweep_kernel: OnceLock::new(),
         })
     }
 
@@ -187,31 +173,34 @@ impl MeshCatalog {
             return Err(invalid("invalid mesh contact query"));
         }
         let pairs = storage(device, "mesh contact pairs", bytemuck::cast_slice(pairs))?;
-        let size = u64::from(count) * std::mem::size_of::<MeshContact>() as u64;
-        if size
-            > device
-                .limits()
-                .max_storage_buffer_binding_size
-                .min(device.limits().max_buffer_size)
-        {
-            return Err(invalid("mesh contact output exceeds device limit"));
-        }
-        let output = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mesh contact results"),
-            size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+        let output = output_buffer::<MeshContact>(device, count, "mesh contact results")?;
+        let mode_index = match mode {
+            Midphase::Bvh => 0,
+            Midphase::VoxelBvh => 1,
+            Midphase::DualBvh => 2,
+            Midphase::DualVoxelBvh => 3,
+        };
+        let kernel = self.kernels[mode_index].get_or_init(|| {
+            Arc::new(Kernel::specialized(
+                device,
+                "specialized mesh contact query",
+                concat!(
+                    include_str!("mesh_contacts/common.wgsl"),
+                    include_str!("mesh_contacts/containment.wgsl"),
+                    include_str!("mesh_contacts/query.wgsl")
+                ),
+                "query",
+                &[
+                    ("DUAL", f64::from(u32::from(mode_index & 2 != 0))),
+                    ("VOXELS", f64::from(u32::from(mode_index & 1 != 0))),
+                ],
+            ))
         });
         let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh contact config"),
             contents: bytemuck::bytes_of(&Config {
                 margin,
-                mode: match mode {
-                    Midphase::Bvh => 0,
-                    Midphase::VoxelBvh => 1,
-                    Midphase::DualBvh => 2,
-                    Midphase::DualVoxelBvh => 3,
-                } | if matches!(domain, Domain::ClosedSolid) {
+                mode: if matches!(domain, Domain::ClosedSolid) {
                     4
                 } else {
                     0
@@ -221,7 +210,7 @@ impl MeshCatalog {
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let bind = self.kernel.bind(
+        let bind = kernel.bind(
             device,
             "resident mesh contact queries",
             &[
@@ -238,39 +227,59 @@ impl MeshCatalog {
             bind,
             output,
             count,
+            kernel: Arc::clone(kernel),
+            marker: PhantomData,
+            label: "mesh contact midphase/narrowphase",
         })
-    }
-
-    /// Record queries after any GPU updates to the transform buffer.
-    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder, queries: &MeshQueries) {
-        self.kernel.dispatch(
-            encoder,
-            "mesh contact midphase/narrowphase",
-            &queries.bind,
-            [queries.count, 1, 1],
-        );
     }
 }
 
-/// Reusable resident query resources. Results may feed another compute stage.
-pub struct MeshQueries {
+fn output_buffer<T>(device: &wgpu::Device, count: u32, label: &str) -> io::Result<wgpu::Buffer> {
+    let size = u64::from(count) * std::mem::size_of::<T>() as u64;
+    if size
+        > device
+            .limits()
+            .max_storage_buffer_binding_size
+            .min(device.limits().max_buffer_size)
+    {
+        return Err(invalid("mesh output exceeds device limit"));
+    }
+    Ok(device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    }))
+}
+
+/// Reusable resident query resources, typed by the output record ABI.
+pub struct MeshBatch<T> {
     bind: wgpu::BindGroup,
     output: wgpu::Buffer,
     count: u32,
+    kernel: Arc<Kernel>,
+    marker: PhantomData<T>,
+    label: &'static str,
 }
-impl MeshQueries {
-    #[must_use = "Bind the authoritative contact results to the next GPU stage"]
+impl<T: bytemuck::Pod> MeshBatch<T> {
+    #[must_use = "Bind the authoritative results to the next GPU stage"]
     pub const fn results(&self) -> &wgpu::Buffer {
         &self.output
     }
+    /// Record this batch after its GPU input updates.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.kernel
+            .dispatch(encoder, self.label, &self.bind, [self.count, 1, 1]);
+    }
 
-    /// Record a diagnostic readback without changing the resident result.
+    /// Record a diagnostic readback without changing resident results.
     #[must_use = "Submit and poll the recorded snapshot"]
     pub fn snapshot(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> RecordedReadback<MeshContact> {
+    ) -> RecordedReadback<T> {
         RecordedReadback::copy(device, encoder, &self.output, 0, self.output.size())
     }
 }
+pub type MeshQueries = MeshBatch<MeshContact>;

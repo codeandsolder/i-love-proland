@@ -1,4 +1,6 @@
 //! Actual GPU benchmark for arbitrary relative mesh poses.
+#[path = "mesh_contacts/containment.rs"]
+mod containment;
 #[path = "mesh_contacts/sweep.rs"]
 mod sweep;
 use i_love_proland::terrain::gpu::mesh_contacts::{
@@ -28,11 +30,10 @@ fn pose(angle: f32, x: f32, y: f32, z: f32) -> Matrix {
 fn sample(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    catalog: &MeshCatalog,
     queries: &MeshQueries,
 ) -> Result<Vec<MeshContact>> {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    catalog.encode(&mut encoder, queries);
+    queries.encode(&mut encoder);
     let snapshot = queries.snapshot(device, &mut encoder);
     queue.submit([encoder.finish()]);
     let mut pending = snapshot.begin();
@@ -172,6 +173,7 @@ fn cases() -> Result<Cases> {
 fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let geometry = geometry()?;
     sweep::check(device, queue, &geometry[2])?;
+    containment::check(device, queue)?;
     let catalog = MeshCatalog::new(
         device,
         &geometry.iter().map(Geometry::source).collect::<Vec<_>>(),
@@ -202,8 +204,8 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         Midphase::VoxelBvh,
         Domain::Surface,
     )?;
-    let a = sample(device, queue, &catalog, &plain)?;
-    let b = sample(device, queue, &catalog, &voxels)?;
+    let a = sample(device, queue, &plain)?;
+    let b = sample(device, queue, &voxels)?;
     for (i, (a, b)) in a.iter().zip(&b).enumerate() {
         assert_eq!(a.features, b.features, "feature mismatch {i}: {a:?} {b:?}");
         assert_eq!(a.point_a, b.point_a, "point mismatch {i}");
@@ -220,11 +222,35 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     assert!(a[4].point_a[3] < 1e-10);
     assert!(a[5].point_a[3] < 0.000_401);
     let rotating = &a[rotations];
+    for (i, result) in rotating.iter().enumerate() {
+        let angle = f64::from(u16::try_from(i)?).to_radians();
+        let (sin, cos) = angle.sin_cos();
+        let mut gap = f64::INFINITY;
+        for x in [0.0_f64, 4.0] {
+            for y in [-0.2_f64, 0.2] {
+                let px = x.mul_add(cos, (-y).mul_add(sin, 2.0));
+                let py = x.mul_add(sin, y * cos);
+                gap = gap.min(5.0 - px.abs()).min(5.0 - py.abs());
+            }
+        }
+        let expected = gap.max(0.0).hypot(0.025);
+        assert_eq!(
+            result.features[2] > 0,
+            expected <= 0.1,
+            "analytic rotating case {i}"
+        );
+        if result.features[2] > 0 {
+            assert!(
+                (f64::from(result.point_a[3]).sqrt() - expected).abs() < 2e-5,
+                "analytic distance case {i}: {result:?} expected {expected}"
+            );
+        }
+    }
     let hits = rotating.iter().filter(|c| c.features[2] > 0).count();
     assert!(hits > 0 && hits < rotating.len());
     // Modify only the resident pose, not the mesh or bind group.
     queue.write_buffer(&matrices, 5 * 64, bytemuck::bytes_of(&pose(0., 3., 0., 0.)));
-    let updated = sample(device, queue, &catalog, &voxels)?;
+    let updated = sample(device, queue, &voxels)?;
     assert!(updated[7].features[2] > 0);
     queue.write_buffer(&matrices, 5 * 64, bytemuck::bytes_of(&IDENTITY));
     println!(
@@ -248,8 +274,8 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         Midphase::DualVoxelBvh,
         Domain::Surface,
     )?;
-    let c = sample(device, queue, &catalog, &dual)?;
-    let d = sample(device, queue, &catalog, &dual_voxel)?;
+    let c = sample(device, queue, &dual)?;
+    let d = sample(device, queue, &dual_voxel)?;
     for other in [&c, &d] {
         for (i, (a, b)) in a.iter().zip(other).enumerate() {
             assert_eq!(
@@ -266,7 +292,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         ("dual_bvh", &dual, &c),
         ("dual_voxel", &dual_voxel, &d),
     ] {
-        benchmark(device, queue, &catalog, name, q, results)?;
+        benchmark(device, queue, name, q, results)?;
     }
     Ok(())
 }
@@ -274,7 +300,6 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
 fn benchmark(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    catalog: &MeshCatalog,
     name: &str,
     queries: &MeshQueries,
     results: &[MeshContact],
@@ -284,7 +309,7 @@ fn benchmark(
         let start = Instant::now();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         for _ in 0..16 {
-            catalog.encode(&mut encoder, queries);
+            queries.encode(&mut encoder);
         }
         queue.submit([encoder.finish()]);
         device.poll(wgpu::PollType::wait_indefinitely())?;

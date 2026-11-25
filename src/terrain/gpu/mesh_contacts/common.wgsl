@@ -1,3 +1,5 @@
+override DUAL:bool=false;
+override VOXELS:bool=true;
 struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, representative:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
@@ -64,23 +66,31 @@ fn edge_triangle(a:vec3<f32>,b:vec3<f32>,t:mat3x3<f32>)->Witness{
     return Witness(a,b,FAR);
 }
 fn edges(a:vec3<f32>,b:vec3<f32>,c:vec3<f32>,d:vec3<f32>)->Witness{
-    var best=witness(a,point_segment(a,c,d));
-    best=nearer(best,witness(b,point_segment(b,c,d)));
-    best=nearer(best,witness(point_segment(c,a,b),c));
-    best=nearer(best,witness(point_segment(d,a,b),d));
     let u=b-a;
     let v=d-c;
-    let w=c-a;
+    let w=a-c;
+    let uu=dot(u,u);
+    let vv=dot(v,v);
+    if uu==0.0{return witness(a,point_segment(a,c,d));}
+    if vv==0.0{return witness(point_segment(c,a,b),c);}
+    let uv=dot(u,v);
+    let uw=dot(u,w);
+    let vw=dot(v,w);
     let n=cross(u,v);
     let denominator=dot(n,n);
+    var s=0.0;
     if denominator>0.0{
-        let s=dot(cross(w,v),n)/denominator;
-        let t=dot(cross(w,u),n)/denominator;
-        if s>=0.0 && s<=1.0 && t>=0.0 && t<=1.0{
-            best=nearer(best,witness(a+u*s,c+v*t));
-        }
+        s=clamp(dot(cross(-w,v),n)/denominator,0.0,1.0);
     }
-    return best;
+    var t=(uv*s+vw)/vv;
+    if t<0.0{
+        t=0.0;
+        s=clamp(-uw/uu,0.0,1.0);
+    }else if t>1.0{
+        t=1.0;
+        s=clamp((uv-uw)/uu,0.0,1.0);
+    }
+    return witness(a+u*s,c+v*t);
 }
 fn triangle_distance(a:mat3x3<f32>,b:mat3x3<f32>)->Witness{
     var best=Witness(a[0],b[0],FAR);
@@ -93,8 +103,10 @@ fn triangle_distance(a:mat3x3<f32>,b:mat3x3<f32>)->Witness{
         best=nearer(best,point_triangle(a[i],b));
         let p=point_triangle(b[i],a);
         best=nearer(best,Witness(p.b,p.a,p.distance2));
+        if best.distance2==0.0{return best;}
         for(var k=0u;k<3u;k+=1u){
             best=nearer(best,edges(a[i],a[j],b[k],b[(k+1u)%3u]));
+            if best.distance2==0.0{return best;}
         }
     }
     return best;
@@ -150,7 +162,6 @@ struct QueryFrame {
     padding:vec3<f32>,
     origin:vec3<f32>,
     margin2:f32,
-    mode:u32,
 }
 struct Bounds { lo:vec3<f32>, hi:vec3<f32> }
 fn node_bounds(n:Node,f:QueryFrame)->Bounds{
@@ -165,16 +176,19 @@ fn tri_bounds(t:Triangle,f:QueryFrame)->Bounds{
     return Bounds(min(local[0],min(local[1],local[2]))-f.padding,
                   max(local[0],max(local[1],local[2]))+f.padding);
 }
-fn accepts(n:Node,b:Bounds,mode:u32,r:ptr<function,Contact>)->bool{
+fn accepts(n:Node,b:Bounds,r:ptr<function,Contact>)->bool{
     (*r).statistics.x+=1u;
     if any(n.lo>b.hi)||any(n.hi<b.lo){return false;}
-    if (mode&1u)!=0u && !voxel_overlap(n,b.lo,b.hi){
+    if VOXELS && !voxel_overlap(n,b.lo,b.hi){
         (*r).statistics.z+=1u;
         return false;
     }
     return true;
 }
-fn test_triangle(ta:Triangle,wa:mat3x3<f32>,tb:Triangle,f:QueryFrame,r:ptr<function,Contact>){
+fn test_triangle(ta:Triangle,wa:mat3x3<f32>,tb:Triangle,bounds:Bounds,f:QueryFrame,r:ptr<function,Contact>){
+    let lo=min(tb.a,min(tb.b.xyz,tb.c));
+    let hi=max(tb.a,max(tb.b.xyz,tb.c));
+    if any(lo>bounds.hi)||any(hi<bounds.lo){return;}
     let wb=transformed(tb,f.lb,vec3<f32>(0.0));
     (*r).statistics.y+=1u;
     let w=triangle_distance(wa,wb);
@@ -198,10 +212,10 @@ fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
         var node_id=mesh_b.nodes.x;
         while node_id<mesh_b.nodes.y{
             let node=nodes[node_id];
-            if !accepts(node,bounds,f.mode,&result){node_id=node.escape;continue;}
+            if !accepts(node,bounds,&result){node_id=node.escape;continue;}
             if node.count==0u{node_id+=1u;continue;}
             for(var bi=node.first;bi<node.end;bi+=1u){
-                test_triangle(ta,wa,triangles[bi],f,&result);
+                test_triangle(ta,wa,triangles[bi],bounds,f,&result);
             }
             node_id=node.escape;
         }
@@ -231,14 +245,15 @@ fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
         let ids=stack[top];
         let a=nodes[ids.x];
         let b=nodes[ids.y];
-        if !accepts(b,node_bounds(a,f),f.mode,&result){continue;}
+        if !accepts(b,node_bounds(a,f),&result){continue;}
         if a.count!=0u&&b.count!=0u{
             for(var ai=a.first;ai<a.end;ai+=1u){
                 let ta=triangles[ai];
-                if !accepts(b,tri_bounds(ta,f),f.mode,&result){continue;}
+                let bounds=tri_bounds(ta,f);
+                if !accepts(b,bounds,&result){continue;}
                 let wa=transformed(ta,f.la,f.relative);
                 for(var bi=b.first;bi<b.end;bi+=1u){
-                    test_triangle(ta,wa,triangles[bi],f,&result);
+                    test_triangle(ta,wa,triangles[bi],bounds,f,&result);
                 }
             }
             continue;
@@ -260,7 +275,7 @@ fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     }
     return result;
 }
-fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,mode:u32,lane:u32)->Contact{
+fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
     var result=empty();
     let la=linear(a);
     let lb=linear(b);
@@ -298,8 +313,8 @@ fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,mode:u32,lane:
     if any(transformed_center+transformed_half+pad+error<root_b.lo)||any(transformed_center-transformed_half-pad-error>root_b.hi){
         return result;
     }
-    let frame=QueryFrame(la,lb,relative,local_linear,local_offset,pad+error,b[3].xyz,margin*margin,mode);
-    if (mode&2u)!=0u{return scan_dual(mesh_a,mesh_b,frame,lane);}
+    let frame=QueryFrame(la,lb,relative,local_linear,local_offset,pad+error,b[3].xyz,margin*margin);
+    if DUAL{return scan_dual(mesh_a,mesh_b,frame,lane);}
     return scan_triangles(mesh_a,mesh_b,frame,lane);
 }
 var<workgroup> reduction:array<Contact,64>;

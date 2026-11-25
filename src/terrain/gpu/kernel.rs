@@ -6,6 +6,16 @@ pub(super) struct Kernel {
 }
 impl Kernel {
     pub(super) fn new(device: &wgpu::Device, label: &str, source: &str, entry: &str) -> Self {
+        Self::specialized(device, label, source, entry, &[])
+    }
+
+    pub(super) fn specialized(
+        device: &wgpu::Device,
+        label: &str,
+        source: &str,
+        entry: &str,
+        constants: &[(&str, f64)],
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -15,7 +25,10 @@ impl Kernel {
             layout: None,
             module: &shader,
             entry_point: Some(entry),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
             cache: None,
         });
         let layout = pipeline.get_bind_group_layout(0);

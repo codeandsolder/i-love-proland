@@ -1,6 +1,6 @@
 //! GPU continuous candidate search over known rigid pose intervals.
-use super::{MeshCatalog, MeshContact, RecordedReadback, invalid};
-use std::io;
+use super::{MeshBatch, MeshCatalog, MeshContact, invalid, output_buffer};
+use std::{io, marker::PhantomData, sync::Arc};
 use wgpu::util::DeviceExt;
 
 /// A rigid position and unit quaternion in a shared local metric frame.
@@ -46,27 +46,7 @@ pub struct SweepResult {
     pub contact: MeshContact,
 }
 
-pub struct MeshSweeps {
-    bind: wgpu::BindGroup,
-    output: wgpu::Buffer,
-    count: u32,
-}
-impl MeshSweeps {
-    #[must_use = "Use the resident forecast results"]
-    pub const fn results(&self) -> &wgpu::Buffer {
-        &self.output
-    }
-
-    /// Record a diagnostic snapshot after the sweep dispatch.
-    #[must_use = "Submit and poll the snapshot"]
-    pub fn snapshot(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-    ) -> RecordedReadback<SweepResult> {
-        RecordedReadback::copy(device, encoder, &self.output, 0, self.output.size())
-    }
-}
+pub type MeshSweeps = MeshBatch<SweepResult>;
 
 impl MeshCatalog {
     /// Bind a resident GPU-written or CPU-uploaded sweep array.
@@ -94,27 +74,25 @@ impl MeshCatalog {
         {
             return Err(invalid("invalid mesh sweep settings"));
         }
-        let size = u64::from(count) * std::mem::size_of::<SweepResult>() as u64;
-        if size
-            > device
-                .limits()
-                .max_storage_buffer_binding_size
-                .min(device.limits().max_buffer_size)
-        {
-            return Err(invalid("mesh sweep output exceeds device limit"));
-        }
-        let output = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mesh sweep results"),
-            size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+        let output = output_buffer::<SweepResult>(device, count, "mesh sweep results")?;
+        let kernel = self.sweep_kernel.get_or_init(|| {
+            Arc::new(super::Kernel::new(
+                device,
+                "mesh swept query",
+                concat!(
+                    include_str!("common.wgsl"),
+                    include_str!("containment.wgsl"),
+                    include_str!("sweep.wgsl")
+                ),
+                "sweep",
+            ))
         });
         let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh sweep settings"),
             contents: bytemuck::bytes_of(&settings),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let bind = self.sweep_kernel.bind(
+        let bind = kernel.bind(
             device,
             "resident mesh sweeps",
             &[
@@ -130,16 +108,9 @@ impl MeshCatalog {
             bind,
             output,
             count,
+            kernel: Arc::clone(kernel),
+            marker: PhantomData,
+            label: "mesh continuous candidate search",
         })
-    }
-
-    /// Search all requested intervals on the GPU, chronologically.
-    pub fn encode_sweeps(&self, encoder: &mut wgpu::CommandEncoder, sweeps: &MeshSweeps) {
-        self.sweep_kernel.dispatch(
-            encoder,
-            "mesh continuous candidate search",
-            &sweeps.bind,
-            [sweeps.count, 1, 1],
-        );
     }
 }

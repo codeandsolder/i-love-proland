@@ -85,7 +85,9 @@ fn contains_components(source:Mesh,destination:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,
         let triangle=triangles[i];
         if triangle.representative==0u{continue;}
         let p=relative*triangle.a+offset;
-        (*result).features.w|=point_inside(p,destination,&(*result).statistics.w);
+        var visits=0u;
+        (*result).features.w|=point_inside(p,destination,&visits);
+        (*result).statistics.w+=visits;
     }
 }
 fn containment(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,lane:u32)->Contact{
