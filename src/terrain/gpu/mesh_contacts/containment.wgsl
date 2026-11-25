@@ -49,7 +49,9 @@ fn parity(p:vec3<f32>,mesh:Mesh,axis:u32,visits:ptr<function,u32>)->u32{
         }
         if n.count==0u{id+=1u;continue;}
         for(var i=n.first;i<n.end;i+=1u){
-            let hit=ray_triangle(p,axis,triangles[i]);
+            let triangle=triangles[i];
+            if (triangle.flags&2u)==0u{continue;}
+            let hit=ray_triangle(p,axis,triangle);
             if hit==2u{return 2u;}
             count^=hit;
         }
@@ -83,7 +85,7 @@ fn contains_components(source:Mesh,destination:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,
     let offset=inverse*(a[3].xyz-b[3].xyz);
     for(var i=source.triangles.x+lane;i<source.triangles.y;i+=64u){
         let triangle=triangles[i];
-        if triangle.representative==0u{continue;}
+        if (triangle.flags&1u)==0u{continue;}
         let p=relative*triangle.a+offset;
         var visits=0u;
         (*result).features.w|=point_inside(p,destination,&visits);

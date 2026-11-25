@@ -1,6 +1,6 @@
 override DUAL:bool=false;
 override VOXELS:bool=true;
-struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, representative:u32 }
+struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, flags:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
     hi:vec3<f32>, count:u32,

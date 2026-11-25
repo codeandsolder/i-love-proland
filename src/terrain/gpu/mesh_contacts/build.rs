@@ -222,7 +222,8 @@ pub(super) fn catalog(
                 id: index(id)?,
                 b: [b[0], b[1], b[2], 0.0],
                 c,
-                representative: u32::from(topology.representatives[id]),
+                flags: u32::from(topology.representatives[id])
+                    | (u32::from(topology.closed_faces[id]) << 1),
             });
         }
         build(&mut nodes, &mut triangles[start..], index(start)?)?;
@@ -276,7 +277,7 @@ mod tests {
                         id: case,
                         b: [b[0], b[1], b[2], 0.0],
                         c,
-                        representative: 0,
+                        flags: 0,
                     };
                     let points = triangle.points();
                     let mut exhaustive = 0_u64;
@@ -299,7 +300,7 @@ mod tests {
             id: 0,
             b: [1., 1., 0., 0.],
             c: [1., 1., 1.],
-            representative: 1,
+            flags: 1,
         };
         let m = mask(&[t], [0.; 3], [1.; 3]);
         assert_ne!(m, [u32::MAX; 2]);
