@@ -56,10 +56,7 @@ impl ProceduralMesh {
 
 /// Convert an immutable Lorax plant into the existing Proland mesh vertex layout.
 ///
-/// Generated normals remain in the original Lorax Mesh; this adapter emits
-/// the current Proland `TreeVertex` layout (position/color/UV), which does not yet
-/// carry vertex normals. Relightable procedural-material support is a separate
-/// renderer change, not an undocumented change to the source shader.
+/// Retains the authored source normal for directional lighting.
 ///
 /// # Errors
 /// Returns the original generator error for an invalid screen target or a
@@ -90,6 +87,7 @@ pub fn bake(
                 (vertex.position[2] - center[2]) / radius,
                 1.0,
             ],
+            normal: [vertex.normal[0], vertex.normal[1], vertex.normal[2], 0.0],
             color: vertex.color,
             uv: vertex.uv,
         })

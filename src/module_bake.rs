@@ -106,6 +106,9 @@ fn quad(module: &GpuModule, side: u8) -> Result<[TreeVertex; 4]> {
             ));
         }
     };
+    let horizontal = unit(std::array::from_fn(|i| positions[1][i] - positions[0][i]))?;
+    let vertical = unit(std::array::from_fn(|i| positions[2][i] - positions[0][i]))?;
+    let normal = unit(cross(horizontal, vertical))?;
     let mut uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
     if module.metadata[0] == 2 && module_hash(module.metadata[1]) & 0x10000 != 0 {
         for uv in &mut uvs {
@@ -114,6 +117,7 @@ fn quad(module: &GpuModule, side: u8) -> Result<[TreeVertex; 4]> {
     }
     Ok(std::array::from_fn(|i| TreeVertex {
         position: [positions[i][0], positions[i][1], positions[i][2], 1.0],
+        normal: [normal[0], normal[1], normal[2], 0.0],
         color,
         uv: uvs[i],
     }))
