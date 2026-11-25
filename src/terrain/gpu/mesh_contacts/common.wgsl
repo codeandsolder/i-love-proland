@@ -2,6 +2,7 @@ override DUAL:bool=false;
 override VOXELS:bool=true;
 override CLUSTERS:bool=false;
 override PLANES:bool=true;
+override LANES:u32=64u;
 struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, flags:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
@@ -252,14 +253,14 @@ fn scan_triangle_range(mesh_b:Mesh,f:QueryFrame,first:u32,end:u32,stride:u32)->C
     return result;
 }
 fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
-    return scan_triangle_range(mesh_b,f,mesh_a.triangles.x+lane,mesh_a.triangles.y,64u);
+    return scan_triangle_range(mesh_b,f,mesh_a.triangles.x+lane,mesh_a.triangles.y,LANES);
 }
 // Divide the source into disjoint existing BVH subtrees. Entire
 // clusters outside the target's conservative voxel envelope are
 // discarded before reading even one source triangle.
 fn cluster_root(mesh:Mesh,lane:u32)->u32{
     var root=mesh.nodes.x;
-    for(var depth=0u;depth<6u;depth+=1u){
+    for(var depth=0u;(1u<<depth)<LANES;depth+=1u){
         if nodes[root].count!=0u{
             if (lane>>depth)!=0u{return 0xffffffffu;}
             break;
@@ -441,12 +442,24 @@ fn select_envelope(ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,solid:bo
 }
 
 var<workgroup> reduction:array<Contact,64>;
-fn reduce_contact(local:Contact,lane:u32)->Contact{
+fn reduce_lanes(local:Contact,lane:u32,width:u32){
     reduction[lane]=local;
     workgroupBarrier();
-    for(var stride=32u;stride>0u;stride/=2u){
-        if lane<stride{reduction[lane]=choose(reduction[lane],reduction[lane+stride]);}
+    for(var stride=width/2u;stride>0u;stride/=2u){
+        if (lane&(width-1u))<stride{reduction[lane]=choose(reduction[lane],reduction[lane+stride]);}
         workgroupBarrier();
     }
+}
+fn reduce_contact(local:Contact,lane:u32)->Contact{
+    reduce_lanes(local,lane,64u);
     return workgroupUniformLoad(&reduction[0]);
+}
+fn reduce_packed(local:Contact,lane:u32)->Contact{
+    if LANES==1u{return local;}
+    reduce_lanes(local,lane,LANES);
+    let result=reduction[lane&~(LANES-1u)];
+    // All lanes read before a following containment reduction can
+    // overwrite the same workgroup memory.
+    workgroupBarrier();
+    return result;
 }

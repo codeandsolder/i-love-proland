@@ -83,7 +83,7 @@ fn contains_components(source:Mesh,destination:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,
     let inverse=transpose(mat3x3<f32>(r0,r1,r2))*(1.0/det);
     let relative=inverse*linear(a);
     let offset=inverse*(a[3].xyz-b[3].xyz);
-    for(var i=source.seeds.x+lane;i<source.seeds.y;i+=64u){
+    for(var i=source.seeds.x+lane;i<source.seeds.y;i+=LANES){
         let triangle=triangles[i];
         let p=relative*triangle.a+offset;
         var visits=0u;
