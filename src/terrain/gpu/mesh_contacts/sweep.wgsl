@@ -87,7 +87,7 @@ fn sweep(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index)
         var candidate=true;
         if SWEEP_ENVELOPE {
             if lane==0u{
-                envelope_candidate=u32(select_envelope(pair.mesh_ids,a,b,margin));
+                envelope_candidate=u32(select_envelope(pair.mesh_ids,a,b,margin,true));
             }
             candidate=workgroupUniformLoad(&envelope_candidate)!=0u;
         }
@@ -95,7 +95,7 @@ fn sweep(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index)
         if candidate{
             result=orient_contact(pair.mesh_ids,reduce_contact(scan(pair.mesh_ids,a,b,margin,lane),lane));
         }
-        if result.features.z==0u && result.features.w==0u {
+        if candidate && result.features.z==0u && result.features.w==0u {
             let inside=reduce_contact(containment(pair.mesh_ids,a,b,lane),lane);
             result.features.w=inside.features.w;
             result.statistics.w=inside.statistics.w;

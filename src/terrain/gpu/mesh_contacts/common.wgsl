@@ -7,7 +7,7 @@ struct Node {
     hi:vec3<f32>, count:u32,
     escape:u32, mask_low:u32, mask_high:u32, end:u32,
 }
-struct Mesh { nodes:vec2<u32>, triangles:vec2<u32>, closed:u32, pad0:u32, pad1:u32, pad2:u32 }
+struct Mesh { nodes:vec2<u32>, triangles:vec2<u32>, closed:u32, pad0:u32, solid_mask:vec2<u32> }
 struct Contact {
     point_a:vec4<f32>,
     point_b:vec4<f32>,
@@ -383,9 +383,15 @@ fn occupied_octant(root:Node,octant:u32)->bool{
     let shift=(octant&1u)*2u+((octant>>1u)&1u)*8u;
     return (bits&(0x00330033u<<shift))!=0u;
 }
-fn envelope_overlap(mesh_a:Mesh,mesh_b:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32)->bool{
-    let root_a=nodes[mesh_a.nodes.x];
-    let root_b=nodes[mesh_b.nodes.x];
+fn envelope_overlap(mesh_a:Mesh,mesh_b:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,solid:bool)->bool{
+    var root_a=nodes[mesh_a.nodes.x];
+    var root_b=nodes[mesh_b.nodes.x];
+    if solid{
+        root_a.mask_low=mesh_a.solid_mask.x;
+        root_a.mask_high=mesh_a.solid_mask.y;
+        root_b.mask_low=mesh_b.solid_mask.x;
+        root_b.mask_high=mesh_b.solid_mask.y;
+    }
     let f=query_frame(a,b,root_a,margin);
     let half=(root_a.hi-root_a.lo)*0.5;
     // Nonfinite transforms/envelopes must continue to the exact path.
@@ -402,9 +408,9 @@ fn envelope_overlap(mesh_a:Mesh,mesh_b:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,margin:f
     return false;
 }
 
-fn select_envelope(ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32)->bool{
-    if reverse_order(ids){return envelope_overlap(meshes[ids.y],meshes[ids.x],b,a,margin);}
-    return envelope_overlap(meshes[ids.x],meshes[ids.y],a,b,margin);
+fn select_envelope(ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,solid:bool)->bool{
+    if reverse_order(ids){return envelope_overlap(meshes[ids.y],meshes[ids.x],b,a,margin,solid);}
+    return envelope_overlap(meshes[ids.x],meshes[ids.y],a,b,margin,solid);
 }
 
 var<workgroup> reduction:array<Contact,64>;

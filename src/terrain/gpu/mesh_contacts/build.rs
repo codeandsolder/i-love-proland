@@ -136,6 +136,40 @@ fn mask(triangles: &[Triangle], lo: [f32; 3], hi: [f32; 3]) -> [u32; 2] {
     ]
 }
 
+// Exterior flood fill on the conservative surface supercover. A cell
+// which contains an interior point cannot reach the outside through
+// face-connected empty cells without crossing an occupied cell.
+// Sealed cavities and disconnected open surfaces may overfill, never
+// carve holes in the authoritative closed shell.
+fn solid_cover(surface: [u32; 2]) -> [u32; 2] {
+    let occupied = u64::from(surface[0]) | (u64::from(surface[1]) << 32);
+    const X0: u64 = 0x1111_1111_1111_1111;
+    const X3: u64 = X0 << 3;
+    const Y0: u64 = 0x000f_000f_000f_000f;
+    const Y3: u64 = Y0 << 12;
+    const Z0: u64 = 0xffff;
+    const Z3: u64 = Z0 << 48;
+    let empty = !occupied;
+    let mut exterior = empty & (X0 | X3 | Y0 | Y3 | Z0 | Z3);
+    loop {
+        let neighbors = ((exterior & !X0) >> 1)
+            | ((exterior & !X3) << 1)
+            | ((exterior & !Y0) >> 4)
+            | ((exterior & !Y3) << 4)
+            | ((exterior & !Z0) >> 16)
+            | ((exterior & !Z3) << 16);
+        let expanded = exterior | (neighbors & empty);
+        if expanded == exterior {
+            let bytes = (!exterior).to_le_bytes();
+            return [
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            ];
+        }
+        exterior = expanded;
+    }
+}
+
 fn index(n: usize) -> io::Result<u32> {
     u32::try_from(n).map_err(io::Error::other)
 }
@@ -227,11 +261,18 @@ pub(super) fn catalog(
             });
         }
         build(&mut nodes, &mut triangles[start..], index(start)?)?;
+        let surface = nodes[root as usize].mask;
+        let solid_mask = if topology.closed {
+            solid_cover(surface)
+        } else {
+            surface
+        };
         meshes.push(Mesh {
             nodes: [root, index(nodes.len())?],
             triangles: [index(start)?, index(triangles.len())?],
             closed: u32::from(topology.closed),
-            padding: [0; 3],
+            padding: 0,
+            solid_mask,
         });
     }
     if meshes.is_empty() {
@@ -243,6 +284,30 @@ pub(super) fn catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filled_root_cover_keeps_solids_and_exterior_holes() {
+        // A sealed 4³ shell encloses eight interior cells.
+        let interior = 0x0000_0660_0660_0000_u64;
+        let boundary = !interior;
+        let bytes = boundary.to_le_bytes();
+        let mask = [
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+            u32::from_le_bytes(bytes[4..].try_into().unwrap()),
+        ];
+        assert_eq!(solid_cover(mask), [u32::MAX; 2]);
+        // Remove one face cell adjacent to the interior; all connected
+        // empty cells must now be reachable from the outside.
+        let vented = boundary & !(1_u64 << 5);
+        let bytes = vented.to_le_bytes();
+        let mask = [
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+            u32::from_le_bytes(bytes[4..].try_into().unwrap()),
+        ];
+        assert_eq!(solid_cover(mask), mask);
+        assert_eq!(solid_cover([0; 2]), [0; 2]);
+        assert_eq!(solid_cover([1, 1 << 31]), [1, 1 << 31]);
+    }
+
     #[test]
     fn grid_projection_preserves_exhaustive_sat() {
         // Reproduce the exhaustive old implementation on isolated

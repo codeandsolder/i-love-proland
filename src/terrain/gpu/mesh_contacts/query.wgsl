@@ -43,19 +43,9 @@ fn prequalify(@builtin(global_invocation_id) id:vec3<u32>){
             let bb=root_bounds(pair.meshes.y,b,b[3].xyz);
             if any(ab.lo-bb.hi>vec3<f32>(config.margin))||
                any(bb.lo-ab.hi>vec3<f32>(config.margin)){return;}
-            // Surface-envelope separation does not prove absence of
-            // solid containment. Keep those pairs for the closed-shell
-            // classifier even when their surfaces are far apart.
-            if ENVELOPE{
-                let ma=meshes[pair.meshes.x];
-                let mb=meshes[pair.meshes.y];
-                if (config.mode&4u)==0u||(ma.closed==0u&&mb.closed==0u){
-                    // Orient the cover just as the exact query: the smaller
-                    // source generally has fewer occupied coarse cells.
-                    let overlap=select_envelope(pair.meshes,a,b,config.margin);
-                    if !overlap{return;}
-                }
-            }
+            // Closed solids use a filled supercover rather than only
+            // their surface voxels. Interior containment survives.
+            if ENVELOPE && !select_envelope(pair.meshes,a,b,config.margin,(config.mode&4u)!=0u){return;}
         }
     }
     let slot=atomicAdd(&dispatch.x,1u);
