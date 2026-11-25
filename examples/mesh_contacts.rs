@@ -11,6 +11,8 @@ mod order;
 mod packed;
 #[path = "mesh_contacts/sweep.rs"]
 mod sweep;
+#[path = "mesh_contacts/timing.rs"]
+mod timing;
 use i_love_proland::terrain::gpu::mesh_contacts::{
     CandidateDispatch, Domain, MeshCatalog, MeshContact, MeshPair, MeshQueries, MeshSource,
     Midphase, QuerySettings,
@@ -364,7 +366,16 @@ fn main() -> Result<()> {
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?
     };
     println!("MESH_GPU adapter={}", adapter.get_info().name);
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+    let optional =
+        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    let required_features = if adapter.features().contains(optional) {
+        optional
+    } else {
+        wgpu::Features::empty()
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features,
+        ..Default::default()
+    }))?;
     check(&device, &queue)
 }

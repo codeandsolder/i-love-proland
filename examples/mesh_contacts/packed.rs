@@ -136,13 +136,7 @@ fn compare(
     };
     let reference = catalog.queries(device, matrices, pairs, settings)?;
     let expected = sample(device, queue, &reference)?;
-    benchmark(
-        device,
-        queue,
-        &format!("{name}_wide64"),
-        &reference,
-        &expected,
-    )?;
+    let mut measurements = vec![(format!("{name}_wide64"), reference, expected.clone())];
     for width in [
         PairWidth::One,
         PairWidth::Four,
@@ -161,13 +155,17 @@ fn compare(
         )?;
         let actual = sample(device, queue, &queries)?;
         assert_same(&expected, &actual, name, width, true);
-        benchmark(
-            device,
-            queue,
-            &format!("{name}_packed_{width:?}"),
-            &queries,
-            &actual,
-        )?;
+        measurements.push((format!("{name}_packed_{width:?}"), queries, actual));
+    }
+    if device
+        .features()
+        .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+    {
+        super::timing::compare(device, queue, &measurements)?;
+    } else {
+        for (label, queries, results) in &measurements {
+            benchmark(device, queue, label, queries, results)?;
+        }
     }
     println!(
         "MESH_PACKED workload={name} cases={} exact_all_widths=true",
