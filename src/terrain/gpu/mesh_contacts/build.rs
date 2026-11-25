@@ -227,11 +227,22 @@ pub(super) fn catalog(
             });
         }
         build(&mut nodes, &mut triangles[start..], index(start)?)?;
+        let end = triangles.len();
+        // The BVH and original triangle range never include these
+        // copies. Each is the exact original representative chosen by
+        // welded topology; no approximation or extra collision surface.
+        let seeds = triangles[start..end]
+            .iter()
+            .copied()
+            .filter(|t| t.flags & 1 != 0)
+            .collect::<Vec<_>>();
+        triangles.extend(seeds);
         meshes.push(Mesh {
             nodes: [root, index(nodes.len())?],
-            triangles: [index(start)?, index(triangles.len())?],
+            triangles: [index(start)?, index(end)?],
             closed: u32::from(topology.closed),
-            padding: [0; 3],
+            padding: 0,
+            seeds: [index(end)?, index(triangles.len())?],
         });
     }
     if meshes.is_empty() {
@@ -243,6 +254,51 @@ pub(super) fn catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn indexed_component_seeds_preserve_original_faces() -> io::Result<()> {
+        let positions = [
+            [0., 0., 0.],
+            [1., 0., 0.],
+            [0., 1., 0.],
+            [1., 1., 0.],
+            [10., 0., 0.],
+            [11., 0., 0.],
+            [10., 1., 0.],
+        ];
+        let indices = [0, 1, 2, 2, 1, 3, 4, 5, 6];
+        let source = MeshSource {
+            positions: &positions,
+            indices: &indices,
+        };
+        let (nodes, triangles, meshes) = catalog(&[
+            source,
+            MeshSource {
+                positions: &positions,
+                indices: &indices,
+            },
+        ])?;
+        for mesh in &meshes {
+            let [start, end] = mesh.triangles.map(|i| i as usize);
+            let [seed_start, seed_end] = mesh.seeds.map(|i| i as usize);
+            let originals = triangles[start..end]
+                .iter()
+                .filter(|t| t.flags & 1 != 0)
+                .map(bytemuck::bytes_of)
+                .collect::<Vec<_>>();
+            let indexed = triangles[seed_start..seed_end]
+                .iter()
+                .map(bytemuck::bytes_of)
+                .collect::<Vec<_>>();
+            assert_eq!(originals, indexed);
+            assert_eq!(originals.len(), 2);
+            assert_eq!(end - start, 3);
+            assert_eq!(seed_start, end);
+            assert_eq!(nodes[mesh.nodes[0] as usize].end, mesh.triangles[1]);
+        }
+        assert_eq!(meshes[0].seeds[1], meshes[1].triangles[0]);
+        Ok(())
+    }
+
     #[test]
     fn grid_projection_preserves_exhaustive_sat() {
         // Reproduce the exhaustive old implementation on isolated

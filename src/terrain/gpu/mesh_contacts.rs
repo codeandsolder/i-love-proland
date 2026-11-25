@@ -112,7 +112,8 @@ struct Mesh {
     nodes: [u32; 2],
     triangles: [u32; 2],
     closed: u32,
-    padding: [u32; 3],
+    padding: u32,
+    seeds: [u32; 2],
 }
 
 #[repr(C)]
