@@ -60,6 +60,7 @@ impl ParallelPairs {
         colliders: &wgpu::Buffer,
         count: u32,
         source: &str,
+        collision_groups: Option<&wgpu::Buffer>,
     ) -> io::Result<Self> {
         if count == 0 {
             return Err(invalid("empty coupled body set"));
@@ -78,26 +79,24 @@ impl ParallelPairs {
         });
         let count_kernel = Kernel::new(device, "body neighbor count", source, "count_neighbors");
         let solve_kernel = Kernel::new(device, "body pair impulse gather", source, "resolve_pairs");
-        let sweep =
-            |input: &wgpu::Buffer, output: &wgpu::Buffer, restitution: u32| -> io::Result<Sweep> {
-                let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("body pair sweep parameters"),
-                    contents: bytemuck::cast_slice(&[restitution, 0, 0, 0]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                Ok(Sweep {
-                    count: count_kernel.bind(
-                        device,
-                        "body degree input",
-                        &[input, colliders, &degrees],
-                    )?,
-                    solve: solve_kernel.bind(
-                        device,
-                        "body impulse input/output",
-                        &[input, colliders, &degrees, output, &config],
-                    )?,
-                })
-            };
+        let sweep = |input: &wgpu::Buffer,
+                     output: &wgpu::Buffer,
+                     restitution: u32|
+         -> io::Result<Sweep> {
+            let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("body pair sweep parameters"),
+                contents: bytemuck::cast_slice(&[restitution, 0, 0, 0]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let mut count_buffers = vec![input, colliders, &degrees];
+            count_buffers.extend(collision_groups);
+            let mut solve_buffers = count_buffers.clone();
+            solve_buffers.extend([output, &config]);
+            Ok(Sweep {
+                count: count_kernel.bind(device, "body degree input", &count_buffers)?,
+                solve: solve_kernel.bind(device, "body impulse input/output", &solve_buffers)?,
+            })
+        };
         let sweeps = [sweep(bodies, &scratch, 1)?, sweep(&scratch, bodies, 0)?];
         Ok(Self {
             count: count_kernel,
@@ -132,18 +131,36 @@ impl BodyPairs {
         colliders: &wgpu::Buffer,
         count: u32,
         spheres: bool,
+        collision_groups: Option<&[u32]>,
     ) -> io::Result<Self> {
         if spheres && (1..=64).contains(&count) {
             let kernel = Kernel::new(device, "local sphere island", LOCAL_SOURCE, "solve_local");
             let bind = kernel.bind(device, "local sphere island", &[bodies, colliders])?;
             Ok(Self::Local { kernel, bind })
         } else {
+            let group_buffer = if spheres {
+                None
+            } else {
+                let groups = collision_groups
+                    .map_or_else(|| (0..count).collect::<Vec<_>>(), <[u32]>::to_vec);
+                if groups.len() != count as usize {
+                    return Err(invalid("invalid collision group mapping"));
+                }
+                Some(
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("body collision groups"),
+                        contents: bytemuck::cast_slice(&groups),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    }),
+                )
+            };
             Ok(Self::Parallel(Box::new(ParallelPairs::new(
                 device,
                 bodies,
                 colliders,
                 count,
                 if spheres { SOURCE } else { COMPOUND_SOURCE },
+                group_buffer.as_ref(),
             )?)))
         }
     }

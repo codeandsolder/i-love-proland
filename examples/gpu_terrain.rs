@@ -26,6 +26,10 @@ fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
     Ok(pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("GPU terrain probe"),
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 10,
+                ..Default::default()
+            },
             ..Default::default()
         },
     ))?)

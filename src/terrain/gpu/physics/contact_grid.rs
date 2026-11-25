@@ -1,7 +1,8 @@
 //! Canonical contact-grid sources. Regional detail stays on the GPU;
 //! external authored height fields can upload exact immutable lattice
 //! samples without building a second procedural terrain generator.
-use super::{TerrainGpu, TerrainRequest, invalid};
+use super::{TerrainRequest, invalid};
+use crate::terrain::gpu::TerrainGpu;
 use crate::terrain::{
     RegionChart,
     gpu::{GridProjection, TerrainSample},

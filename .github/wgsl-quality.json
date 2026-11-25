@@ -39,7 +39,8 @@
         "src/terrain/gpu/physics/body_math.wgsl",
         "src/terrain/gpu/physics/collider.wgsl",
         "src/terrain/gpu/physics/step.wgsl",
-        "src/terrain/gpu/physics/static_scene.wgsl"
+        "src/terrain/gpu/physics/static_scene.wgsl",
+        "src/terrain/gpu/physics/articulation.wgsl"
       ]
     },
     {

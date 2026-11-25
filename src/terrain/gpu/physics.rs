@@ -1,12 +1,14 @@
 //! Experimental fixed-step GPU rigid-body terrain solver. This is a local
 //! chart-space sandbox, not yet a full planetary multi-body physics engine.
+mod articulation;
 mod clock;
 mod contact_grid;
 pub use contact_grid::{ContactGrid, PinnedGrid};
 mod body_pairs;
 mod static_scene;
-use super::{
-    GridProjection, Kernel, RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage,
+use super::{GridProjection, Kernel, RecordedReadback, TerrainRequest, invalid, storage};
+pub use articulation::{
+    ARTICULATION_WGSL, ArticulationLayout, Island, Joint, JointDrive, JointFrame, JointKind,
 };
 pub use clock::{SimulationClock, StepBatch};
 pub use static_scene::{StaticScene, StaticTriangle};
@@ -270,6 +272,7 @@ struct StepConfig {
 /// intentionally outside this first terrain-contact solver.
 pub struct PhysicsGpu {
     pipeline: Kernel,
+    articulation: Option<articulation::Articulation>,
     static_scene: StaticScene,
     sphere_eligible: bool,
     body_pairs: Option<body_pairs::BodyPairs>,
@@ -364,6 +367,7 @@ impl PhysicsGpu {
         };
         Ok(Self {
             pipeline,
+            articulation: None,
             static_scene: StaticScene::new(device, &[])?,
             sphere_eligible: body_pairs::eligible(bodies, shapes),
             body_pairs: None,
@@ -387,6 +391,47 @@ impl PhysicsGpu {
             submitted: config.initial_tick,
             hz: config.hz,
         })
+    }
+
+    /// Upload coupled islands with the same GPU terrain contact geometry.
+    /// Each island is an exclusive owner of its bodies during a dispatch.
+    ///
+    /// # Errors
+    /// Rejects invalid topology, joint parameters or adapter limits.
+    pub fn articulated(
+        device: &wgpu::Device,
+        terrain: &(impl ContactGrid + ?Sized),
+        slot: u32,
+        config: PhysicsConfig<'_>,
+        bodies: &[RigidBody],
+        shapes: &[Collider],
+        layout: ArticulationLayout<'_>,
+    ) -> io::Result<Self> {
+        let mut physics = Self::new(device, terrain, slot, config, bodies, shapes)?;
+        physics.articulation = Some(articulation::Articulation::new(
+            device,
+            layout,
+            bodies,
+            physics.params.contact_stride,
+        )?);
+        Ok(physics)
+    }
+
+    /// Change a scalar joint drive in command-buffer order.
+    ///
+    /// # Errors
+    /// Rejects invalid drive or a nonexistent joint.
+    pub fn encode_joint_drive(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        index: usize,
+        drive: JointDrive,
+    ) -> io::Result<()> {
+        self.articulation
+            .as_mut()
+            .ok_or_else(|| invalid("independent physics has no joints"))?
+            .drive(device, encoder, index, drive)
     }
 
     /// Geometry used by both the solver and its terrain draw.
@@ -430,7 +475,10 @@ impl PhysicsGpu {
             &self.bodies,
             &self.shapes,
             self.params.count,
-            self.sphere_eligible,
+            self.sphere_eligible && self.articulation.is_none(),
+            self.articulation
+                .as_ref()
+                .map(|a| a.collision_groups.as_slice()),
         )?);
         Ok(())
     }
@@ -558,17 +606,32 @@ impl PhysicsGpu {
             &self.static_scene.nodes,
             &self.static_scene.triangles,
         ];
-        let bind = self.pipeline.bind(device, "physics batch", &buffers)?;
-        let groups = [self.params.count.div_ceil(64), 1, 1];
+        let (kernel, bind, groups) = if let Some(articulation) = &self.articulation {
+            let mut articulated_buffers = buffers.to_vec();
+            articulated_buffers.extend([&articulation.topology, &articulation.scratch]);
+            (
+                &articulation.pipeline,
+                articulation.pipeline.bind(
+                    device,
+                    "articulated physics batch",
+                    &articulated_buffers,
+                )?,
+                [articulation.count, 1, 1],
+            )
+        } else {
+            (
+                &self.pipeline,
+                self.pipeline.bind(device, "physics batch", &buffers)?,
+                [self.params.count.div_ceil(64), 1, 1],
+            )
+        };
         if let Some(pairs) = &self.body_pairs {
             for _ in 0..batch.steps {
-                self.pipeline
-                    .dispatch(encoder, "advance one coupled physics tick", &bind, groups);
+                kernel.dispatch(encoder, "advance one coupled physics tick", &bind, groups);
                 pairs.encode(encoder);
             }
         } else {
-            self.pipeline
-                .dispatch(encoder, "advance fixed physics ticks", &bind, groups);
+            kernel.dispatch(encoder, "advance fixed physics ticks", &bind, groups);
         }
         self.submitted = end;
         Ok(())
