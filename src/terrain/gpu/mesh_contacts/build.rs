@@ -31,7 +31,7 @@ impl Triangle {
 // Separating-axis triangle/AABB test in f64, inflated by roundoff.
 // Zero-area and thin triangles are retained, including boundary touches.
 fn intersects(points: [V; 3], lo: V, hi: V) -> bool {
-    let center = std::array::from_fn(|i| (lo[i] + hi[i]) * 0.5);
+    let center = std::array::from_fn(|i| f64::midpoint(lo[i], hi[i]));
     let half: V = std::array::from_fn(|i| (hi[i] - lo[i]) * 0.5);
     let p = points.map(|v| sub(v, center));
     let edges = [sub(p[1], p[0]), sub(p[2], p[1]), sub(p[0], p[2])];
@@ -155,8 +155,8 @@ pub(super) fn catalog(
         let start = triangles.len();
         let root = index(nodes.len())?;
         for (id, face) in source.indices.as_chunks::<3>().0.iter().enumerate() {
-            let [a, b, c] = face.map(|i| source.positions.get(i as usize).copied());
-            let (Some(a), Some(b), Some(c)) = (a, b, c) else {
+            let points = face.map(|i| source.positions.get(i as usize).copied());
+            let [Some(a), Some(b), Some(c)] = points else {
                 return Err(invalid("collision index out of range"));
             };
             triangles.push(Triangle {
