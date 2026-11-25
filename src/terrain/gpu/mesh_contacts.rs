@@ -9,6 +9,7 @@ use std::io;
 use wgpu::util::DeviceExt;
 mod build;
 mod sweep;
+mod topology;
 pub use sweep::{MeshSweeps, RigidPose, SweepPair, SweepResult, SweepSettings};
 
 /// One indexed collision mesh in its authored local coordinate system.
@@ -34,6 +35,13 @@ pub enum Midphase {
     DualVoxelBvh,
 }
 
+/// Surface-only distance or physical closed-shell containment as well.
+#[derive(Clone, Copy, Debug)]
+pub enum Domain {
+    Surface,
+    ClosedSolid,
+}
+
 /// Per-pair reduced contact candidate and instrumentation.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -43,7 +51,8 @@ pub struct MeshContact {
     /// Corresponding point on B, reserved.
     pub point_b: [f32; 4],
     /// Authored triangle IDs on A and B, count of near pairs, status.
-    /// Status 0 is valid; 1 indicates an invalid or singular transform.
+    /// Status flags: 1 invalid transform, 2 traversal overflow,
+    /// 4 closed-shell containment, 8 unresolved containment classification.
     pub features: [u32; 4],
     /// BVH visits, triangle tests, mask rejections, reserved.
     pub statistics: [u32; 4],
@@ -55,7 +64,8 @@ struct Triangle {
     a: [f32; 3],
     id: u32,
     b: [f32; 4],
-    c: [f32; 4],
+    c: [f32; 3],
+    representative: u32,
 }
 
 #[repr(C)]
@@ -75,6 +85,8 @@ struct Node {
 struct Mesh {
     nodes: [u32; 2],
     triangles: [u32; 2],
+    closed: u32,
+    padding: [u32; 3],
 }
 
 #[repr(C)]
@@ -121,6 +133,7 @@ impl MeshCatalog {
                 "mesh contact query",
                 concat!(
                     include_str!("mesh_contacts/common.wgsl"),
+                    include_str!("mesh_contacts/containment.wgsl"),
                     include_str!("mesh_contacts/query.wgsl")
                 ),
                 "query",
@@ -130,6 +143,7 @@ impl MeshCatalog {
                 "mesh swept query",
                 concat!(
                     include_str!("mesh_contacts/common.wgsl"),
+                    include_str!("mesh_contacts/containment.wgsl"),
                     include_str!("mesh_contacts/sweep.wgsl")
                 ),
                 "sweep",
@@ -155,6 +169,7 @@ impl MeshCatalog {
         pairs: &[MeshPair],
         margin: f32,
         mode: Midphase,
+        domain: Domain,
     ) -> io::Result<MeshQueries> {
         let count = u32::try_from(pairs.len()).map_err(io::Error::other)?;
         let transform_count = u32::try_from(transforms.size() / 64).map_err(io::Error::other)?;
@@ -196,6 +211,10 @@ impl MeshCatalog {
                     Midphase::VoxelBvh => 1,
                     Midphase::DualBvh => 2,
                     Midphase::DualVoxelBvh => 3,
+                } | if matches!(domain, Domain::ClosedSolid) {
+                    4
+                } else {
+                    0
                 },
                 count,
                 transform_count,

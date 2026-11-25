@@ -10,6 +10,11 @@ struct Config { margin:f32, mode:u32, count:u32, transform_count:u32 }
 fn query(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) lane:u32){
     let pair=pairs[group.x];
     let local=scan(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],config.margin,config.mode,lane);
-    let result=reduce_contact(local,lane);
+    var result=reduce_contact(local,lane);
+    if (config.mode&4u)!=0u && result.features.z==0u && result.features.w==0u {
+        let inside=reduce_contact(containment(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],lane),lane);
+        result.features.w=inside.features.w;
+        result.statistics.w=inside.statistics.w;
+    }
     if lane==0u{contacts[group.x]=result;}
 }

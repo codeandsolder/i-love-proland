@@ -82,13 +82,18 @@ fn sweep(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index)
         let margin=config.margin+displacement*width*0.5+config.deviation+rounding;
         let a=interpolate(pair.poses[0],pair.poses[1],mid);
         let b=interpolate(pair.poses[2],pair.poses[3],mid);
-        let result=reduce_contact(scan(pair.mesh_ids,a,b,margin,1u,lane),lane);
+        var result=reduce_contact(scan(pair.mesh_ids,a,b,margin,1u,lane),lane);
+        if result.features.z==0u && result.features.w==0u {
+            let inside=reduce_contact(containment(pair.mesh_ids,a,b,lane),lane);
+            result.features.w=inside.features.w;
+            result.statistics.w=inside.statistics.w;
+        }
         if lane==0u{
             cursor.tests+=1u;
-            if result.features.w!=0u{
+            if (result.features.w&3u)!=0u{
                 cursor.done=2u;
                 results[group.x]=SweepResult(vec4<f32>(lo,hi,mid,margin),vec4<u32>(2u,cursor.tests,0u,0u),result);
-            }else if result.features.z!=0u{
+            }else if result.features.z!=0u||result.features.w!=0u{
                 if width<=config.tolerance || cursor.tests>=config.budget{
                     cursor.done=1u;
                     let status=select(1u,3u,width>config.tolerance);

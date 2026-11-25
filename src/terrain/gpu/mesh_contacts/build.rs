@@ -23,7 +23,7 @@ impl Triangle {
         [
             self.a.map(f64::from),
             [self.b[0], self.b[1], self.b[2]].map(f64::from),
-            [self.c[0], self.c[1], self.c[2]].map(f64::from),
+            self.c.map(f64::from),
         ]
     }
 }
@@ -154,6 +154,7 @@ pub(super) fn catalog(
         {
             return Err(invalid("invalid collision mesh"));
         }
+        let topology = super::topology::classify(source)?;
         let start = triangles.len();
         let root = index(nodes.len())?;
         for (id, face) in source.indices.as_chunks::<3>().0.iter().enumerate() {
@@ -165,13 +166,16 @@ pub(super) fn catalog(
                 a,
                 id: index(id)?,
                 b: [b[0], b[1], b[2], 0.0],
-                c: [c[0], c[1], c[2], 0.0],
+                c,
+                representative: u32::from(topology.representatives[id]),
             });
         }
         build(&mut nodes, &mut triangles[start..], index(start)?)?;
         meshes.push(Mesh {
             nodes: [root, index(nodes.len())?],
             triangles: [index(start)?, index(triangles.len())?],
+            closed: u32::from(topology.closed),
+            padding: [0; 3],
         });
     }
     if meshes.is_empty() {
@@ -189,7 +193,8 @@ mod tests {
             a: [0., 0., 0.],
             id: 0,
             b: [1., 1., 0., 0.],
-            c: [1., 1., 1., 0.],
+            c: [1., 1., 1.],
+            representative: 1,
         };
         let m = mask(&[t], [0.; 3], [1.; 3]);
         assert_ne!(m, [u32::MAX; 2]);

@@ -2,7 +2,7 @@
 #[path = "mesh_contacts/sweep.rs"]
 mod sweep;
 use i_love_proland::terrain::gpu::mesh_contacts::{
-    MeshCatalog, MeshContact, MeshPair, MeshQueries, MeshSource, Midphase,
+    Domain, MeshCatalog, MeshContact, MeshPair, MeshQueries, MeshSource, Midphase,
 };
 use std::{error::Error, io, time::Instant};
 use wgpu::util::DeviceExt;
@@ -186,8 +186,22 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         contents: bytemuck::cast_slice(&poses),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    let plain = catalog.queries(device, &matrices, &pairs, 0.1, Midphase::Bvh)?;
-    let voxels = catalog.queries(device, &matrices, &pairs, 0.1, Midphase::VoxelBvh)?;
+    let plain = catalog.queries(
+        device,
+        &matrices,
+        &pairs,
+        0.1,
+        Midphase::Bvh,
+        Domain::Surface,
+    )?;
+    let voxels = catalog.queries(
+        device,
+        &matrices,
+        &pairs,
+        0.1,
+        Midphase::VoxelBvh,
+        Domain::Surface,
+    )?;
     let a = sample(device, queue, &catalog, &plain)?;
     let b = sample(device, queue, &catalog, &voxels)?;
     for (i, (a, b)) in a.iter().zip(&b).enumerate() {
@@ -218,8 +232,22 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         rotating.len(),
         catalog.resident_bytes()
     );
-    let dual = catalog.queries(device, &matrices, &pairs, 0.1, Midphase::DualBvh)?;
-    let dual_voxel = catalog.queries(device, &matrices, &pairs, 0.1, Midphase::DualVoxelBvh)?;
+    let dual = catalog.queries(
+        device,
+        &matrices,
+        &pairs,
+        0.1,
+        Midphase::DualBvh,
+        Domain::Surface,
+    )?;
+    let dual_voxel = catalog.queries(
+        device,
+        &matrices,
+        &pairs,
+        0.1,
+        Midphase::DualVoxelBvh,
+        Domain::Surface,
+    )?;
     let c = sample(device, queue, &catalog, &dual)?;
     let d = sample(device, queue, &catalog, &dual_voxel)?;
     for other in [&c, &d] {

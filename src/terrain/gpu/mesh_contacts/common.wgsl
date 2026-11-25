@@ -1,10 +1,10 @@
-struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec4<f32> }
+struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, representative:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
     hi:vec3<f32>, count:u32,
     escape:u32, mask_low:u32, mask_high:u32, end:u32,
 }
-struct Mesh { nodes:vec2<u32>, triangles:vec2<u32> }
+struct Mesh { nodes:vec2<u32>, triangles:vec2<u32>, closed:u32, pad0:u32, pad1:u32, pad2:u32 }
 struct Contact {
     point_a:vec4<f32>,
     point_b:vec4<f32>,
@@ -109,7 +109,7 @@ fn linear(m:mat4x4<f32>)->mat3x3<f32>{
     return mat3x3<f32>(m[0].xyz,m[1].xyz,m[2].xyz);
 }
 fn transformed(t:Triangle,m:mat3x3<f32>,offset:vec3<f32>)->mat3x3<f32>{
-    return mat3x3<f32>(m*t.a+offset,m*t.b.xyz+offset,m*t.c.xyz+offset);
+    return mat3x3<f32>(m*t.a+offset,m*t.b.xyz+offset,m*t.c+offset);
 }
 fn voxel_overlap(node:Node,lo:vec3<f32>,hi:vec3<f32>)->bool{
     if node.mask_low==0xffffffffu && node.mask_high==0xffffffffu{return true;}
@@ -135,7 +135,7 @@ fn choose(a:Contact,b:Contact)->Contact{
         result=b;
     }
     result.features.z=a.features.z+b.features.z;
-    result.features.w=max(a.features.w,b.features.w);
+    result.features.w=a.features.w|b.features.w;
     result.statistics=a.statistics+b.statistics;
     return result;
 }
