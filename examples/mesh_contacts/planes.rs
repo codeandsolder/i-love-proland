@@ -59,7 +59,13 @@ fn baked_oblique(frame: &Geometry) -> Geometry {
         positions: frame
             .positions
             .iter()
-            .map(|p| [cos * p[0] - sin * p[2], p[1], sin * p[0] + cos * p[2]])
+            .map(|p| {
+                [
+                    sin.mul_add(-p[2], cos * p[0]),
+                    p[1],
+                    cos.mul_add(p[2], sin * p[0]),
+                ]
+            })
             .collect(),
         indices: frame.indices.clone(),
     }
