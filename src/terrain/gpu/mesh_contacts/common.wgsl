@@ -323,8 +323,6 @@ fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u
 // can therefore avoid thousands of root visits without changing the
 // actual geometric predicate. Preserve the public pair's witness order.
 fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
-    let ma=meshes[mesh_ids.x].triangles;
-    let mb=meshes[mesh_ids.y].triangles;
     // A singular input must not become valid merely because the pair
     // order changed. Degenerate triangles are still allowed in meshes.
     let la=linear(a);
@@ -336,8 +334,17 @@ fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Con
         result.features.w=1u;
         return result;
     }
-    if ma.y-ma.x<=mb.y-mb.x{return scan_ordered(mesh_ids,a,b,margin,lane);}
-    var result=scan_ordered(mesh_ids.yx,b,a,margin,lane);
+    if !reverse_order(mesh_ids){return scan_ordered(mesh_ids,a,b,margin,lane);}
+    return scan_ordered(mesh_ids.yx,b,a,margin,lane);
+}
+fn reverse_order(mesh_ids:vec2<u32>)->bool{
+    let ma=meshes[mesh_ids.x].triangles;
+    let mb=meshes[mesh_ids.y].triangles;
+    return ma.y-ma.x>mb.y-mb.x;
+}
+fn orient_contact(mesh_ids:vec2<u32>,contact:Contact)->Contact{
+    if !reverse_order(mesh_ids){return contact;}
+    var result=contact;
     let pa=result.point_a.xyz;
     result.point_a=vec4<f32>(result.point_b.xyz,result.point_a.w);
     result.point_b=vec4<f32>(pa,0.0);

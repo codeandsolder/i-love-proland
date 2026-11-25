@@ -51,7 +51,7 @@ fn prequalify(@builtin(global_invocation_id) id:vec3<u32>){
 fn query_pair(i:u32,lane:u32){
     let pair=pairs[i];
     let local=scan(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],config.margin,lane);
-    var result=reduce_contact(local,lane);
+    var result=orient_contact(pair.meshes,reduce_contact(local,lane));
     if (config.mode&4u)!=0u && result.features.z==0u && result.features.w==0u {
         let inside=reduce_contact(containment(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],lane),lane);
         result.features.w=inside.features.w;
