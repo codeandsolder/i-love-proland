@@ -40,3 +40,7 @@ required-features = ["gpu"]
 [[example]]
 name = "gpu_terrain"
 required-features = ["gpu"]
+
+[[example]]
+name = "mesh_contacts"
+required-features = ["gpu"]
