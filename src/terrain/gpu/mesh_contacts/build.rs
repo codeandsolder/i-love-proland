@@ -52,29 +52,84 @@ fn intersects(points: [V; 3], lo: V, hi: V) -> bool {
         .any(separated)
 }
 
-fn mask(triangles: &[Triangle], lo: [f32; 3], hi: [f32; 3]) -> [u32; 2] {
-    let lo = lo.map(f64::from);
-    let hi = hi.map(f64::from);
-    let step: V = std::array::from_fn(|i| (hi[i] - lo[i]) * 0.25);
-    let mut result = 0_u64;
-    for t in triangles {
-        let p = t.points();
-        for i in 0..64_u32 {
-            if result & (1 << i) != 0 {
-                continue;
-            }
-            let index = [i % 4, i / 4 % 4, i / 16];
-            let a = std::array::from_fn(|j| step[j].mul_add(f64::from(index[j]), lo[j]));
-            let b = std::array::from_fn(|j| step[j].mul_add(f64::from(index[j] + 1), lo[j]));
-            if intersects(p, a, b) {
-                result |= 1 << i;
-            }
-        }
-        if result == u64::MAX {
-            break;
+struct Grid {
+    lo: V,
+    step: V,
+}
+
+impl Grid {
+    fn new(lo: [f32; 3], hi: [f32; 3]) -> Self {
+        let lo = lo.map(f64::from);
+        let hi = hi.map(f64::from);
+        Self {
+            lo,
+            step: std::array::from_fn(|i| (hi[i] - lo[i]) * 0.25),
         }
     }
-    let bytes = result.to_le_bytes();
+
+    fn cell(&self, index: [u32; 3]) -> (V, V) {
+        let lo = std::array::from_fn(|j| self.step[j].mul_add(f64::from(index[j]), self.lo[j]));
+        let hi = std::array::from_fn(|j| self.step[j].mul_add(f64::from(index[j] + 1), self.lo[j]));
+        (lo, hi)
+    }
+
+    // Restrict SAT to cells which overlap the triangle's axis-aligned
+    // projection. Include the full SAT axis-roundoff allowance, so this
+    // inexpensive prefilter cannot change the exact occupancy mask.
+    fn axis_range(&self, points: [V; 3], axis: usize) -> std::ops::RangeInclusive<u32> {
+        let min = points.iter().map(|p| p[axis]).fold(f64::INFINITY, f64::min);
+        let max = points
+            .iter()
+            .map(|p| p[axis])
+            .fold(f64::NEG_INFINITY, f64::max);
+        let end = self.step[axis].mul_add(4.0, self.lo[axis]);
+        let scale = min
+            .abs()
+            .max(max.abs())
+            .max(self.lo[axis].abs())
+            .max(end.abs());
+        let error = 128.0 * f64::EPSILON * 8.0_f64.mul_add(scale, 1.0);
+        let boundary = |i| self.step[axis].mul_add(f64::from(i), self.lo[axis]);
+        let mut first = 0;
+        let mut last = 3;
+        while first < 3 && boundary(first + 1) < min - error {
+            first += 1;
+        }
+        while last > 0 && boundary(last) > max + error {
+            last -= 1;
+        }
+        first..=last
+    }
+
+    fn occupied(&self, triangles: &[Triangle]) -> u64 {
+        let mut result = 0_u64;
+        for t in triangles {
+            let points = t.points();
+            let [xs, ys, zs] = std::array::from_fn(|axis| self.axis_range(points, axis));
+            for z in zs {
+                for y in ys.clone() {
+                    for x in xs.clone() {
+                        let bit = 1_u64 << (x + y * 4 + z * 16);
+                        if result & bit != 0 {
+                            continue;
+                        }
+                        let (lo, hi) = self.cell([x, y, z]);
+                        if intersects(points, lo, hi) {
+                            result |= bit;
+                        }
+                    }
+                }
+            }
+            if result == u64::MAX {
+                break;
+            }
+        }
+        result
+    }
+}
+
+fn mask(triangles: &[Triangle], lo: [f32; 3], hi: [f32; 3]) -> [u32; 2] {
+    let bytes = Grid::new(lo, hi).occupied(triangles).to_le_bytes();
     [
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
@@ -187,6 +242,56 @@ pub(super) fn catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grid_projection_preserves_exhaustive_sat() {
+        // Reproduce the exhaustive old implementation on isolated
+        // triangles (not a quickly saturated union of many surfaces).
+        let mut rng = 0x4d59_5df4_u32;
+        for offset in [0.0_f32, 100.0, 100_000.0, -100_000.0] {
+            for extent in [0.125_f32, 1.0, 256.0] {
+                let grid = Grid::new([offset; 3], [offset + extent; 3]);
+                for case in 0..128_u32 {
+                    let mut point = || {
+                        std::array::from_fn(|_| {
+                            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            let value = f32::from(u16::from_le_bytes([
+                                rng.to_le_bytes()[2],
+                                rng.to_le_bytes()[3],
+                            ])) / 65_535.0;
+                            extent.mul_add(value, offset)
+                        })
+                    };
+                    let a = point();
+                    let mut b = point();
+                    let mut c = point();
+                    if case % 4 == 0 {
+                        b = a;
+                    }
+                    if case % 7 == 0 {
+                        c[2] = a[2];
+                        b[2] = a[2];
+                    }
+                    let triangle = Triangle {
+                        a,
+                        id: case,
+                        b: [b[0], b[1], b[2], 0.0],
+                        c,
+                        representative: 0,
+                    };
+                    let points = triangle.points();
+                    let mut exhaustive = 0_u64;
+                    for cell in 0..64_u32 {
+                        let (lo, hi) = grid.cell([cell % 4, cell / 4 % 4, cell / 16]);
+                        if intersects(points, lo, hi) {
+                            exhaustive |= 1_u64 << cell;
+                        }
+                    }
+                    assert_eq!(grid.occupied(&[triangle]), exhaustive);
+                }
+            }
+        }
+    }
+
     #[test]
     fn sparse_diagonal_and_planar_boundary_are_preserved() {
         let t = Triangle {

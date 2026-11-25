@@ -343,7 +343,7 @@ fn reverse_order(mesh_ids:vec2<u32>)->bool{
     return ma.y-ma.x>mb.y-mb.x;
 }
 fn orient_contact(mesh_ids:vec2<u32>,contact:Contact)->Contact{
-    if !reverse_order(mesh_ids){return contact;}
+    if !reverse_order(mesh_ids)||contact.features.z==0u{return contact;}
     var result=contact;
     let pa=result.point_a.xyz;
     result.point_a=vec4<f32>(result.point_b.xyz,result.point_a.w);
