@@ -9,8 +9,8 @@ struct ArticulationScratch{
     contact:Constraint,
     impulses:vec4<f32>,
 }
-@group(0) @binding(7) var<storage,read> topology:array<JointRecord>;
-@group(0) @binding(8) var<storage,read_write> scratch:array<ArticulationScratch>;
+@group(0) @binding(9) var<storage,read> topology:array<JointRecord>;
+@group(0) @binding(10) var<storage,read_write> scratch:array<ArticulationScratch>;
 
 fn inverse_quat(q:vec4<f32>)->vec4<f32>{return vec4<f32>(-q.xyz,q.w);}
 fn rotation_vector(q:vec4<f32>)->vec3<f32>{
@@ -209,9 +209,11 @@ fn advance_island(@builtin(global_invocation_id) invocation:vec3<u32>){
                 if c.inv_effective_mass<=0.0{continue;}
                 contact=true;
                 if config.record_contacts!=0u{
-                    let index=(tick*config.count+i)*config.contact_stride+j;
+                    let batch_tick=b.clock.x-config.first_tick_low-1u;
+                    let index=(batch_tick*config.count+i)*config.contact_stride+j;
                     contact_events[index]=ContactEvent(vec4<f32>(c.point,c.normal_impulse/config.dt),vec4<f32>(c.normal,c.depth),
-                        b.rotation,vec4<f32>(c.incident_slip,c.area),vec4<u32>(b.clock.xy,b.metadata.x+j,select(0u,c.material+1u,c.normal_impulse>0.0)));
+                        b.rotation,vec4<f32>(c.incident_slip,c.area),vec4<u32>(b.clock.xy,b.metadata.x+j,select(0u,c.material+1u,c.normal_impulse>0.0)),
+                        vec4<f32>(c.incident_normal_speed,c.normal_impulse,length(c.friction_impulse),0.0));
                 }
             }
             if contact&&b.metadata.w==0u{

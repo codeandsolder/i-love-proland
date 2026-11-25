@@ -131,7 +131,7 @@ struct Record {
     meta: [u32; 4],
 }
 
-fn padded(v: [f32; 3]) -> [f32; 4] {
+const fn padded(v: [f32; 3]) -> [f32; 4] {
     [v[0], v[1], v[2], 0.0]
 }
 
@@ -176,6 +176,7 @@ pub(super) struct Articulation {
     pub(super) count: u32,
     pub(super) pipeline: Kernel,
     joints: Vec<Joint>,
+    pub(super) collision_groups: Vec<u32>,
 }
 
 impl Articulation {
@@ -191,14 +192,15 @@ impl Articulation {
         let body_count = u32::try_from(bodies.len()).map_err(io::Error::other)?;
         if count == 0
             || count > device.limits().max_compute_workgroups_per_dimension
-            || device.limits().max_storage_buffers_per_shader_stage < 8
+            || device.limits().max_storage_buffers_per_shader_stage < 10
         {
             return Err(invalid("articulated dispatch exceeds adapter limits"));
         }
+        let mut collision_groups = Vec::with_capacity(bodies.len());
         let mut body_end = 0;
         let mut joint_end = 0;
         let mut records = vec![Record::header([count, body_count, joint_count, 0])];
-        for island in layout.islands {
+        for (group, island) in layout.islands.iter().enumerate() {
             if island.first_body != body_end
                 || island.first_joint != joint_end
                 || island.body_count == 0
@@ -221,6 +223,10 @@ impl Articulation {
             {
                 return Err(invalid("joint crosses island or has invalid parameters"));
             }
+            collision_groups.extend(std::iter::repeat_n(
+                u32::try_from(group).map_err(io::Error::other)?,
+                island.body_count as usize,
+            ));
             records.push(Record::header([
                 island.first_body,
                 island.body_count,
@@ -271,6 +277,7 @@ impl Articulation {
             count,
             pipeline,
             joints: layout.joints.to_vec(),
+            collision_groups,
         })
     }
 
