@@ -4,7 +4,7 @@ use i_love_proland::terrain::gpu::mesh_contacts::{
 };
 use wgpu::util::DeviceExt;
 
-pub(super) fn cube(half: f32) -> Geometry {
+pub fn cube(half: f32) -> Geometry {
     let positions = (0..8_u16)
         .map(|i| {
             [

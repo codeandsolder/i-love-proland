@@ -78,9 +78,13 @@ fn summarize(
             let elapsed = times[start + 1]
                 .checked_sub(times[start])
                 .ok_or_else(|| io::Error::other("invalid GPU timestamp order"))?;
-            // Each measured dispatch is far shorter than the exact f64 integer range.
-            let ticks = u32::try_from(elapsed)?;
-            samples.push(f64::from(ticks) * f64::from(period) / f64::from(REPEATS) * 1e-6);
+            // Keep the whole native timestamp range, including long
+            // batches delayed by another GPU workload.
+            let bytes = elapsed.to_le_bytes();
+            let low = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let high = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            let ticks = f64::from(high).mul_add(4_294_967_296.0, f64::from(low));
+            samples.push(ticks * f64::from(period) / f64::from(REPEATS) * 1e-6);
         }
         samples.sort_by(f64::total_cmp);
         println!(
