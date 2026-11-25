@@ -48,6 +48,21 @@ pub enum Domain {
     ClosedSolid,
 }
 
+/// Direct dispatch or GPU-compacted root-bound candidates.
+#[derive(Clone, Copy, Debug)]
+pub enum CandidateDispatch {
+    Direct,
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct QuerySettings {
+    pub margin: f32,
+    pub mode: Midphase,
+    pub domain: Domain,
+    pub dispatch: CandidateDispatch,
+}
+
 /// Per-pair reduced contact candidate and instrumentation.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -113,7 +128,8 @@ pub struct MeshCatalog {
     triangles: wgpu::Buffer,
     meshes: wgpu::Buffer,
     count: u32,
-    kernels: [OnceLock<Arc<Kernel>>; 4],
+    kernels: [OnceLock<Arc<Kernel>>; 8],
+    prefilter: OnceLock<Arc<Kernel>>,
     sweep_kernel: OnceLock<Arc<Kernel>>,
 }
 
@@ -138,6 +154,7 @@ impl MeshCatalog {
             )?,
             count: u32::try_from(meshes.len()).map_err(io::Error::other)?,
             kernels: std::array::from_fn(|_| OnceLock::new()),
+            prefilter: OnceLock::new(),
             sweep_kernel: OnceLock::new(),
         })
     }
@@ -146,6 +163,31 @@ impl MeshCatalog {
     #[must_use = "Use to account for resident collision storage"]
     pub fn resident_bytes(&self) -> u64 {
         self.nodes.size() + self.triangles.size() + self.meshes.size()
+    }
+
+    fn query_kernel(&self, device: &wgpu::Device, mode: Midphase, compact: bool) -> &Arc<Kernel> {
+        let mode_index = match mode {
+            Midphase::Bvh => 0,
+            Midphase::VoxelBvh => 1,
+            Midphase::DualBvh => 2,
+            Midphase::DualVoxelBvh => 3,
+        };
+        self.kernels[mode_index + 4 * usize::from(compact)].get_or_init(|| {
+            Arc::new(Kernel::specialized(
+                device,
+                "specialized mesh contact query",
+                concat!(
+                    include_str!("mesh_contacts/common.wgsl"),
+                    include_str!("mesh_contacts/containment.wgsl"),
+                    include_str!("mesh_contacts/query.wgsl")
+                ),
+                if compact { "query_compact" } else { "query" },
+                &[
+                    ("DUAL", f64::from(u32::from(mode_index & 2 != 0))),
+                    ("VOXELS", f64::from(u32::from(mode_index & 1 != 0))),
+                ],
+            ))
+        })
     }
 
     /// Allocate a reusable query set. Transforms are not copied or mapped:
@@ -158,15 +200,20 @@ impl MeshCatalog {
         device: &wgpu::Device,
         transforms: &wgpu::Buffer,
         pairs: &[MeshPair],
-        margin: f32,
-        mode: Midphase,
-        domain: Domain,
+        settings: QuerySettings,
     ) -> io::Result<MeshQueries> {
+        let QuerySettings {
+            margin,
+            mode,
+            domain,
+            dispatch,
+        } = settings;
         let count = u32::try_from(pairs.len()).map_err(io::Error::other)?;
         let transform_count = u32::try_from(transforms.size() / 64).map_err(io::Error::other)?;
         if count == 0
             || count > device.limits().max_compute_workgroups_per_dimension
             || !transforms.size().is_multiple_of(64)
+            || transforms.size() > device.limits().max_storage_buffer_binding_size
             || !transforms.usage().contains(wgpu::BufferUsages::STORAGE)
             || !margin.is_finite()
             || margin < 0.0
@@ -179,28 +226,8 @@ impl MeshCatalog {
         }
         let pairs = storage(device, "mesh contact pairs", bytemuck::cast_slice(pairs))?;
         let output = output_buffer::<MeshContact>(device, count, "mesh contact results")?;
-        let mode_index = match mode {
-            Midphase::Bvh => 0,
-            Midphase::VoxelBvh => 1,
-            Midphase::DualBvh => 2,
-            Midphase::DualVoxelBvh => 3,
-        };
-        let kernel = self.kernels[mode_index].get_or_init(|| {
-            Arc::new(Kernel::specialized(
-                device,
-                "specialized mesh contact query",
-                concat!(
-                    include_str!("mesh_contacts/common.wgsl"),
-                    include_str!("mesh_contacts/containment.wgsl"),
-                    include_str!("mesh_contacts/query.wgsl")
-                ),
-                "query",
-                &[
-                    ("DUAL", f64::from(u32::from(mode_index & 2 != 0))),
-                    ("VOXELS", f64::from(u32::from(mode_index & 1 != 0))),
-                ],
-            ))
-        });
+        let compact = matches!(dispatch, CandidateDispatch::Compact);
+        let kernel = self.query_kernel(device, mode, compact);
         let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh contact config"),
             contents: bytemuck::bytes_of(&Config {
@@ -215,19 +242,62 @@ impl MeshCatalog {
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let bind = kernel.bind(
-            device,
-            "resident mesh contact queries",
-            &[
-                &self.nodes,
-                &self.triangles,
-                &self.meshes,
-                transforms,
-                &pairs,
-                &output,
-                &config,
-            ],
-        )?;
+        let mut buffers = vec![
+            &self.nodes,
+            &self.triangles,
+            &self.meshes,
+            transforms,
+            &pairs,
+            &output,
+            &config,
+        ];
+        let candidates = compact
+            .then(|| output_buffer::<u32>(device, count, "mesh compact candidates"))
+            .transpose()?;
+        let prefilter = if let Some(candidates) = &candidates {
+            let filter = self.prefilter.get_or_init(|| {
+                Arc::new(Kernel::new(
+                    device,
+                    "mesh root prequalification",
+                    concat!(
+                        include_str!("mesh_contacts/common.wgsl"),
+                        include_str!("mesh_contacts/containment.wgsl"),
+                        include_str!("mesh_contacts/query.wgsl")
+                    ),
+                    "prequalify",
+                ))
+            });
+            let args = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh indirect dispatch"),
+                contents: bytemuck::cast_slice(&[0_u32, 1, 1]),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::INDIRECT
+                    | wgpu::BufferUsages::COPY_DST,
+            });
+            buffers.push(candidates);
+            let bind = filter.bind_numbered(
+                device,
+                "mesh root prequalification",
+                &[
+                    (0, &self.nodes),
+                    (2, &self.meshes),
+                    (3, transforms),
+                    (4, &pairs),
+                    (5, &output),
+                    (6, &config),
+                    (7, candidates),
+                    (8, &args),
+                ],
+            );
+            Some(Prefilter {
+                kernel: Arc::clone(filter),
+                bind,
+                args,
+            })
+        } else {
+            None
+        };
+        let bind = kernel.bind(device, "resident mesh contact queries", &buffers)?;
         Ok(MeshQueries {
             bind,
             output,
@@ -235,6 +305,7 @@ impl MeshCatalog {
             kernel: Arc::clone(kernel),
             marker: PhantomData,
             label: "mesh contact midphase/narrowphase",
+            prefilter,
         })
     }
 }
@@ -257,6 +328,12 @@ fn output_buffer<T>(device: &wgpu::Device, count: u32, label: &str) -> io::Resul
     }))
 }
 
+struct Prefilter {
+    kernel: Arc<Kernel>,
+    bind: wgpu::BindGroup,
+    args: wgpu::Buffer,
+}
+
 /// Reusable resident query resources, typed by the output record ABI.
 pub struct MeshBatch<T> {
     bind: wgpu::BindGroup,
@@ -265,6 +342,7 @@ pub struct MeshBatch<T> {
     kernel: Arc<Kernel>,
     marker: PhantomData<T>,
     label: &'static str,
+    prefilter: Option<Prefilter>,
 }
 impl<T: bytemuck::Pod> MeshBatch<T> {
     #[must_use = "Bind the authoritative results to the next GPU stage"]
@@ -273,8 +351,20 @@ impl<T: bytemuck::Pod> MeshBatch<T> {
     }
     /// Record this batch after its GPU input updates.
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
-        self.kernel
-            .dispatch(encoder, self.label, &self.bind, [self.count, 1, 1]);
+        if let Some(prefilter) = &self.prefilter {
+            encoder.clear_buffer(&prefilter.args, 0, Some(4));
+            prefilter.kernel.dispatch(
+                encoder,
+                "mesh root prequalification",
+                &prefilter.bind,
+                [self.count.div_ceil(64), 1, 1],
+            );
+            self.kernel
+                .dispatch_indirect(encoder, self.label, &self.bind, &prefilter.args);
+        } else {
+            self.kernel
+                .dispatch(encoder, self.label, &self.bind, [self.count, 1, 1]);
+        }
     }
 
     /// Record a diagnostic readback without changing resident results.

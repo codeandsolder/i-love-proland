@@ -1,8 +1,8 @@
 use super::{Geometry, IDENTITY, Result};
 use i_love_proland::terrain::gpu::{
     mesh_contacts::{
-        BodyMeshInstance, BodyMeshPoses, Domain, MeshCatalog, MeshImpact, MeshImpulses, MeshPair,
-        Midphase,
+        BodyMeshInstance, BodyMeshPoses, CandidateDispatch, Domain, MeshCatalog, MeshImpact,
+        MeshImpulses, MeshPair, Midphase, QuerySettings,
     },
     physics::RigidBody,
 };
@@ -88,9 +88,12 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         device,
         poses.matrices(),
         &pairs,
-        0.01,
-        Midphase::VoxelBvh,
-        Domain::ClosedSolid,
+        QuerySettings {
+            margin: 0.01,
+            mode: Midphase::VoxelBvh,
+            domain: Domain::ClosedSolid,
+            dispatch: CandidateDispatch::Direct,
+        },
     )?;
     let solver = MeshImpulses::new(device, &bodies, queries.results(), &links)?;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());

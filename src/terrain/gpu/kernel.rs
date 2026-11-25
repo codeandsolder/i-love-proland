@@ -87,12 +87,32 @@ impl Kernel {
         bind: &wgpu::BindGroup,
         groups: [u32; 3],
     ) {
+        let mut pass = self.pass(encoder, label, bind);
+        pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+    }
+    pub(super) fn dispatch_indirect(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        bind: &wgpu::BindGroup,
+        args: &wgpu::Buffer,
+    ) {
+        let mut pass = self.pass(encoder, label, bind);
+        pass.dispatch_workgroups_indirect(args, 0);
+    }
+
+    fn pass<'a>(
+        &self,
+        encoder: &'a mut wgpu::CommandEncoder,
+        label: &str,
+        bind: &wgpu::BindGroup,
+    ) -> wgpu::ComputePass<'a> {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some(label),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind, &[]);
-        pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        pass
     }
 }

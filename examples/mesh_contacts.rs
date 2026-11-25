@@ -1,4 +1,6 @@
 //! Actual GPU benchmark for arbitrary relative mesh poses.
+#[path = "mesh_contacts/compact.rs"]
+mod compact;
 #[path = "mesh_contacts/containment.rs"]
 mod containment;
 #[path = "mesh_contacts/impact.rs"]
@@ -6,7 +8,8 @@ mod impact;
 #[path = "mesh_contacts/sweep.rs"]
 mod sweep;
 use i_love_proland::terrain::gpu::mesh_contacts::{
-    Domain, MeshCatalog, MeshContact, MeshPair, MeshQueries, MeshSource, Midphase,
+    CandidateDispatch, Domain, MeshCatalog, MeshContact, MeshPair, MeshQueries, MeshSource,
+    Midphase, QuerySettings,
 };
 use std::{error::Error, io, time::Instant};
 use wgpu::util::DeviceExt;
@@ -177,6 +180,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     sweep::check(device, queue, &geometry[2])?;
     containment::check(device, queue)?;
     impact::check(device, queue)?;
+    compact::check(device, queue, &geometry)?;
     let catalog = MeshCatalog::new(
         device,
         &geometry.iter().map(Geometry::source).collect::<Vec<_>>(),
@@ -195,17 +199,23 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         device,
         &matrices,
         &pairs,
-        0.1,
-        Midphase::Bvh,
-        Domain::Surface,
+        QuerySettings {
+            margin: 0.1,
+            mode: Midphase::Bvh,
+            domain: Domain::Surface,
+            dispatch: CandidateDispatch::Direct,
+        },
     )?;
     let voxels = catalog.queries(
         device,
         &matrices,
         &pairs,
-        0.1,
-        Midphase::VoxelBvh,
-        Domain::Surface,
+        QuerySettings {
+            margin: 0.1,
+            mode: Midphase::VoxelBvh,
+            domain: Domain::Surface,
+            dispatch: CandidateDispatch::Direct,
+        },
     )?;
     let a = sample(device, queue, &plain)?;
     let b = sample(device, queue, &voxels)?;
@@ -234,17 +244,23 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         device,
         &matrices,
         &pairs,
-        0.1,
-        Midphase::DualBvh,
-        Domain::Surface,
+        QuerySettings {
+            margin: 0.1,
+            mode: Midphase::DualBvh,
+            domain: Domain::Surface,
+            dispatch: CandidateDispatch::Direct,
+        },
     )?;
     let dual_voxel = catalog.queries(
         device,
         &matrices,
         &pairs,
-        0.1,
-        Midphase::DualVoxelBvh,
-        Domain::Surface,
+        QuerySettings {
+            margin: 0.1,
+            mode: Midphase::DualVoxelBvh,
+            domain: Domain::Surface,
+            dispatch: CandidateDispatch::Direct,
+        },
     )?;
     let c = sample(device, queue, &dual)?;
     let d = sample(device, queue, &dual_voxel)?;

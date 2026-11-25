@@ -1,5 +1,7 @@
 use super::{Geometry, IDENTITY, Result, pose, sample};
-use i_love_proland::terrain::gpu::mesh_contacts::{Domain, MeshCatalog, MeshPair, Midphase};
+use i_love_proland::terrain::gpu::mesh_contacts::{
+    CandidateDispatch, Domain, MeshCatalog, MeshPair, Midphase, QuerySettings,
+};
 use wgpu::util::DeviceExt;
 
 fn cube(half: f32) -> Geometry {
@@ -70,9 +72,12 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         device,
         &buffer,
         &pairs,
-        0.001,
-        Midphase::VoxelBvh,
-        Domain::Surface,
+        QuerySettings {
+            margin: 0.001,
+            mode: Midphase::VoxelBvh,
+            domain: Domain::Surface,
+            dispatch: CandidateDispatch::Direct,
+        },
     )?;
     let result = sample(device, queue, &surface)?;
     assert!(
@@ -84,9 +89,12 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         device,
         &buffer,
         &pairs,
-        0.001,
-        Midphase::VoxelBvh,
-        Domain::ClosedSolid,
+        QuerySettings {
+            margin: 0.001,
+            mode: Midphase::VoxelBvh,
+            domain: Domain::ClosedSolid,
+            dispatch: CandidateDispatch::Direct,
+        },
     )?;
     let result = sample(device, queue, &solid)?;
     assert_eq!(

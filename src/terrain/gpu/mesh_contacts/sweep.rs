@@ -111,6 +111,7 @@ impl MeshCatalog {
             kernel: Arc::clone(kernel),
             marker: PhantomData,
             label: "mesh continuous candidate search",
+            prefilter: None,
         })
     }
 }
