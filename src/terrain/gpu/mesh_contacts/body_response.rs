@@ -136,7 +136,7 @@ impl MeshImpulses {
     /// Bind query results in the same order as the two-body link array.
     ///
     /// # Errors
-    /// Rejects invalid mappings and buffer sizes. States require COPY_DST
+    /// Rejects invalid mappings and buffer sizes. States require `COPY_DST`
     /// for the final immutable-snapshot-to-authoritative GPU copy.
     pub fn new(
         device: &wgpu::Device,
