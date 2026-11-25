@@ -3,7 +3,7 @@ use super::{MeshContact, MeshQueries, Result};
 use std::sync::mpsc;
 
 const ROUNDS: usize = 8;
-const REPEATS: u32 = 8;
+const REPEATS: u32 = 1;
 
 pub fn compare(
     device: &wgpu::Device,
@@ -29,18 +29,26 @@ pub fn compare(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    // Bound command-buffer residence time: a packed pair with a large
+    // hierarchy may take much longer than its wide-workgroup equivalent.
+    // Separate samples also prevent a long benchmark from monopolizing
+    // a display adapter or overflowing a driver's watchdog interval.
     for round in 0..ROUNDS {
         for offset in 0..entries.len() {
             let index = (round + offset) % entries.len();
             let query = u32::try_from((round * entries.len() + index) * 2)?;
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             encoder.write_timestamp(&set, query);
             for _ in 0..REPEATS {
                 entries[index].1.encode(&mut encoder);
             }
             encoder.write_timestamp(&set, query + 1);
+            queue.submit([encoder.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely())?;
         }
     }
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     encoder.resolve_query_set(&set, 0..count, &resolve, 0);
     encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, size);
     queue.submit([encoder.finish()]);
@@ -66,7 +74,22 @@ pub fn compare(
     if !summarize(entries, &times, queue.get_timestamp_period()) {
         eprintln!("MESH_GPU_BENCH invalid timestamp samples; use synchronized wall-clock fallback");
         for (label, queries, results) in entries {
-            super::benchmark(device, queue, label, queries, results)?;
+            let mut times = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                queries.encode(&mut encoder);
+                let start = std::time::Instant::now();
+                queue.submit([encoder.finish()]);
+                device.poll(wgpu::PollType::wait_indefinitely())?;
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "MESH_WALL_BENCH mode={label} pairs={} median_ms={:.6}",
+                results.len(),
+                times[ROUNDS / 2]
+            );
         }
     }
     Ok(())

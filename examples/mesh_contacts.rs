@@ -363,7 +363,8 @@ fn main() -> Result<()> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(descriptor);
-    let adapter = if let Some(name) = std::env::args().nth(1) {
+    let packed_only = std::env::args().any(|arg| arg == "--packed-only");
+    let adapter = if let Some(name) = std::env::args().skip(1).find(|arg| arg != "--packed-only") {
         pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
             .into_iter()
             .find(|adapter| adapter.get_info().name.contains(&name))
@@ -383,5 +384,9 @@ fn main() -> Result<()> {
         required_features,
         ..Default::default()
     }))?;
-    check(&device, &queue)
+    if packed_only {
+        packed::check(&device, &queue, &geometry()?)
+    } else {
+        check(&device, &queue)
+    }
 }
