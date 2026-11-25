@@ -22,7 +22,7 @@ fn cube(half: f32) -> Geometry {
         ],
     }
 }
-pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+fn catalog(device: &wgpu::Device) -> Result<MeshCatalog> {
     let outer = cube(2.0);
     let inner = cube(0.2);
     let disconnected = Geometry {
@@ -36,10 +36,24 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         ],
         indices: vec![0, 1, 2, 3, 4, 5],
     };
-    let catalog = MeshCatalog::new(
+    let mut mixed = cube(2.0);
+    mixed
+        .positions
+        .extend([[10.0, 0.0, 0.0], [10.1, 0.0, 0.0], [10.0, 0.1, 0.0]]);
+    mixed.indices.extend([8, 9, 10]);
+    Ok(MeshCatalog::new(
         device,
-        &[outer.source(), inner.source(), disconnected.source()],
-    )?;
+        &[
+            outer.source(),
+            inner.source(),
+            disconnected.source(),
+            mixed.source(),
+        ],
+    )?)
+}
+
+pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    let catalog = catalog(device)?;
     let matrices = [
         IDENTITY,
         pose(0.37, 0.2, -0.3, 0.15),
@@ -66,6 +80,14 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         MeshPair {
             meshes: [0, 1],
             transforms: [0, 2],
+        },
+        MeshPair {
+            meshes: [3, 1],
+            transforms: [0, 1],
+        },
+        MeshPair {
+            meshes: [1, 3],
+            transforms: [1, 0],
         },
     ];
     let surface = catalog.queries(
@@ -99,9 +121,11 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let result = sample(device, queue, &solid)?;
     assert_eq!(
         result.iter().map(|r| r.features[3]).collect::<Vec<_>>(),
-        [4, 4, 4, 0],
+        [4, 4, 4, 0, 4, 4],
         "{result:?}"
     );
-    println!("MESH_CONTAINMENT nested_both_orders=true disconnected_component=true separated=true");
+    println!(
+        "MESH_CONTAINMENT nested_both_orders=true disconnected_component=true mixed_open_closed=true separated=true"
+    );
     Ok(())
 }

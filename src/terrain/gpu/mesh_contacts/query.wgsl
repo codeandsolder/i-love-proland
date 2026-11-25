@@ -33,9 +33,11 @@ fn prequalify(@builtin(global_invocation_id) id:vec3<u32>){
     contacts[i]=empty();
     if valid_matrix(a)&&valid_matrix(b){
         // Preserve the narrow phase invalid/singular-transform semantics.
+        let la=linear(a);
         let lb=linear(b);
-        let det=dot(lb[0],cross(lb[1],lb[2]));
-        if abs(det)>1e-20 {
+        let det_a=dot(la[0],cross(la[1],la[2]));
+        let det_b=dot(lb[0],cross(lb[1],lb[2]));
+        if abs(det_a)>1e-20 && abs(det_b)>1e-20 {
             let ab=root_bounds(pair.meshes.x,a,b[3].xyz);
             let bb=root_bounds(pair.meshes.y,b,b[3].xyz);
             if any(ab.lo-bb.hi>vec3<f32>(config.margin))||
@@ -49,7 +51,7 @@ fn prequalify(@builtin(global_invocation_id) id:vec3<u32>){
 fn query_pair(i:u32,lane:u32){
     let pair=pairs[i];
     let local=scan(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],config.margin,lane);
-    var result=reduce_contact(local,lane);
+    var result=orient_contact(pair.meshes,reduce_contact(local,lane));
     if (config.mode&4u)!=0u && result.features.z==0u && result.features.w==0u {
         let inside=reduce_contact(containment(pair.meshes,transforms[pair.transforms.x],transforms[pair.transforms.y],lane),lane);
         result.features.w=inside.features.w;

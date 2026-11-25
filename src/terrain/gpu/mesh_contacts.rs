@@ -91,7 +91,7 @@ struct Triangle {
     id: u32,
     b: [f32; 4],
     c: [f32; 3],
-    representative: u32,
+    flags: u32,
 }
 
 #[repr(C)]

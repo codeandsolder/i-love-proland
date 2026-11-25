@@ -1,6 +1,6 @@
 override DUAL:bool=false;
 override VOXELS:bool=true;
-struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, representative:u32 }
+struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, flags:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
     hi:vec3<f32>, count:u32,
@@ -280,7 +280,7 @@ fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     }
     return result;
 }
-fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
+fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
     var result=empty();
     let la=linear(a);
     let lb=linear(b);
@@ -288,10 +288,6 @@ fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Con
     let r1=cross(lb[2],lb[0]);
     let r2=cross(lb[0],lb[1]);
     let det=dot(lb[0],r0);
-    if !valid_matrix(a)||!valid_matrix(b)||!(abs(det)>1e-20){
-        result.features.w=1u;
-        return result;
-    }
     let inverse=transpose(mat3x3<f32>(r0,r1,r2))*(1.0/det);
     let relative=a[3].xyz-b[3].xyz;
     let row_norm=vec3<f32>(length(r0),length(r1),length(r2))/abs(det);
@@ -321,6 +317,40 @@ fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Con
     let frame=QueryFrame(la,lb,relative,local_linear,local_offset,pad+error,b[3].xyz,margin*margin);
     if DUAL{return scan_dual(mesh_a,mesh_b,frame,lane);}
     return scan_triangles(mesh_a,mesh_b,frame,lane);
+}
+// Use the smaller authored triangle range as the query side. Each
+// triangle on that side starts one BVH traversal; reversing the pair
+// can therefore avoid thousands of root visits without changing the
+// actual geometric predicate. Preserve the public pair's witness order.
+fn scan(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
+    // A singular input must not become valid merely because the pair
+    // order changed. Degenerate triangles are still allowed in meshes.
+    let la=linear(a);
+    let lb=linear(b);
+    if !valid_matrix(a)||!valid_matrix(b)||
+       !(abs(dot(la[0],cross(la[1],la[2])))>1e-20)||
+       !(abs(dot(lb[0],cross(lb[1],lb[2])))>1e-20){
+        var result=empty();
+        result.features.w=1u;
+        return result;
+    }
+    if !reverse_order(mesh_ids){return scan_ordered(mesh_ids,a,b,margin,lane);}
+    return scan_ordered(mesh_ids.yx,b,a,margin,lane);
+}
+fn reverse_order(mesh_ids:vec2<u32>)->bool{
+    let ma=meshes[mesh_ids.x].triangles;
+    let mb=meshes[mesh_ids.y].triangles;
+    return ma.y-ma.x>mb.y-mb.x;
+}
+fn orient_contact(mesh_ids:vec2<u32>,contact:Contact)->Contact{
+    if !reverse_order(mesh_ids)||contact.features.z==0u{return contact;}
+    var result=contact;
+    let pa=result.point_a.xyz;
+    result.point_a=vec4<f32>(result.point_b.xyz,result.point_a.w);
+    result.point_b=vec4<f32>(pa,0.0);
+    result.normal=vec4<f32>(-result.normal.xyz,result.normal.w);
+    result.features=vec4<u32>(result.features.yx,result.features.zw);
+    return result;
 }
 var<workgroup> reduction:array<Contact,64>;
 fn reduce_contact(local:Contact,lane:u32)->Contact{

@@ -11,6 +11,7 @@ use std::{
 pub(super) struct Topology {
     pub closed: bool,
     pub representatives: Vec<bool>,
+    pub closed_faces: Vec<bool>,
 }
 const fn root(parent: &mut [usize], mut x: usize) -> usize {
     while parent[x] != x {
@@ -43,7 +44,7 @@ pub(super) fn classify(source: &MeshSource<'_>) -> io::Result<Topology> {
         .collect::<Vec<_>>();
     let mut parent = (0..welded.len()).collect::<Vec<_>>();
     let mut edges = HashMap::<(usize, usize), (usize, isize)>::new();
-    let mut closed = true;
+    let mut degenerate = Vec::new();
     let faces = source
         .indices
         .as_chunks::<3>()
@@ -57,7 +58,7 @@ pub(super) fn classify(source: &MeshSource<'_>) -> io::Result<Topology> {
             unite(&mut parent, a, b);
             unite(&mut parent, b, c);
             if a == b || b == c || c == a {
-                closed = false;
+                degenerate.push(a);
             }
             for (a, b) in [(a, b), (b, c), (c, a)] {
                 let edge = edges.entry((a.min(b), a.max(b))).or_default();
@@ -67,17 +68,30 @@ pub(super) fn classify(source: &MeshSource<'_>) -> io::Result<Topology> {
             Ok(a)
         })
         .collect::<io::Result<Vec<_>>>()?;
-    closed &= edges
-        .values()
-        .all(|&(count, winding)| count == 2 && winding == 0);
-    let mut seen = HashSet::new();
-    let representatives = faces
+    // Closure is a property of each welded connected component, not
+    // the entire asset. An open decorative surface must not invalidate a
+    // disconnected watertight hull stored in the same collision mesh.
+    let mut open = degenerate
         .into_iter()
-        .map(|v| seen.insert(root(&mut parent, v)))
-        .collect();
+        .map(|v| root(&mut parent, v))
+        .collect::<HashSet<_>>();
+    for ((a, _), (count, winding)) in edges {
+        if count != 2 || winding != 0 {
+            open.insert(root(&mut parent, a));
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut representatives = Vec::with_capacity(faces.len());
+    let mut closed_faces = Vec::with_capacity(faces.len());
+    for v in faces {
+        let component = root(&mut parent, v);
+        representatives.push(seen.insert(component));
+        closed_faces.push(!open.contains(&component));
+    }
     Ok(Topology {
-        closed,
+        closed: closed_faces.iter().any(|&closed| closed),
         representatives,
+        closed_faces,
     })
 }
 
@@ -101,6 +115,7 @@ mod tests {
             indices: &indices,
         })?;
         assert!(shell.closed);
+        assert_eq!(shell.closed_faces, [true; 4]);
         assert_eq!(shell.representatives.iter().filter(|&&v| v).count(), 1);
         let open = classify(&MeshSource {
             positions: &positions,
@@ -108,6 +123,13 @@ mod tests {
         })?;
         assert!(!open.closed);
         assert_eq!(open.representatives.iter().filter(|&&v| v).count(), 2);
+        let mixed = classify(&MeshSource {
+            positions: &positions,
+            indices: &[0, 2, 1, 4, 1, 3, 0, 3, 2, 1, 2, 3, 5, 5, 5],
+        })?;
+        assert!(mixed.closed);
+        assert_eq!(mixed.closed_faces, [true, true, true, true, false]);
+        assert_eq!(mixed.representatives.iter().filter(|&&v| v).count(), 2);
         Ok(())
     }
 }
