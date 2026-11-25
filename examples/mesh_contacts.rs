@@ -175,6 +175,15 @@ fn cases() -> Result<Cases> {
     })
 }
 
+const fn direct_settings(mode: Midphase) -> QuerySettings {
+    QuerySettings {
+        margin: 0.1,
+        mode,
+        domain: Domain::Surface,
+        dispatch: CandidateDispatch::Direct,
+    }
+}
+
 fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let geometry = geometry()?;
     sweep::check(device, queue, &geometry[2])?;
@@ -195,27 +204,12 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         contents: bytemuck::cast_slice(&poses),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
-    let plain = catalog.queries(
-        device,
-        &matrices,
-        &pairs,
-        QuerySettings {
-            margin: 0.1,
-            mode: Midphase::Bvh,
-            domain: Domain::Surface,
-            dispatch: CandidateDispatch::Direct,
-        },
-    )?;
+    let plain = catalog.queries(device, &matrices, &pairs, direct_settings(Midphase::Bvh))?;
     let voxels = catalog.queries(
         device,
         &matrices,
         &pairs,
-        QuerySettings {
-            margin: 0.1,
-            mode: Midphase::VoxelBvh,
-            domain: Domain::Surface,
-            dispatch: CandidateDispatch::Direct,
-        },
+        direct_settings(Midphase::VoxelBvh),
     )?;
     let a = sample(device, queue, &plain)?;
     let b = sample(device, queue, &voxels)?;
@@ -244,23 +238,13 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         device,
         &matrices,
         &pairs,
-        QuerySettings {
-            margin: 0.1,
-            mode: Midphase::DualBvh,
-            domain: Domain::Surface,
-            dispatch: CandidateDispatch::Direct,
-        },
+        direct_settings(Midphase::DualBvh),
     )?;
     let dual_voxel = catalog.queries(
         device,
         &matrices,
         &pairs,
-        QuerySettings {
-            margin: 0.1,
-            mode: Midphase::DualVoxelBvh,
-            domain: Domain::Surface,
-            dispatch: CandidateDispatch::Direct,
-        },
+        direct_settings(Midphase::DualVoxelBvh),
     )?;
     let c = sample(device, queue, &dual)?;
     let d = sample(device, queue, &dual_voxel)?;
@@ -365,8 +349,14 @@ fn main() -> Result<()> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::VULKAN;
     let instance = wgpu::Instance::new(descriptor);
-    let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = if let Some(name) = std::env::args().nth(1) {
+        pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
+            .into_iter()
+            .find(|adapter| adapter.get_info().name.contains(&name))
+            .ok_or_else(|| io::Error::other(format!("adapter not found: {name}")))?
+    } else {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?
+    };
     println!("MESH_GPU adapter={}", adapter.get_info().name);
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
