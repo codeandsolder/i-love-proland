@@ -2,7 +2,7 @@ struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec4<f32> }
 struct Node {
     lo:vec3<f32>, first:u32,
     hi:vec3<f32>, count:u32,
-    escape:u32, mask_low:u32, mask_high:u32, padding:u32,
+    escape:u32, mask_low:u32, mask_high:u32, end:u32,
 }
 struct Mesh { nodes:vec2<u32>, triangles:vec2<u32> }
 struct Pair { meshes:vec2<u32>, transforms:vec2<u32> }
@@ -12,7 +12,7 @@ struct Contact {
     features:vec4<u32>,
     statistics:vec4<u32>,
 }
-struct Config { margin:f32, voxels:u32, count:u32, transform_count:u32 }
+struct Config { margin:f32, mode:u32, count:u32, transform_count:u32 }
 @group(0) @binding(0) var<storage,read> nodes:array<Node>;
 @group(0) @binding(1) var<storage,read> triangles:array<Triangle>;
 @group(0) @binding(2) var<storage,read> meshes:array<Mesh>;
@@ -149,6 +149,123 @@ fn choose(a:Contact,b:Contact)->Contact{
 fn empty()->Contact{
     return Contact(vec4<f32>(0.0,0.0,0.0,FAR),vec4<f32>(0.0),vec4<u32>(0xffffffffu,0xffffffffu,0u,0u),vec4<u32>(0u));
 }
+struct QueryFrame {
+    la:mat3x3<f32>, lb:mat3x3<f32>,
+    relative:vec3<f32>,
+    local_linear:mat3x3<f32>,
+    local_offset:vec3<f32>,
+    padding:vec3<f32>,
+    origin:vec3<f32>,
+    margin2:f32,
+}
+struct Bounds { lo:vec3<f32>, hi:vec3<f32> }
+fn node_bounds(n:Node,f:QueryFrame)->Bounds{
+    let center=(n.lo+n.hi)*0.5;
+    let half=(n.hi-n.lo)*0.5;
+    let c=f.local_linear*center+f.local_offset;
+    let r=abs(f.local_linear[0])*half.x+abs(f.local_linear[1])*half.y+abs(f.local_linear[2])*half.z+f.padding;
+    return Bounds(c-r,c+r);
+}
+fn tri_bounds(t:Triangle,f:QueryFrame)->Bounds{
+    let local=transformed(t,f.local_linear,f.local_offset);
+    return Bounds(min(local[0],min(local[1],local[2]))-f.padding,
+                  max(local[0],max(local[1],local[2]))+f.padding);
+}
+fn accepts(n:Node,b:Bounds,r:ptr<function,Contact>)->bool{
+    (*r).statistics.x+=1u;
+    if any(n.lo>b.hi)||any(n.hi<b.lo){return false;}
+    if (config.mode&1u)!=0u && !voxel_overlap(n,b.lo,b.hi){
+        (*r).statistics.z+=1u;
+        return false;
+    }
+    return true;
+}
+fn test_triangle(ta:Triangle,wa:mat3x3<f32>,tb:Triangle,f:QueryFrame,r:ptr<function,Contact>){
+    let wb=transformed(tb,f.lb,vec3<f32>(0.0));
+    (*r).statistics.y+=1u;
+    let w=triangle_distance(wa,wb);
+    if w.distance2<=f.margin2{
+        (*r).features.z+=1u;
+        if w.distance2<(*r).point_a.w ||
+            (w.distance2==(*r).point_a.w && (ta.id<(*r).features.x||(ta.id==(*r).features.x&&tb.id<(*r).features.y))){
+            (*r).point_a=vec4<f32>(w.a+f.origin,w.distance2);
+            (*r).point_b=vec4<f32>(w.b+f.origin,0.0);
+            (*r).features.x=ta.id;
+            (*r).features.y=tb.id;
+        }
+    }
+}
+fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
+    var result=empty();
+    for(var ai=mesh_a.triangles.x+lane;ai<mesh_a.triangles.y;ai+=64u){
+        let ta=triangles[ai];
+        let bounds=tri_bounds(ta,f);
+        let wa=transformed(ta,f.la,f.relative);
+        var node_id=mesh_b.nodes.x;
+        while node_id<mesh_b.nodes.y{
+            let node=nodes[node_id];
+            if !accepts(node,bounds,&result){node_id=node.escape;continue;}
+            if node.count==0u{node_id+=1u;continue;}
+            for(var bi=node.first;bi<node.end;bi+=1u){
+                test_triangle(ta,wa,triangles[bi],f,&result);
+            }
+            node_id=node.escape;
+        }
+    }
+    return result;
+}
+// Cut A's balanced hierarchy into at most 64 disjoint subtrees. Each
+// invocation walks pairs of nodes depth-first, splitting the larger
+// remaining triangle range. The median-built tree has depth <32 even
+// for u32-sized triangle arrays; the combined stack cannot exceed 64.
+fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
+    var result=empty();
+    var root=mesh_a.nodes.x;
+    for(var depth=0u;depth<6u;depth+=1u){
+        if nodes[root].count!=0u{
+            if (lane>>depth)!=0u{return result;}
+            break;
+        }
+        let left=root+1u;
+        root=select(left,nodes[left].escape,((lane>>depth)&1u)!=0u);
+    }
+    var stack:array<vec2<u32>,64>;
+    stack[0]=vec2<u32>(root,mesh_b.nodes.x);
+    var top=1u;
+    while top>0u{
+        top-=1u;
+        let ids=stack[top];
+        let a=nodes[ids.x];
+        let b=nodes[ids.y];
+        if !accepts(b,node_bounds(a,f),&result){continue;}
+        if a.count!=0u&&b.count!=0u{
+            for(var ai=a.first;ai<a.end;ai+=1u){
+                let ta=triangles[ai];
+                if !accepts(b,tri_bounds(ta,f),&result){continue;}
+                let wa=transformed(ta,f.la,f.relative);
+                for(var bi=b.first;bi<b.end;bi+=1u){
+                    test_triangle(ta,wa,triangles[bi],f,&result);
+                }
+            }
+            continue;
+        }
+        if top+2u>64u{
+            result.features.w=2u;
+            return result;
+        }
+        if a.count==0u&&(b.count!=0u||a.end-a.first>=b.end-b.first){
+            let left=ids.x+1u;
+            stack[top]=vec2<u32>(nodes[left].escape,ids.y);
+            stack[top+1u]=vec2<u32>(left,ids.y);
+        }else{
+            let left=ids.y+1u;
+            stack[top]=vec2<u32>(ids.x,nodes[left].escape);
+            stack[top+1u]=vec2<u32>(ids.x,left);
+        }
+        top+=2u;
+    }
+    return result;
+}
 fn scan(pair:Pair,lane:u32)->Contact{
     var result=empty();
     let a=transforms[pair.transforms.x];
@@ -189,53 +306,9 @@ fn scan(pair:Pair,lane:u32)->Contact{
     if any(transformed_center+transformed_half+pad+error<root_b.lo)||any(transformed_center-transformed_half-pad-error>root_b.hi){
         return result;
     }
-    let margin2=config.margin*config.margin;
-    for(var ai=mesh_a.triangles.x+lane;ai<mesh_a.triangles.y;ai+=64u){
-        let ta=triangles[ai];
-        let local=transformed(ta,local_linear,local_offset);
-        let lo=min(local[0],min(local[1],local[2]))-pad-error;
-        let hi=max(local[0],max(local[1],local[2]))+pad+error;
-        // Use B-relative world metres for exact features: no cancellation
-        // from absolute planetary position, and no metric distortion from
-        // nonuniform scale or sheared animation transforms.
-        let wa=transformed(ta,la,relative);
-        var node_id=mesh_b.nodes.x;
-        while node_id<mesh_b.nodes.y{
-            let node=nodes[node_id];
-            result.statistics.x+=1u;
-            if any(node.lo>hi)||any(node.hi<lo){
-                node_id=node.escape;
-                continue;
-            }
-            if config.voxels!=0u && !voxel_overlap(node,lo,hi){
-                result.statistics.z+=1u;
-                node_id=node.escape;
-                continue;
-            }
-            if node.count==0u{
-                node_id+=1u;
-                continue;
-            }
-            for(var bi=node.first;bi<node.first+node.count;bi+=1u){
-                let tb=triangles[bi];
-                let wb=transformed(tb,lb,vec3<f32>(0.0));
-                result.statistics.y+=1u;
-                let w=triangle_distance(wa,wb);
-                if w.distance2<=margin2{
-                    result.features.z+=1u;
-                    if w.distance2<result.point_a.w ||
-                        (w.distance2==result.point_a.w && (ta.id<result.features.x||(ta.id==result.features.x&&tb.id<result.features.y))){
-                        result.point_a=vec4<f32>(w.a+b[3].xyz,w.distance2);
-                        result.point_b=vec4<f32>(w.b+b[3].xyz,0.0);
-                        result.features.x=ta.id;
-                        result.features.y=tb.id;
-                    }
-                }
-            }
-            node_id=node.escape;
-        }
-    }
-    return result;
+    let frame=QueryFrame(la,lb,relative,local_linear,local_offset,pad+error,b[3].xyz,config.margin*config.margin);
+    if (config.mode&2u)!=0u{return scan_dual(mesh_a,mesh_b,frame,lane);}
+    return scan_triangles(mesh_a,mesh_b,frame,lane);
 }
 var<workgroup> reduction:array<Contact,64>;
 @compute @workgroup_size(64)

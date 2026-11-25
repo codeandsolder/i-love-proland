@@ -142,6 +142,16 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
             transforms: [index, 0],
         });
     }
+    let rotation_end = pairs.len();
+    for i in 0..36_u16 {
+        let angle = f32::from(i) * std::f32::consts::TAU / 36.0;
+        let index = u32::try_from(poses.len())?;
+        poses.push(pose(angle, 12.0, 3.0 * angle.sin(), 0.05));
+        pairs.push(MeshPair {
+            meshes: [1, 1],
+            transforms: [index, 0],
+        });
+    }
     let matrices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("test resident animated matrices"),
         contents: bytemuck::cast_slice(&poses),
@@ -166,7 +176,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     assert!((a[0].point_a[3] - 0.0025).abs() < 1e-6);
     assert!(a[4].point_a[3] < 1e-10);
     assert!(a[5].point_a[3] < 0.000401);
-    let rotating = &a[test_count..];
+    let rotating = &a[test_count..rotation_end];
     let hits = rotating.iter().filter(|c| c.features[2] > 0).count();
     assert!(hits > 0 && hits < rotating.len());
     // Modify only the resident pose, not the mesh or bind group.
@@ -179,7 +189,26 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         rotating.len(),
         catalog.resident_bytes()
     );
-    for (name, q, results) in [("bvh", &plain, &a), ("voxel_bvh", &voxels, &b)] {
+    let dual = catalog.queries(device, &matrices, &pairs, 0.1, Midphase::DualBvh)?;
+    let dual_voxel = catalog.queries(device, &matrices, &pairs, 0.1, Midphase::DualVoxelBvh)?;
+    let c = sample(device, queue, &catalog, &dual)?;
+    let d = sample(device, queue, &catalog, &dual_voxel)?;
+    for other in [&c, &d] {
+        for (i, (a, b)) in a.iter().zip(other).enumerate() {
+            assert_eq!(
+                a.features, b.features,
+                "dual feature mismatch {i}: {a:?} {b:?}"
+            );
+            assert_eq!(a.point_a, b.point_a, "dual point A {i}");
+            assert_eq!(a.point_b, b.point_b, "dual point B {i}");
+        }
+    }
+    for (name, q, results) in [
+        ("bvh", &plain, &a),
+        ("voxel_bvh", &voxels, &b),
+        ("dual_bvh", &dual, &c),
+        ("dual_voxel", &dual_voxel, &d),
+    ] {
         let mut times = Vec::new();
         for _ in 0..12 {
             let start = Instant::now();

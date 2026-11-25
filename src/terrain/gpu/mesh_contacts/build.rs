@@ -109,7 +109,9 @@ fn build(nodes: &mut Vec<Node>, triangles: &mut [Triangle], first: u32) -> io::R
         count: 0,
         escape: 0,
         mask: mask(triangles, lo, hi),
-        padding: 0,
+        end: first
+            .checked_add(index(triangles.len())?)
+            .ok_or_else(|| invalid("mesh triangle range overflow"))?,
     });
     if triangles.len() <= LEAF {
         nodes[offset].count = index(triangles.len())?;

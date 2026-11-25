@@ -28,6 +28,8 @@ pub struct MeshPair {
 pub enum Midphase {
     Bvh,
     VoxelBvh,
+    DualBvh,
+    DualVoxelBvh,
 }
 
 /// Per-pair reduced contact candidate and instrumentation.
@@ -63,7 +65,7 @@ struct Node {
     count: u32,
     escape: u32,
     mask: [u32; 2],
-    padding: u32,
+    end: u32,
 }
 
 #[repr(C)]
@@ -77,7 +79,7 @@ struct Mesh {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Config {
     margin: f32,
-    voxels: u32,
+    mode: u32,
     count: u32,
     transform_count: u32,
 }
@@ -174,7 +176,12 @@ impl MeshCatalog {
             label: Some("mesh contact config"),
             contents: bytemuck::bytes_of(&Config {
                 margin,
-                voxels: u32::from(matches!(mode, Midphase::VoxelBvh)),
+                mode: match mode {
+                    Midphase::Bvh => 0,
+                    Midphase::VoxelBvh => 1,
+                    Midphase::DualBvh => 2,
+                    Midphase::DualVoxelBvh => 3,
+                },
                 count,
                 transform_count,
             }),
