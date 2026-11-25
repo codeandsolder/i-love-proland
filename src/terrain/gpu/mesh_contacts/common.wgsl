@@ -1,5 +1,6 @@
 override DUAL:bool=false;
 override VOXELS:bool=true;
+override LANES:u32=64u;
 struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, flags:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
@@ -210,7 +211,7 @@ fn test_triangle(ta:Triangle,wa:mat3x3<f32>,tb:Triangle,bounds:Bounds,f:QueryFra
 }
 fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     var result=empty();
-    for(var ai=mesh_a.triangles.x+lane;ai<mesh_a.triangles.y;ai+=64u){
+    for(var ai=mesh_a.triangles.x+lane;ai<mesh_a.triangles.y;ai+=LANES){
         let ta=triangles[ai];
         let bounds=tri_bounds(ta,f);
         let wa=transformed(ta,f.la,f.relative);
@@ -234,7 +235,7 @@ fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
 fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     var result=empty();
     var root=mesh_a.nodes.x;
-    for(var depth=0u;depth<6u;depth+=1u){
+    for(var depth=0u;(1u<<depth)<LANES;depth+=1u){
         if nodes[root].count!=0u{
             if (lane>>depth)!=0u{return result;}
             break;
@@ -353,12 +354,24 @@ fn orient_contact(mesh_ids:vec2<u32>,contact:Contact)->Contact{
     return result;
 }
 var<workgroup> reduction:array<Contact,64>;
-fn reduce_contact(local:Contact,lane:u32)->Contact{
+fn reduce_lanes(local:Contact,lane:u32,width:u32){
     reduction[lane]=local;
     workgroupBarrier();
-    for(var stride=32u;stride>0u;stride/=2u){
-        if lane<stride{reduction[lane]=choose(reduction[lane],reduction[lane+stride]);}
+    for(var stride=width/2u;stride>0u;stride/=2u){
+        if (lane&(width-1u))<stride{reduction[lane]=choose(reduction[lane],reduction[lane+stride]);}
         workgroupBarrier();
     }
+}
+fn reduce_contact(local:Contact,lane:u32)->Contact{
+    reduce_lanes(local,lane,64u);
     return workgroupUniformLoad(&reduction[0]);
+}
+fn reduce_packed(local:Contact,lane:u32)->Contact{
+    if LANES==1u{return local;}
+    reduce_lanes(local,lane,LANES);
+    let result=reduction[lane&~(LANES-1u)];
+    // All lanes read before a following containment reduction can
+    // overwrite the same workgroup memory.
+    workgroupBarrier();
+    return result;
 }

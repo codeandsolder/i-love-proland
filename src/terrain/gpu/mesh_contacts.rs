@@ -55,6 +55,40 @@ pub enum Domain {
 pub enum CandidateDispatch {
     Direct,
     Compact,
+    /// Independent mesh pairs share one physical 64-lane workgroup.
+    Packed(PairWidth),
+}
+
+/// Number of lanes assigned to each independent packed pair.
+#[derive(Clone, Copy, Debug)]
+#[repr(u32)]
+pub enum PairWidth {
+    One = 1,
+    Four = 4,
+    Eight = 8,
+    Sixteen = 16,
+    ThirtyTwo = 32,
+}
+
+impl CandidateDispatch {
+    const fn lanes(self) -> u32 {
+        match self {
+            Self::Packed(width) => width as u32,
+            _ => 64,
+        }
+    }
+
+    const fn kernel_index(self) -> usize {
+        match self {
+            Self::Direct => 0,
+            Self::Compact => 1,
+            Self::Packed(PairWidth::One) => 2,
+            Self::Packed(PairWidth::Four) => 3,
+            Self::Packed(PairWidth::Eight) => 4,
+            Self::Packed(PairWidth::Sixteen) => 5,
+            Self::Packed(PairWidth::ThirtyTwo) => 6,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -130,7 +164,7 @@ pub struct MeshCatalog {
     triangles: wgpu::Buffer,
     meshes: wgpu::Buffer,
     count: u32,
-    kernels: [OnceLock<Arc<Kernel>>; 8],
+    kernels: [OnceLock<Arc<Kernel>>; 28],
     prefilter: OnceLock<Arc<Kernel>>,
     sweep_kernel: OnceLock<Arc<Kernel>>,
 }
@@ -167,14 +201,19 @@ impl MeshCatalog {
         self.nodes.size() + self.triangles.size() + self.meshes.size()
     }
 
-    fn query_kernel(&self, device: &wgpu::Device, mode: Midphase, compact: bool) -> &Arc<Kernel> {
+    fn query_kernel(
+        &self,
+        device: &wgpu::Device,
+        mode: Midphase,
+        dispatch: CandidateDispatch,
+    ) -> &Arc<Kernel> {
         let mode_index = match mode {
             Midphase::Bvh => 0,
             Midphase::VoxelBvh => 1,
             Midphase::DualBvh => 2,
             Midphase::DualVoxelBvh => 3,
         };
-        self.kernels[mode_index + 4 * usize::from(compact)].get_or_init(|| {
+        self.kernels[mode_index + 4 * dispatch.kernel_index()].get_or_init(|| {
             Arc::new(Kernel::specialized(
                 device,
                 "specialized mesh contact query",
@@ -183,10 +222,15 @@ impl MeshCatalog {
                     include_str!("mesh_contacts/containment.wgsl"),
                     include_str!("mesh_contacts/query.wgsl")
                 ),
-                if compact { "query_compact" } else { "query" },
+                match dispatch {
+                    CandidateDispatch::Direct => "query",
+                    CandidateDispatch::Compact => "query_compact",
+                    CandidateDispatch::Packed(_) => "query_packed",
+                },
                 &[
                     ("DUAL", f64::from(u32::from(mode_index & 2 != 0))),
                     ("VOXELS", f64::from(u32::from(mode_index & 1 != 0))),
+                    ("LANES", f64::from(dispatch.lanes())),
                 ],
             ))
         })
@@ -244,9 +288,10 @@ impl MeshCatalog {
             dispatch,
         } = settings;
         let count = u32::try_from(pairs.len()).map_err(io::Error::other)?;
+        let groups = count.div_ceil(64 / dispatch.lanes());
         let transform_count = u32::try_from(transforms.size() / 64).map_err(io::Error::other)?;
         if count == 0
-            || count > device.limits().max_compute_workgroups_per_dimension
+            || groups > device.limits().max_compute_workgroups_per_dimension
             || !transforms.size().is_multiple_of(64)
             || transforms.size() > device.limits().max_storage_buffer_binding_size
             || !transforms.usage().contains(wgpu::BufferUsages::STORAGE)
@@ -262,7 +307,7 @@ impl MeshCatalog {
         let pairs = storage(device, "mesh contact pairs", bytemuck::cast_slice(pairs))?;
         let output = output_buffer::<MeshContact>(device, count, "mesh contact results")?;
         let compact = matches!(dispatch, CandidateDispatch::Compact);
-        let kernel = self.query_kernel(device, mode, compact);
+        let kernel = self.query_kernel(device, mode, dispatch);
         let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh contact config"),
             contents: bytemuck::bytes_of(&Config {
@@ -298,6 +343,7 @@ impl MeshCatalog {
             bind,
             output,
             count,
+            groups,
             kernel: Arc::clone(kernel),
             marker: PhantomData,
             label: "mesh contact midphase/narrowphase",
@@ -335,6 +381,7 @@ pub struct MeshBatch<T> {
     bind: wgpu::BindGroup,
     output: wgpu::Buffer,
     count: u32,
+    groups: u32,
     kernel: Arc<Kernel>,
     marker: PhantomData<T>,
     label: &'static str,
@@ -359,7 +406,7 @@ impl<T: bytemuck::Pod> MeshBatch<T> {
                 .dispatch_indirect(encoder, self.label, &self.bind, &prefilter.args);
         } else {
             self.kernel
-                .dispatch(encoder, self.label, &self.bind, [self.count, 1, 1]);
+                .dispatch(encoder, self.label, &self.bind, [self.groups, 1, 1]);
         }
     }
 

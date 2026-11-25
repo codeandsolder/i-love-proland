@@ -7,6 +7,8 @@ mod containment;
 mod impact;
 #[path = "mesh_contacts/order.rs"]
 mod order;
+#[path = "mesh_contacts/packed.rs"]
+mod packed;
 #[path = "mesh_contacts/sweep.rs"]
 mod sweep;
 use i_love_proland::terrain::gpu::mesh_contacts::{
@@ -193,6 +195,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     impact::check(device, queue)?;
     compact::check(device, queue, &geometry)?;
     order::check(device, queue, &geometry)?;
+    packed::check(device, queue, &geometry)?;
     let catalog = MeshCatalog::new(
         device,
         &geometry.iter().map(Geometry::source).collect::<Vec<_>>(),
