@@ -61,7 +61,7 @@ fn predict_impulses(@builtin(global_invocation_id) id:vec3<u32>){
         let b=bodies[pair.y];
         let ia=instances[link.instances.x];
         let ib=instances[link.instances.y];
-        if a.metadata.z!=0u || b.metadata.z!=0u || any(a.clock.xy!=b.clock.xy) || ia.metadata.x!=pair.x || ib.metadata.x!=pair.y){
+        if a.metadata.z!=0u || b.metadata.z!=0u || any(a.clock.xy!=b.clock.xy) || ia.metadata.x!=pair.x || ib.metadata.x!=pair.y{
             impact.metadata.x=3u;
         }else{
             let point=(c.point_a.xyz+c.point_b.xyz)*0.5;

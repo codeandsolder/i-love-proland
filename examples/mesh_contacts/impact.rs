@@ -2,7 +2,7 @@ use super::{Geometry, IDENTITY, Result};
 use i_love_proland::terrain::gpu::{
     mesh_contacts::{
         BodyMeshInstance, BodyMeshPoses, CandidateDispatch, Domain, MeshCatalog, MeshImpact,
-        MeshImpulses, MeshPair, Midphase, QuerySettings,
+        MeshImpactLink, MeshImpulses, MeshPair, Midphase, QuerySettings,
     },
     physics::RigidBody,
 };
@@ -21,7 +21,7 @@ const fn body(position: [f32; 3], velocity: [f32; 3], angular: [f32; 3]) -> Rigi
     }
 }
 
-pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+fn catalog(device: &wgpu::Device) -> Result<MeshCatalog> {
     let horizontal = Geometry {
         positions: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]],
         indices: vec![0, 1, 2],
@@ -38,10 +38,14 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
             .collect(),
         indices: vertical.indices.clone(),
     };
-    let catalog = MeshCatalog::new(
+    Ok(MeshCatalog::new(
         device,
         &[horizontal.source(), offset.source(), vertical.source()],
-    )?;
+    )?)
+}
+
+pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    let catalog = catalog(device)?;
     let states = [
         body([0.; 3], [0., 0., 1.], [0.; 3]),
         body([0., 0., 0.005], [0., 0., -1.], [0.; 3]),

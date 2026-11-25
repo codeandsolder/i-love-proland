@@ -192,6 +192,39 @@ impl MeshCatalog {
         })
     }
 
+    fn make_prefilter(&self, device: &wgpu::Device, buffers: &[&wgpu::Buffer]) -> Prefilter {
+        let filter = self.prefilter.get_or_init(|| {
+            Arc::new(Kernel::new(
+                device,
+                "mesh root prequalification",
+                concat!(
+                    include_str!("mesh_contacts/common.wgsl"),
+                    include_str!("mesh_contacts/containment.wgsl"),
+                    include_str!("mesh_contacts/query.wgsl")
+                ),
+                "prequalify",
+            ))
+        });
+        let args = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh indirect dispatch"),
+            contents: bytemuck::cast_slice(&[0_u32, 1, 1]),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST,
+        });
+        let bindings = [0_u32, 2, 3, 4, 5, 6, 7].map(|i| (i, buffers[i as usize]));
+        let bind = filter.bind_numbered(
+            device,
+            "mesh root prequalification",
+            &[bindings.as_slice(), &[(8, &args)]].concat(),
+        );
+        Prefilter {
+            kernel: Arc::clone(filter),
+            bind,
+            args,
+        }
+    }
+
     /// Allocate a reusable query set. Transforms are not copied or mapped:
     /// pass the authoritative storage buffer of column-major affine matrices.
     ///
@@ -256,49 +289,10 @@ impl MeshCatalog {
         let candidates = compact
             .then(|| output_buffer::<u32>(device, count, "mesh compact candidates"))
             .transpose()?;
-        let prefilter = if let Some(candidates) = &candidates {
-            let filter = self.prefilter.get_or_init(|| {
-                Arc::new(Kernel::new(
-                    device,
-                    "mesh root prequalification",
-                    concat!(
-                        include_str!("mesh_contacts/common.wgsl"),
-                        include_str!("mesh_contacts/containment.wgsl"),
-                        include_str!("mesh_contacts/query.wgsl")
-                    ),
-                    "prequalify",
-                ))
-            });
-            let args = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh indirect dispatch"),
-                contents: bytemuck::cast_slice(&[0_u32, 1, 1]),
-                usage: wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::INDIRECT
-                    | wgpu::BufferUsages::COPY_DST,
-            });
+        let prefilter = candidates.as_ref().map(|candidates| {
             buffers.push(candidates);
-            let bind = filter.bind_numbered(
-                device,
-                "mesh root prequalification",
-                &[
-                    (0, &self.nodes),
-                    (2, &self.meshes),
-                    (3, transforms),
-                    (4, &pairs),
-                    (5, &output),
-                    (6, &config),
-                    (7, candidates),
-                    (8, &args),
-                ],
-            );
-            Some(Prefilter {
-                kernel: Arc::clone(filter),
-                bind,
-                args,
-            })
-        } else {
-            None
-        };
+            self.make_prefilter(device, &buffers)
+        });
         let bind = kernel.bind(device, "resident mesh contact queries", &buffers)?;
         Ok(MeshQueries {
             bind,
