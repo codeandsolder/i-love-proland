@@ -1,3 +1,4 @@
+override SWEEP_ENVELOPE:bool=false;
 // Earliest conservative interval for linear translation + shortest-arc
 // rigid rotation, with an explicit extra trajectory deviation allowance.
 // No collision can disappear solely because both endpoint poses are clear.
@@ -52,6 +53,7 @@ fn travel(a:RigidPose,b:RigidPose,radius:f32)->f32{
 }
 struct Cursor { depth:u32, index:u32, done:u32, tests:u32 }
 var<workgroup> cursor:Cursor;
+var<workgroup> envelope_candidate:u32;
 @compute @workgroup_size(64)
 fn sweep(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index) lane:u32){
     let pair=sweeps[group.x];
@@ -82,7 +84,17 @@ fn sweep(@builtin(workgroup_id) group:vec3<u32>,@builtin(local_invocation_index)
         let margin=config.margin+displacement*width*0.5+config.deviation+rounding;
         let a=interpolate(pair.poses[0],pair.poses[1],mid);
         let b=interpolate(pair.poses[2],pair.poses[3],mid);
-        var result=orient_contact(pair.mesh_ids,reduce_contact(scan(pair.mesh_ids,a,b,margin,lane),lane));
+        var candidate=true;
+        if SWEEP_ENVELOPE {
+            if lane==0u{
+                envelope_candidate=u32(select_envelope(pair.mesh_ids,a,b,margin));
+            }
+            candidate=workgroupUniformLoad(&envelope_candidate)!=0u;
+        }
+        var result=empty();
+        if candidate{
+            result=orient_contact(pair.mesh_ids,reduce_contact(scan(pair.mesh_ids,a,b,margin,lane),lane));
+        }
         if result.features.z==0u && result.features.w==0u {
             let inside=reduce_contact(containment(pair.mesh_ids,a,b,lane),lane);
             result.features.w=inside.features.w;

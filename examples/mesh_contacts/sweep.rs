@@ -19,6 +19,37 @@ fn run(
     settings: SweepSettings,
 ) -> Result<Vec<SweepResult>> {
     let sweeps = catalog.sweeps(device, pairs, settings)?;
+    let envelope = catalog.envelope_sweeps(device, pairs, settings)?;
+    let expected = read(device, queue, &sweeps)?;
+    let actual = read(device, queue, &envelope)?;
+    for (a, b) in expected.iter().zip(&actual) {
+        assert_eq!(a.status, b.status, "swept coarse envelope status");
+        assert_eq!(a.interval, b.interval, "swept coarse envelope interval");
+        assert_eq!(
+            a.contact.features, b.contact.features,
+            "swept coarse envelope features"
+        );
+        assert_eq!(
+            a.contact.point_a, b.contact.point_a,
+            "swept coarse envelope witness A"
+        );
+        assert_eq!(
+            a.contact.point_b, b.contact.point_b,
+            "swept coarse envelope witness B"
+        );
+        assert_eq!(
+            a.contact.normal, b.contact.normal,
+            "swept coarse envelope normal"
+        );
+    }
+    Ok(actual)
+}
+
+fn read(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    sweeps: &i_love_proland::terrain::gpu::mesh_contacts::MeshSweeps,
+) -> Result<Vec<SweepResult>> {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     sweeps.encode(&mut encoder);
     let snapshot = sweeps.snapshot(device, &mut encoder);

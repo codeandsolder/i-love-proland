@@ -136,7 +136,7 @@ pub struct MeshCatalog {
     count: u32,
     kernels: [OnceLock<Arc<Kernel>>; 10],
     prefilters: [OnceLock<Arc<Kernel>>; 2],
-    sweep_kernel: OnceLock<Arc<Kernel>>,
+    sweep_kernels: [OnceLock<Arc<Kernel>>; 2],
 }
 
 impl MeshCatalog {
@@ -161,7 +161,7 @@ impl MeshCatalog {
             count: u32::try_from(meshes.len()).map_err(io::Error::other)?,
             kernels: std::array::from_fn(|_| OnceLock::new()),
             prefilters: std::array::from_fn(|_| OnceLock::new()),
-            sweep_kernel: OnceLock::new(),
+            sweep_kernels: std::array::from_fn(|_| OnceLock::new()),
         })
     }
 
