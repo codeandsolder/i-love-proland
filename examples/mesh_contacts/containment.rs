@@ -22,7 +22,7 @@ fn cube(half: f32) -> Geometry {
         ],
     }
 }
-pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+fn catalog(device: &wgpu::Device) -> Result<MeshCatalog> {
     let outer = cube(2.0);
     let inner = cube(0.2);
     let disconnected = Geometry {
@@ -41,7 +41,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         .positions
         .extend([[10.0, 0.0, 0.0], [10.1, 0.0, 0.0], [10.0, 0.1, 0.0]]);
     mixed.indices.extend([8, 9, 10]);
-    let catalog = MeshCatalog::new(
+    Ok(MeshCatalog::new(
         device,
         &[
             outer.source(),
@@ -49,7 +49,11 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
             disconnected.source(),
             mixed.source(),
         ],
-    )?;
+    )?)
+}
+
+pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    let catalog = catalog(device)?;
     let matrices = [
         IDENTITY,
         pose(0.37, 0.2, -0.3, 0.15),
