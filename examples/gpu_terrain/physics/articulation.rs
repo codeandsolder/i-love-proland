@@ -341,7 +341,10 @@ fn external_contact(
     let after = read_state(device, queue, &mut physics, terrain, 24, 216)?;
     let momentum = after.iter().map(|b| b.velocity[0]).sum::<f32>();
     assert!((momentum + 2.0).abs() < 0.001, "{after:?}");
-    assert!(after[0].velocity[0]<-0.2&&after[1].velocity[0]<-0.2,"{after:?}");
+    assert!(
+        after[0].velocity[0] < -0.2 && after[1].velocity[0] < -0.2,
+        "{after:?}"
+    );
     assert!((after[1].position[0] - after[0].position[0] - 0.7).abs() < 0.01);
     assert!((after[1].velocity[0] - after[0].velocity[0]).abs() < 0.01);
     println!(
