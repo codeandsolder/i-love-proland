@@ -1,4 +1,6 @@
 //! Actual GPU benchmark for arbitrary relative mesh poses.
+#[path = "mesh_contacts/sweep.rs"]
+mod sweep;
 use i_love_proland::terrain::gpu::mesh_contacts::{
     MeshCatalog, MeshContact, MeshPair, MeshQueries, MeshSource, Midphase,
 };
@@ -64,7 +66,7 @@ impl Geometry {
     }
 }
 
-fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+fn geometry() -> Result<[Geometry; 3]> {
     let triangle = Geometry {
         positions: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]],
         indices: vec![0, 1, 2],
@@ -75,7 +77,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     };
     for y in 0..16_u16 {
         for x in 0..16_u16 {
-            if x < 3 || x >= 13 || y < 3 || y >= 13 {
+            if !(3..13).contains(&x) || !(3..13).contains(&y) {
                 frame.tile(f32::from(x) - 8., f32::from(y) - 8., 1.)?;
             }
         }
@@ -84,7 +86,15 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         positions: vec![[0., -0.2, 0.], [4., -0.2, 0.], [4., 0.2, 0.], [0., 0.2, 0.]],
         indices: vec![0, 1, 2, 0, 2, 3],
     };
-    let catalog = MeshCatalog::new(device, &[triangle.source(), frame.source(), panel.source()])?;
+    Ok([triangle, frame, panel])
+}
+
+struct Cases {
+    poses: Vec<Matrix>,
+    pairs: Vec<MeshPair>,
+    rotations: std::ops::Range<usize>,
+}
+fn cases() -> Result<Cases> {
     let mut poses = vec![
         IDENTITY,
         pose(0., 0., 0., 0.05),
@@ -152,6 +162,25 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
             transforms: [index, 0],
         });
     }
+    Ok(Cases {
+        poses,
+        pairs,
+        rotations: test_count..rotation_end,
+    })
+}
+
+fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    let geometry = geometry()?;
+    sweep::check(device, queue, &geometry[2])?;
+    let catalog = MeshCatalog::new(
+        device,
+        &geometry.iter().map(Geometry::source).collect::<Vec<_>>(),
+    )?;
+    let Cases {
+        poses,
+        pairs,
+        rotations,
+    } = cases()?;
     let matrices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("test resident animated matrices"),
         contents: bytemuck::cast_slice(&poses),
@@ -175,8 +204,8 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     }
     assert!((a[0].point_a[3] - 0.0025).abs() < 1e-6);
     assert!(a[4].point_a[3] < 1e-10);
-    assert!(a[5].point_a[3] < 0.000401);
-    let rotating = &a[test_count..rotation_end];
+    assert!(a[5].point_a[3] < 0.000_401);
+    let rotating = &a[rotations];
     let hits = rotating.iter().filter(|c| c.features[2] > 0).count();
     assert!(hits > 0 && hits < rotating.len());
     // Modify only the resident pose, not the mesh or bind group.
@@ -209,34 +238,46 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         ("dual_bvh", &dual, &c),
         ("dual_voxel", &dual_voxel, &d),
     ] {
-        let mut times = Vec::new();
-        for _ in 0..12 {
-            let start = Instant::now();
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            for _ in 0..16 {
-                catalog.encode(&mut encoder, q);
-            }
-            queue.submit([encoder.finish()]);
-            device.poll(wgpu::PollType::wait_indefinitely())?;
-            times.push(start.elapsed().as_secs_f64() * 1000. / 16.);
-        }
-        times.sort_by(f64::total_cmp);
-        let sums = |i: usize| {
-            results
-                .iter()
-                .map(|r| u64::from(r.statistics[i]))
-                .sum::<u64>()
-        };
-        println!(
-            "MESH_BENCH mode={name} pairs={} median_ms={:.6} visits={} triangle_tests={} mask_rejections={}",
-            pairs.len(),
-            times[6],
-            sums(0),
-            sums(1),
-            sums(2)
-        );
+        benchmark(device, queue, &catalog, name, q, results)?;
     }
+    Ok(())
+}
+
+fn benchmark(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    catalog: &MeshCatalog,
+    name: &str,
+    queries: &MeshQueries,
+    results: &[MeshContact],
+) -> Result<()> {
+    let mut times = Vec::new();
+    for _ in 0..12 {
+        let start = Instant::now();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        for _ in 0..16 {
+            catalog.encode(&mut encoder, queries);
+        }
+        queue.submit([encoder.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely())?;
+        times.push(start.elapsed().as_secs_f64() * 1000. / 16.);
+    }
+    times.sort_by(f64::total_cmp);
+    let sums = |i: usize| {
+        results
+            .iter()
+            .map(|r| u64::from(r.statistics[i]))
+            .sum::<u64>()
+    };
+    println!(
+        "MESH_BENCH mode={name} pairs={} median_ms={:.6} visits={} triangle_tests={} mask_rejections={}",
+        results.len(),
+        times[6],
+        sums(0),
+        sums(1),
+        sums(2)
+    );
+
     Ok(())
 }
 

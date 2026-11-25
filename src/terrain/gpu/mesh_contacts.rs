@@ -8,6 +8,8 @@ use super::{Kernel, RecordedReadback, invalid, storage};
 use std::io;
 use wgpu::util::DeviceExt;
 mod build;
+mod sweep;
+pub use sweep::{MeshSweeps, RigidPose, SweepPair, SweepResult, SweepSettings};
 
 /// One indexed collision mesh in its authored local coordinate system.
 pub struct MeshSource<'a> {
@@ -91,6 +93,7 @@ pub struct MeshCatalog {
     meshes: wgpu::Buffer,
     count: u32,
     kernel: Kernel,
+    sweep_kernel: Kernel,
 }
 
 impl MeshCatalog {
@@ -116,8 +119,20 @@ impl MeshCatalog {
             kernel: Kernel::new(
                 device,
                 "mesh contact query",
-                include_str!("mesh_contacts/query.wgsl"),
+                concat!(
+                    include_str!("mesh_contacts/common.wgsl"),
+                    include_str!("mesh_contacts/query.wgsl")
+                ),
                 "query",
+            ),
+            sweep_kernel: Kernel::new(
+                device,
+                "mesh swept query",
+                concat!(
+                    include_str!("mesh_contacts/common.wgsl"),
+                    include_str!("mesh_contacts/sweep.wgsl")
+                ),
+                "sweep",
             ),
         })
     }

@@ -85,7 +85,15 @@
     {
       "name": "mesh contact hierarchy",
       "sources": [
+        "src/terrain/gpu/mesh_contacts/common.wgsl",
         "src/terrain/gpu/mesh_contacts/query.wgsl"
+      ]
+    },
+    {
+      "name": "mesh continuous contact search",
+      "sources": [
+        "src/terrain/gpu/mesh_contacts/common.wgsl",
+        "src/terrain/gpu/mesh_contacts/sweep.wgsl"
       ]
     }
   ],
