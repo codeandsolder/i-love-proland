@@ -1,5 +1,5 @@
-//! Coupled spherical rigid bodies share the regular terrain/static-contact
-//! solver and advance at the same fixed simulation ticks.
+//! Coupled rigid bodies share the terrain/static-contact solver and advance
+//! at the same fixed simulation ticks.
 use super::{Collider, Kernel, RigidBody, invalid};
 use std::io;
 use wgpu::util::DeviceExt;
@@ -10,6 +10,15 @@ const SOURCE: &str = concat!(
     include_str!("body_math.wgsl"),
     include_str!("sphere_pair_math.wgsl"),
     include_str!("sphere_pairs.wgsl"),
+);
+
+const COMPOUND_SOURCE: &str = concat!(
+    include_str!("body.wgsl"),
+    include_str!("collider.wgsl"),
+    include_str!("body_math.wgsl"),
+    include_str!("sphere_pair_math.wgsl"),
+    include_str!("ellipsoid_pair_math.wgsl"),
+    include_str!("compound_pairs.wgsl"),
 );
 
 pub(super) fn eligible(bodies: &[RigidBody], colliders: &[Collider]) -> bool {
@@ -50,45 +59,41 @@ impl ParallelPairs {
         bodies: &wgpu::Buffer,
         colliders: &wgpu::Buffer,
         count: u32,
+        source: &str,
     ) -> io::Result<Self> {
         if count == 0 {
             return Err(invalid("empty coupled body set"));
         }
         let scratch = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sphere pair immutable iteration output"),
+            label: Some("body pair immutable iteration output"),
             size: bodies.size(),
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         let degrees = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sphere contact graph degrees"),
+            label: Some("body contact graph degrees"),
             size: u64::from(count) * 4,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-        let count_kernel = Kernel::new(device, "sphere neighbor count", SOURCE, "count_neighbors");
-        let solve_kernel = Kernel::new(
-            device,
-            "sphere pair impulse gather",
-            SOURCE,
-            "resolve_pairs",
-        );
+        let count_kernel = Kernel::new(device, "body neighbor count", source, "count_neighbors");
+        let solve_kernel = Kernel::new(device, "body pair impulse gather", source, "resolve_pairs");
         let sweep =
             |input: &wgpu::Buffer, output: &wgpu::Buffer, restitution: u32| -> io::Result<Sweep> {
                 let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("sphere pair sweep parameters"),
+                    label: Some("body pair sweep parameters"),
                     contents: bytemuck::cast_slice(&[restitution, 0, 0, 0]),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
                 Ok(Sweep {
                     count: count_kernel.bind(
                         device,
-                        "sphere degree input",
+                        "body degree input",
                         &[input, colliders, &degrees],
                     )?,
                     solve: solve_kernel.bind(
                         device,
-                        "sphere impulse input/output",
+                        "body impulse input/output",
                         &[input, colliders, &degrees, output, &config],
                     )?,
                 })
@@ -106,38 +111,39 @@ impl ParallelPairs {
         // Two sweeps return the authoritative state to the original buffer.
         for sweep in &self.sweeps {
             self.count
-                .dispatch(encoder, "sphere contact degrees", &sweep.count, self.groups);
-            self.solve.dispatch(
-                encoder,
-                "sphere contact impulses",
-                &sweep.solve,
-                self.groups,
-            );
+                .dispatch(encoder, "body contact degrees", &sweep.count, self.groups);
+            self.solve
+                .dispatch(encoder, "body contact impulses", &sweep.solve, self.groups);
         }
     }
 }
 
-pub(super) enum SpherePairs {
+pub(super) enum BodyPairs {
     Local {
         kernel: Kernel,
         bind: wgpu::BindGroup,
     },
     Parallel(Box<ParallelPairs>),
 }
-impl SpherePairs {
+impl BodyPairs {
     pub(super) fn new(
         device: &wgpu::Device,
         bodies: &wgpu::Buffer,
         colliders: &wgpu::Buffer,
         count: u32,
+        spheres: bool,
     ) -> io::Result<Self> {
-        if (1..=64).contains(&count) {
+        if spheres && (1..=64).contains(&count) {
             let kernel = Kernel::new(device, "local sphere island", LOCAL_SOURCE, "solve_local");
             let bind = kernel.bind(device, "local sphere island", &[bodies, colliders])?;
             Ok(Self::Local { kernel, bind })
         } else {
             Ok(Self::Parallel(Box::new(ParallelPairs::new(
-                device, bodies, colliders, count,
+                device,
+                bodies,
+                colliders,
+                count,
+                if spheres { SOURCE } else { COMPOUND_SOURCE },
             )?)))
         }
     }

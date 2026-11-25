@@ -69,6 +69,17 @@
         "src/terrain/gpu/physics/sphere_pair_math.wgsl",
         "src/terrain/gpu/physics/sphere_pairs_local.wgsl"
       ]
+    },
+    {
+      "name": "compound ellipsoid contacts",
+      "sources": [
+        "src/terrain/gpu/physics/body.wgsl",
+        "src/terrain/gpu/physics/collider.wgsl",
+        "src/terrain/gpu/physics/body_math.wgsl",
+        "src/terrain/gpu/physics/sphere_pair_math.wgsl",
+        "src/terrain/gpu/physics/ellipsoid_pair_math.wgsl",
+        "src/terrain/gpu/physics/compound_pairs.wgsl"
+      ]
     }
   ],
   "negative_tests": []
