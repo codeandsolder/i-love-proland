@@ -3,7 +3,7 @@
 mod clock;
 mod contact_grid;
 pub use contact_grid::{ContactGrid, PinnedGrid};
-mod sphere_pairs;
+mod body_pairs;
 mod static_scene;
 use super::{
     GridProjection, Kernel, RecordedReadback, TerrainGpu, TerrainRequest, invalid, storage,
@@ -272,7 +272,7 @@ pub struct PhysicsGpu {
     pipeline: Kernel,
     static_scene: StaticScene,
     sphere_eligible: bool,
-    sphere_pairs: Option<sphere_pairs::SpherePairs>,
+    body_pairs: Option<body_pairs::BodyPairs>,
     bodies: wgpu::Buffer,
     shapes: wgpu::Buffer,
     empty_contacts: wgpu::Buffer,
@@ -365,8 +365,8 @@ impl PhysicsGpu {
         Ok(Self {
             pipeline,
             static_scene: StaticScene::new(device, &[])?,
-            sphere_eligible: sphere_pairs::eligible(bodies, shapes),
-            sphere_pairs: None,
+            sphere_eligible: body_pairs::eligible(bodies, shapes),
+            body_pairs: None,
             bodies: states,
             shapes: storage(
                 device,
@@ -413,25 +413,24 @@ impl PhysicsGpu {
         &self.shapes
     }
 
-    /// Enable coupled GPU contacts for single centered spherical bodies.
-    /// The terrain and static mesh solver runs at the same fixed tick;
-    /// interbody contacts exchange impulses between those integrations.
+    /// Enable coupled GPU contacts for compound ellipsoids.
+    ///
+    /// Centered spheres automatically use the specialized local/parallel
+    /// solver. General compounds use symmetric Jacobi contact sweeps.
+    /// This is discrete contact resolution, not swept collision prediction.
     ///
     /// # Errors
-    /// Rejects a compound or anisotropic collider set. General convex
-    /// body-body contacts use a different narrow phase and are not yet
-    /// implemented.
-    pub fn enable_sphere_pairs(&mut self, device: &wgpu::Device) -> io::Result<()> {
-        if !self.sphere_eligible || self.params.stop_at_contact != 0 {
-            return Err(invalid(
-                "coupled contacts require centered spherical bodies and normal stepping",
-            ));
+    /// Rejects first-contact stopping, which requires coupled TOI handling.
+    pub fn enable_body_pairs(&mut self, device: &wgpu::Device) -> io::Result<()> {
+        if self.params.stop_at_contact != 0 {
+            return Err(invalid("coupled contacts require normal stepping"));
         }
-        self.sphere_pairs = Some(sphere_pairs::SpherePairs::new(
+        self.body_pairs = Some(body_pairs::BodyPairs::new(
             device,
             &self.bodies,
             &self.shapes,
             self.params.count,
+            self.sphere_eligible,
         )?);
         Ok(())
     }
@@ -533,7 +532,7 @@ impl PhysicsGpu {
             .checked_add(u64::from(batch.steps))
             .ok_or_else(|| invalid("physics tick overflow"))?;
         let params = StepConfig {
-            steps: if self.sphere_pairs.is_some() {
+            steps: if self.body_pairs.is_some() {
                 1
             } else {
                 batch.steps
@@ -561,7 +560,7 @@ impl PhysicsGpu {
         ];
         let bind = self.pipeline.bind(device, "physics batch", &buffers)?;
         let groups = [self.params.count.div_ceil(64), 1, 1];
-        if let Some(pairs) = &self.sphere_pairs {
+        if let Some(pairs) = &self.body_pairs {
             for _ in 0..batch.steps {
                 self.pipeline
                     .dispatch(encoder, "advance one coupled physics tick", &bind, groups);

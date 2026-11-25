@@ -1,4 +1,6 @@
 //! Actual device regressions for interacting spheres and static triangles.
+#[path = "marbles/compound.rs"]
+mod compound;
 use super::{Result, encoder};
 use i_love_proland::terrain::gpu::{
     TerrainGpu,
@@ -77,13 +79,14 @@ fn wall() -> [StaticTriangle; 2] {
 }
 
 pub fn run(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) -> Result<()> {
+    compound::run(device, queue, terrain)?;
     let shapes = [Collider::sphere([0.0; 3], 0.5)];
     let initial = [
         body([30.0, 32.0, 108.0], [2.0, 0.0, 0.0], 1.0),
         body([32.0, 32.0, 108.0], [-2.0, 0.0, 0.0], 1.0),
     ];
     let mut physics = PhysicsGpu::new(device, terrain, 0, config(0.0), &initial, &shapes)?;
-    physics.enable_sphere_pairs(device)?;
+    physics.enable_body_pairs(device)?;
     let bounced = sample(device, queue, terrain, &mut physics, 0, 100)?;
     assert!((bounced[0].velocity[0] + 2.0).abs() < 0.01, "{bounced:?}");
     assert!((bounced[1].velocity[0] - 2.0).abs() < 0.01, "{bounced:?}");
@@ -123,7 +126,7 @@ pub fn run(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) -> 
         .collect::<Vec<_>>();
     let mut physics = PhysicsGpu::new(device, terrain, 0, config(9.81), &initial, &shapes)?;
     physics.set_static_scene(StaticScene::new(device, &wall())?)?;
-    physics.enable_sphere_pairs(device)?;
+    physics.enable_body_pairs(device)?;
     let mut contacts = 0;
     let mut bounced = 0;
     let mut peak_penetration = 0.0_f32;
