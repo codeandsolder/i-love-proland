@@ -1,5 +1,6 @@
 override DUAL:bool=false;
 override VOXELS:bool=true;
+override PLANES:bool=true;
 struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, flags:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
@@ -42,9 +43,7 @@ fn inside(p:vec3<f32>,t:mat3x3<f32>,n:vec3<f32>)->bool{
     }
     return true;
 }
-fn point_triangle(p:vec3<f32>,t:mat3x3<f32>)->Witness{
-    let n=cross(t[1]-t[0],t[2]-t[0]);
-    let n2=dot(n,n);
+fn point_triangle(p:vec3<f32>,t:mat3x3<f32>,n:vec3<f32>,n2:f32)->Witness{
     if n2>0.0{
         let q=p-n*(dot(p-t[0],n)/n2);
         if inside(q,t,n){return witness(p,q);}
@@ -55,8 +54,7 @@ fn point_triangle(p:vec3<f32>,t:mat3x3<f32>)->Witness{
     }
     return best;
 }
-fn edge_triangle(a:vec3<f32>,b:vec3<f32>,t:mat3x3<f32>)->Witness{
-    let n=cross(t[1]-t[0],t[2]-t[0]);
+fn edge_triangle(a:vec3<f32>,b:vec3<f32>,t:mat3x3<f32>,n:vec3<f32>)->Witness{
     let da=dot(a-t[0],n);
     let db=dot(b-t[0],n);
     let denominator=da-db;
@@ -93,16 +91,18 @@ fn edges(a:vec3<f32>,b:vec3<f32>,c:vec3<f32>,d:vec3<f32>)->Witness{
     }
     return witness(a+u*s,c+v*t);
 }
-fn triangle_distance(a:mat3x3<f32>,b:mat3x3<f32>)->Witness{
+fn triangle_distance(a:mat3x3<f32>,b:mat3x3<f32>,na:vec3<f32>,nb:vec3<f32>)->Witness{
+    let na2=dot(na,na);
+    let nb2=dot(nb,nb);
     var best=Witness(a[0],b[0],FAR);
     for(var i=0u;i<3u;i+=1u){
         let j=(i+1u)%3u;
-        let ab=edge_triangle(a[i],a[j],b);
+        let ab=edge_triangle(a[i],a[j],b,nb);
         if ab.distance2==0.0{return ab;}
-        let ba=edge_triangle(b[i],b[j],a);
+        let ba=edge_triangle(b[i],b[j],a,na);
         if ba.distance2==0.0{return Witness(ba.b,ba.a,0.0);}
-        best=nearer(best,point_triangle(a[i],b));
-        let p=point_triangle(b[i],a);
+        best=nearer(best,point_triangle(a[i],b,nb,nb2));
+        let p=point_triangle(b[i],a,na,na2);
         best=nearer(best,Witness(p.b,p.a,p.distance2));
         if best.distance2==0.0{return best;}
         for(var k=0u;k<3u;k+=1u){
@@ -188,13 +188,40 @@ fn accepts(n:Node,b:Bounds,r:ptr<function,Contact>)->bool{
     }
     return true;
 }
+// Reject only if the complete projected intervals are separated by
+// more than the physical query margin. No assumption about a normalized
+// or accurate face normal is needed: any finite nonzero axis is valid.
+// Use the L1 axis norm as an upper bound on its Euclidean norm and a
+// generous f32 projection error envelope. Degenerate axes cannot reject.
+fn plane_separates(a:mat3x3<f32>,b:mat3x3<f32>,axis:vec3<f32>,margin:f32)->bool{
+    let scale=max(abs(axis.x),max(abs(axis.y),abs(axis.z)));
+    if !(scale>0.0&&scale<1e30){return false;}
+    let n=axis/scale;
+    let abs_n=abs(n);
+    let ap=vec3<f32>(dot(a[0],n),dot(a[1],n),dot(a[2],n));
+    let bp=vec3<f32>(dot(b[0],n),dot(b[1],n),dot(b[2],n));
+    let am=max(abs(a[0]),max(abs(a[1]),abs(a[2])));
+    let bm=max(abs(b[0]),max(abs(b[1]),abs(b[2])));
+    let error=0.000032*(dot(am+bm,abs_n)+margin+1.0);
+    let limit=margin*(abs_n.x+abs_n.y+abs_n.z)+error;
+    return min(ap.x,min(ap.y,ap.z))-max(bp.x,max(bp.y,bp.z))>limit ||
+           min(bp.x,min(bp.y,bp.z))-max(ap.x,max(ap.y,ap.z))>limit;
+}
 fn test_triangle(ta:Triangle,wa:mat3x3<f32>,tb:Triangle,bounds:Bounds,f:QueryFrame,r:ptr<function,Contact>){
     let lo=min(tb.a,min(tb.b.xyz,tb.c));
     let hi=max(tb.a,max(tb.b.xyz,tb.c));
     if any(lo>bounds.hi)||any(hi<bounds.lo){return;}
     let wb=transformed(tb,f.lb,vec3<f32>(0.0));
+    let na=cross(wa[1]-wa[0],wa[2]-wa[0]);
+    let nb=cross(wb[1]-wb[0],wb[2]-wb[0]);
+    if PLANES {
+        let margin=sqrt(f.margin2);
+        if plane_separates(wa,wb,na,margin)||plane_separates(wa,wb,nb,margin){
+            return;
+        }
+    }
     (*r).statistics.y+=1u;
-    let w=triangle_distance(wa,wb);
+    let w=triangle_distance(wa,wb,na,nb);
     if w.distance2<=f.margin2{
         (*r).features.z+=1u;
         if w.distance2<(*r).point_a.w ||
