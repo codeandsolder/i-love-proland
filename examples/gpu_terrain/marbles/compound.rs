@@ -48,7 +48,7 @@ fn head_on(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) -> 
 fn separated(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) -> Result<()> {
     // Circumscribed spheres overlap for the whole pass, but the authored
     // thin ellipsoids are separated in Y. Test false positives and rotation.
-    let rotation = [0.0, 0.0, 0.38268343, 0.9238795];
+    let rotation = [0.0, 0.0, 0.382_683_43, 0.923_879_5];
     let shapes = [Collider::ellipsoid([0.0; 3], [1.5, 0.08, 0.25], rotation)];
     let initial = [
         body([30.0, 32.0, 108.0], [0.0; 3], 1.0),
@@ -89,7 +89,7 @@ fn off_center(device: &wgpu::Device, queue: &wgpu::Queue, terrain: &TerrainGpu) 
         "{out:?}"
     );
     assert!((out[1].velocity[0] - (-1.0 + expected)).abs() < 0.001);
-    assert!((out[0].angular[2] - 0.5 * expected).abs() < 0.001);
+    assert!(0.5_f32.mul_add(-expected, out[0].angular[2]).abs() < 0.001);
     assert!(out[1].angular[2].abs() < 0.001);
     println!(
         "GPU_COMPOUND off_center impulse={:.6} spin={:.6}",
