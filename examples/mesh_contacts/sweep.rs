@@ -91,6 +91,61 @@ fn check_comoving(
     );
     Ok(())
 }
+fn check_linear_crossing(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    catalog: &MeshCatalog,
+    settings: SweepSettings,
+) -> Result<()> {
+    let identity = [0.0, 0.0, 0.0, 1.0];
+    let panel = at([0.0; 3], identity);
+    let pair = SweepPair {
+        meshes: [0, 1],
+        padding: [0; 2],
+        poses: [
+            panel,
+            panel,
+            at([1.0, 0.0, 1.0], identity),
+            at([1.0, 0.0, -1.0], identity),
+        ],
+    };
+    let shift = [1000.0, 2000.0, 3000.0];
+    let pairs = [pair, translate(pair, [0.0; 3], shift)];
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("relative linear crossing"),
+        contents: bytemuck::cast_slice(&pairs),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let result = run(device, queue, catalog, &buffer, settings)?;
+    let expected = (1.0 - f64::from(settings.margin)) * 0.5;
+    let a = &result[0];
+    let b = &result[1];
+    assert_eq!(a.status[0], 1);
+    assert!(f64::from(a.interval[0]) <= expected);
+    assert!(expected - f64::from(a.interval[0]) < 0.001);
+    assert_eq!(a.interval, b.interval);
+    assert_eq!(a.status, b.status);
+    assert_eq!(a.contact.features, b.contact.features);
+    assert_eq!(a.contact.normal, b.contact.normal);
+    for (a_point, b_point) in [
+        (a.contact.point_a, b.contact.point_a),
+        (a.contact.point_b, b.contact.point_b),
+    ] {
+        for axis in 0..3 {
+            let expected = shift[axis].mul_add(a.interval[2], a_point[axis]);
+            assert!(
+                (expected - b_point[axis]).abs() < 0.000_5,
+                "world witness was not restored"
+            );
+        }
+    }
+    println!(
+        "MESH_SWEEP_LINEAR analytic={expected:.9} interval={:?} common_translation_preserved=true world_witness_restored=true",
+        a.interval
+    );
+    Ok(())
+}
+
 pub fn check(device: &wgpu::Device, queue: &wgpu::Queue, panel: &Geometry) -> Result<()> {
     let point = Geometry {
         positions: vec![[0.0; 3]],
@@ -132,6 +187,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue, panel: &Geometry) -> Re
     assert!(result[0].interval[1] - result[0].interval[0] <= settings.time_tolerance);
     assert_eq!(result[1].status[0], 0);
     check_comoving(device, queue, &catalog, settings, &pairs, &result)?;
+    check_linear_crossing(device, queue, &catalog, settings)?;
     let limited = run(
         device,
         queue,
