@@ -1,3 +1,4 @@
+override ENVELOPE:bool=false;
 struct Pair { meshes:vec2<u32>, transforms:vec2<u32> }
 struct Config { margin:f32, mode:u32, count:u32, transform_count:u32 }
 struct Dispatch { x:atomic<u32>, y:u32, z:u32 }
@@ -42,6 +43,9 @@ fn prequalify(@builtin(global_invocation_id) id:vec3<u32>){
             let bb=root_bounds(pair.meshes.y,b,b[3].xyz);
             if any(ab.lo-bb.hi>vec3<f32>(config.margin))||
                any(bb.lo-ab.hi>vec3<f32>(config.margin)){return;}
+            // Closed solids use a filled supercover rather than only
+            // their surface voxels. Interior containment survives.
+            if ENVELOPE && !select_envelope(pair.meshes,a,b,config.margin,(config.mode&4u)!=0u){return;}
         }
     }
     let slot=atomicAdd(&dispatch.x,1u);

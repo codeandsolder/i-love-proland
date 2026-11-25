@@ -59,6 +59,30 @@ impl MeshCatalog {
         pairs: &wgpu::Buffer,
         settings: SweepSettings,
     ) -> io::Result<MeshSweeps> {
+        self.sweeps_impl(device, pairs, settings, false)
+    }
+
+    /// Use the conservative coarse mesh envelope during every temporal
+    /// subdivision. Closed-solid containment is still evaluated.
+    ///
+    /// # Errors
+    /// Same validation as the unfiltered sweep.
+    pub fn envelope_sweeps(
+        &self,
+        device: &wgpu::Device,
+        pairs: &wgpu::Buffer,
+        settings: SweepSettings,
+    ) -> io::Result<MeshSweeps> {
+        self.sweeps_impl(device, pairs, settings, true)
+    }
+
+    fn sweeps_impl(
+        &self,
+        device: &wgpu::Device,
+        pairs: &wgpu::Buffer,
+        settings: SweepSettings,
+        envelope: bool,
+    ) -> io::Result<MeshSweeps> {
         let stride = std::mem::size_of::<SweepPair>() as u64;
         let count = u32::try_from(pairs.size() / stride).map_err(io::Error::other)?;
         if count == 0
@@ -75,8 +99,8 @@ impl MeshCatalog {
             return Err(invalid("invalid mesh sweep settings"));
         }
         let output = output_buffer::<SweepResult>(device, count, "mesh sweep results")?;
-        let kernel = self.sweep_kernel.get_or_init(|| {
-            Arc::new(super::Kernel::new(
+        let kernel = self.sweep_kernels[usize::from(envelope)].get_or_init(|| {
+            Arc::new(super::Kernel::specialized(
                 device,
                 "mesh swept query",
                 concat!(
@@ -85,6 +109,7 @@ impl MeshCatalog {
                     include_str!("sweep.wgsl")
                 ),
                 "sweep",
+                &[("SWEEP_ENVELOPE", f64::from(u32::from(envelope)))],
             ))
         });
         let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

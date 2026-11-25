@@ -52,6 +52,89 @@ fn catalog(device: &wgpu::Device) -> Result<MeshCatalog> {
     )?)
 }
 
+// Two separated closed components share one large asset AABB. The
+// central hole must clear at coarse resolution, whereas a small box
+// inside either component must still report exact containment.
+fn separated_solids() -> Geometry {
+    let mut left = cube(1.0);
+    let right = cube(1.0);
+    for p in &mut left.positions {
+        p[0] -= 4.0;
+    }
+    left.positions
+        .extend(right.positions.into_iter().map(|mut p| {
+            p[0] += 4.0;
+            p
+        }));
+    left.indices
+        .extend(right.indices.into_iter().map(|i| i + 8));
+    left
+}
+
+fn sparse_closed(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    let shell = separated_solids();
+    let small = cube(0.1);
+    let catalog = MeshCatalog::new(device, &[shell.source(), small.source()])?;
+    let poses = [
+        IDENTITY,
+        pose(0.0, 0.0, 0.0, 0.0),
+        pose(0.0, -4.0, 0.0, 0.0),
+        pose(0.0, 4.0, 0.0, 0.0),
+        pose(0.0, 2.95, 0.0, 0.0),
+    ];
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("closed sparse hull poses"),
+        contents: bytemuck::cast_slice(&poses),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let pairs = (1..5)
+        .flat_map(|i| {
+            [
+                MeshPair {
+                    meshes: [0, 1],
+                    transforms: [0, i],
+                },
+                MeshPair {
+                    meshes: [1, 0],
+                    transforms: [i, 0],
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    let settings = QuerySettings {
+        margin: 0.001,
+        mode: Midphase::VoxelBvh,
+        domain: Domain::ClosedSolid,
+        dispatch: CandidateDispatch::Compact,
+    };
+    let reference = catalog.queries(device, &buffer, &pairs, settings)?;
+    let envelope = catalog.queries(
+        device,
+        &buffer,
+        &pairs,
+        QuerySettings {
+            dispatch: CandidateDispatch::CompactEnvelope,
+            ..settings
+        },
+    )?;
+    let a = sample(device, queue, &reference)?;
+    let b = sample(device, queue, &envelope)?;
+    super::envelope::compare(&a, &b);
+    assert_eq!(b[0].features[2..], [0, 0]);
+    assert_eq!(b[1].features[2..], [0, 0]);
+    for contact in &b[2..6] {
+        assert_eq!(contact.features[2..], [0, 4], "nested closed shell");
+    }
+    for contact in &b[6..] {
+        assert!(contact.features[2] > 0, "surface crossing");
+    }
+    assert!(a[0].statistics[0] > 0);
+    assert_eq!(b[0].statistics, [0; 4]);
+    assert_eq!(b[1].statistics, [0; 4]);
+    println!("MESH_SOLID_ENVELOPE clear_hole=true nested_both_orders=true crossing=true");
+    Ok(())
+}
+
 pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let catalog = catalog(device)?;
     let matrices = [
@@ -107,25 +190,31 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
             .iter()
             .all(|r| r.features[2] == 0 && r.features[3] == 0)
     );
-    let solid = catalog.queries(
-        device,
-        &buffer,
-        &pairs,
-        QuerySettings {
-            margin: 0.001,
-            mode: Midphase::VoxelBvh,
-            domain: Domain::ClosedSolid,
-            dispatch: CandidateDispatch::Direct,
-        },
-    )?;
-    let result = sample(device, queue, &solid)?;
-    assert_eq!(
-        result.iter().map(|r| r.features[3]).collect::<Vec<_>>(),
-        [4, 4, 4, 0, 4, 4],
-        "{result:?}"
-    );
+    for dispatch in [
+        CandidateDispatch::Direct,
+        CandidateDispatch::CompactEnvelope,
+    ] {
+        let solid = catalog.queries(
+            device,
+            &buffer,
+            &pairs,
+            QuerySettings {
+                margin: 0.001,
+                mode: Midphase::VoxelBvh,
+                domain: Domain::ClosedSolid,
+                dispatch,
+            },
+        )?;
+        let result = sample(device, queue, &solid)?;
+        assert_eq!(
+            result.iter().map(|r| r.features[3]).collect::<Vec<_>>(),
+            [4, 4, 4, 0, 4, 4],
+            "{result:?}"
+        );
+    }
     println!(
         "MESH_CONTAINMENT nested_both_orders=true disconnected_component=true mixed_open_closed=true separated=true"
     );
+    sparse_closed(device, queue)?;
     Ok(())
 }

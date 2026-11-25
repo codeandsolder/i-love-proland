@@ -1,12 +1,13 @@
 override DUAL:bool=false;
 override VOXELS:bool=true;
+override CLUSTERS:bool=false;
 struct Triangle { a:vec3<f32>, id:u32, b:vec4<f32>, c:vec3<f32>, flags:u32 }
 struct Node {
     lo:vec3<f32>, first:u32,
     hi:vec3<f32>, count:u32,
     escape:u32, mask_low:u32, mask_high:u32, end:u32,
 }
-struct Mesh { nodes:vec2<u32>, triangles:vec2<u32>, closed:u32, pad0:u32, pad1:u32, pad2:u32 }
+struct Mesh { nodes:vec2<u32>, triangles:vec2<u32>, closed:u32, pad0:u32, solid_mask:vec2<u32>, seeds:vec2<u32> }
 struct Contact {
     point_a:vec4<f32>,
     point_b:vec4<f32>,
@@ -168,11 +169,7 @@ struct QueryFrame {
 }
 struct Bounds { lo:vec3<f32>, hi:vec3<f32> }
 fn node_bounds(n:Node,f:QueryFrame)->Bounds{
-    let center=(n.lo+n.hi)*0.5;
-    let half=(n.hi-n.lo)*0.5;
-    let c=f.local_linear*center+f.local_offset;
-    let r=abs(f.local_linear[0])*half.x+abs(f.local_linear[1])*half.y+abs(f.local_linear[2])*half.z+f.padding;
-    return Bounds(c-r,c+r);
+    return box_bounds(n.lo,n.hi,f);
 }
 fn tri_bounds(t:Triangle,f:QueryFrame)->Bounds{
     let local=transformed(t,f.local_linear,f.local_offset);
@@ -208,9 +205,9 @@ fn test_triangle(ta:Triangle,wa:mat3x3<f32>,tb:Triangle,bounds:Bounds,f:QueryFra
         }
     }
 }
-fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
+fn scan_triangle_range(mesh_b:Mesh,f:QueryFrame,first:u32,end:u32,stride:u32)->Contact{
     var result=empty();
-    for(var ai=mesh_a.triangles.x+lane;ai<mesh_a.triangles.y;ai+=64u){
+    for(var ai=first;ai<end;ai+=stride){
         let ta=triangles[ai];
         let bounds=tri_bounds(ta,f);
         let wa=transformed(ta,f.la,f.relative);
@@ -227,21 +224,41 @@ fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     }
     return result;
 }
+fn scan_triangles(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
+    return scan_triangle_range(mesh_b,f,mesh_a.triangles.x+lane,mesh_a.triangles.y,64u);
+}
+// Divide the source into disjoint existing BVH subtrees. Entire
+// clusters outside the target's conservative voxel envelope are
+// discarded before reading even one source triangle.
+fn cluster_root(mesh:Mesh,lane:u32)->u32{
+    var root=mesh.nodes.x;
+    for(var depth=0u;depth<6u;depth+=1u){
+        if nodes[root].count!=0u{
+            if (lane>>depth)!=0u{return 0xffffffffu;}
+            break;
+        }
+        let left=root+1u;
+        root=select(left,nodes[left].escape,((lane>>depth)&1u)!=0u);
+    }
+    return root;
+}
+fn scan_clusters(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
+    if mesh_a.triangles.y-mesh_a.triangles.x<512u{return scan_triangles(mesh_a,mesh_b,f,lane);}
+    var result=empty();
+    let root=cluster_root(mesh_a,lane);
+    if root==0xffffffffu{return result;}
+    let cluster=nodes[root];
+    if !accepts(nodes[mesh_b.nodes.x],node_bounds(cluster,f),&result){return result;}
+    return choose(result,scan_triangle_range(mesh_b,f,cluster.first,cluster.end,1u));
+}
 // Cut A's balanced hierarchy into at most 64 disjoint subtrees. Each
 // invocation walks pairs of nodes depth-first, splitting the larger
 // remaining triangle range. The median-built tree has depth <32 even
 // for u32-sized triangle arrays; the combined stack cannot exceed 64.
 fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     var result=empty();
-    var root=mesh_a.nodes.x;
-    for(var depth=0u;depth<6u;depth+=1u){
-        if nodes[root].count!=0u{
-            if (lane>>depth)!=0u{return result;}
-            break;
-        }
-        let left=root+1u;
-        root=select(left,nodes[left].escape,((lane>>depth)&1u)!=0u);
-    }
+    let root=cluster_root(mesh_a,lane);
+    if root==0xffffffffu{return result;}
     var stack:array<vec2<u32>,64>;
     stack[0]=vec2<u32>(root,mesh_b.nodes.x);
     var top=1u;
@@ -280,8 +297,7 @@ fn scan_dual(mesh_a:Mesh,mesh_b:Mesh,f:QueryFrame,lane:u32)->Contact{
     }
     return result;
 }
-fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
-    var result=empty();
+fn query_frame(a:mat4x4<f32>,b:mat4x4<f32>,root_a:Node,margin:f32)->QueryFrame{
     let la=linear(a);
     let lb=linear(b);
     let r0=cross(lb[1],lb[2]);
@@ -294,15 +310,6 @@ fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u
     let pad=margin*row_norm;
     let local_linear=inverse*la;
     let local_offset=inverse*relative;
-    let mesh_a=meshes[mesh_ids.x];
-    let mesh_b=meshes[mesh_ids.y];
-    // Reject entire transformed A root before walking any triangles.
-    let root_a=nodes[mesh_a.nodes.x];
-    let root_b=nodes[mesh_b.nodes.x];
-    let center=(root_a.lo+root_a.hi)*0.5;
-    let half=(root_a.hi-root_a.lo)*0.5;
-    let transformed_center=local_linear*center+local_offset;
-    let transformed_half=abs(local_linear[0])*half.x+abs(local_linear[1])*half.y+abs(local_linear[2])*half.z;
     // Bound roundoff of both the relative transform and inverse. For
     // ill-conditioned transforms this increases candidates rather than
     // shrinking their conservative query envelope.
@@ -311,11 +318,26 @@ fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u
         +abs(local_linear[1])*max(abs(root_a.lo.y),abs(root_a.hi.y))
         +abs(local_linear[2])*max(abs(root_a.lo.z),abs(root_a.hi.z));
     let error=(scale+vec3<f32>(1.0))*0.000008*max(condition,1.0);
-    if any(transformed_center+transformed_half+pad+error<root_b.lo)||any(transformed_center-transformed_half-pad-error>root_b.hi){
-        return result;
-    }
-    let frame=QueryFrame(la,lb,relative,local_linear,local_offset,pad+error,b[3].xyz,margin*margin);
+    return QueryFrame(la,lb,relative,local_linear,local_offset,pad+error,b[3].xyz,margin*margin);
+}
+fn box_bounds(lo:vec3<f32>,hi:vec3<f32>,f:QueryFrame)->Bounds{
+    let center=(lo+hi)*0.5;
+    let half=(hi-lo)*0.5;
+    let c=f.local_linear*center+f.local_offset;
+    let r=abs(f.local_linear[0])*half.x+abs(f.local_linear[1])*half.y+abs(f.local_linear[2])*half.z+f.padding;
+    return Bounds(c-r,c+r);
+}
+fn scan_ordered(mesh_ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,lane:u32)->Contact{
+    let mesh_a=meshes[mesh_ids.x];
+    let mesh_b=meshes[mesh_ids.y];
+    let root_a=nodes[mesh_a.nodes.x];
+    let root_b=nodes[mesh_b.nodes.x];
+    let frame=query_frame(a,b,root_a,margin);
+    let bounds=box_bounds(root_a.lo,root_a.hi,frame);
+    if any(bounds.hi<root_b.lo)||any(bounds.lo>root_b.hi){return empty();}
+
     if DUAL{return scan_dual(mesh_a,mesh_b,frame,lane);}
+    if CLUSTERS{return scan_clusters(mesh_a,mesh_b,frame,lane);}
     return scan_triangles(mesh_a,mesh_b,frame,lane);
 }
 // Use the smaller authored triangle range as the query side. Each
@@ -352,6 +374,45 @@ fn orient_contact(mesh_ids:vec2<u32>,contact:Contact)->Contact{
     result.features=vec4<u32>(result.features.yx,result.features.zw);
     return result;
 }
+// Eight conservative occupied octants of the existing root brick.
+// A set bit means some original triangle intersects that voxel. The
+// union covers every source triangle, including planar and degenerate
+// faces. No approximation of the original collision surface is used.
+fn occupied_octant(root:Node,octant:u32)->bool{
+    let bits=select(root.mask_low,root.mask_high,(octant&4u)!=0u);
+    let shift=(octant&1u)*2u+((octant>>1u)&1u)*8u;
+    return (bits&(0x00330033u<<shift))!=0u;
+}
+fn envelope_overlap(mesh_a:Mesh,mesh_b:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,solid:bool)->bool{
+    var root_a=nodes[mesh_a.nodes.x];
+    var root_b=nodes[mesh_b.nodes.x];
+    if solid{
+        root_a.mask_low=mesh_a.solid_mask.x;
+        root_a.mask_high=mesh_a.solid_mask.y;
+        root_b.mask_low=mesh_b.solid_mask.x;
+        root_b.mask_high=mesh_b.solid_mask.y;
+    }
+    let f=query_frame(a,b,root_a,margin);
+    let half=(root_a.hi-root_a.lo)*0.5;
+    // Nonfinite transforms/envelopes must continue to the exact path.
+    if !all(abs(f.padding)<=vec3<f32>(1e30)){return true;}
+    for(var octant=0u;octant<8u;octant+=1u){
+        if !occupied_octant(root_a,octant){continue;}
+        let corner=vec3<f32>(f32(octant&1u),f32((octant>>1u)&1u),f32(octant>>2u));
+        let lo=root_a.lo+corner*half;
+        let hi=lo+half;
+        let bounds=box_bounds(lo,hi,f);
+        if any(bounds.lo>root_b.hi)||any(bounds.hi<root_b.lo){continue;}
+        if voxel_overlap(root_b,bounds.lo,bounds.hi){return true;}
+    }
+    return false;
+}
+
+fn select_envelope(ids:vec2<u32>,a:mat4x4<f32>,b:mat4x4<f32>,margin:f32,solid:bool)->bool{
+    if reverse_order(ids){return envelope_overlap(meshes[ids.y],meshes[ids.x],b,a,margin,solid);}
+    return envelope_overlap(meshes[ids.x],meshes[ids.y],a,b,margin,solid);
+}
+
 var<workgroup> reduction:array<Contact,64>;
 fn reduce_contact(local:Contact,lane:u32)->Contact{
     reduction[lane]=local;

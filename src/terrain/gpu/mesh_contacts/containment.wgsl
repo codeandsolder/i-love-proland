@@ -73,7 +73,7 @@ fn point_inside(p:vec3<f32>,mesh:Mesh,visits:ptr<function,u32>)->u32{
     return 8u;
 }
 fn contains_components(source:Mesh,destination:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,lane:u32,result:ptr<function,Contact>){
-    if destination.closed==0u{return;}
+    if destination.closed==0u||source.seeds.x+lane>=source.seeds.y{return;}
     let lb=linear(b);
     let r0=cross(lb[1],lb[2]);
     let r1=cross(lb[2],lb[0]);
@@ -83,9 +83,8 @@ fn contains_components(source:Mesh,destination:Mesh,a:mat4x4<f32>,b:mat4x4<f32>,
     let inverse=transpose(mat3x3<f32>(r0,r1,r2))*(1.0/det);
     let relative=inverse*linear(a);
     let offset=inverse*(a[3].xyz-b[3].xyz);
-    for(var i=source.triangles.x+lane;i<source.triangles.y;i+=64u){
+    for(var i=source.seeds.x+lane;i<source.seeds.y;i+=64u){
         let triangle=triangles[i];
-        if (triangle.flags&1u)==0u{continue;}
         let p=relative*triangle.a+offset;
         var visits=0u;
         (*result).features.w|=point_inside(p,destination,&visits);

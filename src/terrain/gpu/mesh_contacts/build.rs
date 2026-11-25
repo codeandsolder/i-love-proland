@@ -136,6 +136,40 @@ fn mask(triangles: &[Triangle], lo: [f32; 3], hi: [f32; 3]) -> [u32; 2] {
     ]
 }
 
+// Exterior flood fill on the conservative surface supercover. A cell
+// which contains an interior point cannot reach the outside through
+// face-connected empty cells without crossing an occupied cell.
+// Sealed cavities and disconnected open surfaces may overfill, never
+// carve holes in the authoritative closed shell.
+fn solid_cover(surface: [u32; 2]) -> [u32; 2] {
+    const X0: u64 = 0x1111_1111_1111_1111;
+    const X3: u64 = X0 << 3;
+    const Y0: u64 = 0x000f_000f_000f_000f;
+    const Y3: u64 = Y0 << 12;
+    const Z0: u64 = 0xffff;
+    const Z3: u64 = Z0 << 48;
+    let occupied = u64::from(surface[0]) | (u64::from(surface[1]) << 32);
+    let empty = !occupied;
+    let mut exterior = empty & (X0 | X3 | Y0 | Y3 | Z0 | Z3);
+    loop {
+        let neighbors = ((exterior & !X0) >> 1)
+            | ((exterior & !X3) << 1)
+            | ((exterior & !Y0) >> 4)
+            | ((exterior & !Y3) << 4)
+            | ((exterior & !Z0) >> 16)
+            | ((exterior & !Z3) << 16);
+        let expanded = exterior | (neighbors & empty);
+        if expanded == exterior {
+            let bytes = (!exterior).to_le_bytes();
+            return [
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            ];
+        }
+        exterior = expanded;
+    }
+}
+
 fn index(n: usize) -> io::Result<u32> {
     u32::try_from(n).map_err(io::Error::other)
 }
@@ -227,11 +261,29 @@ pub(super) fn catalog(
             });
         }
         build(&mut nodes, &mut triangles[start..], index(start)?)?;
+        let surface = nodes[root as usize].mask;
+        let solid_mask = if topology.closed {
+            solid_cover(surface)
+        } else {
+            surface
+        };
+        let end = triangles.len();
+        // The BVH and original triangle range never include these
+        // copies. Each is the exact original representative chosen by
+        // welded topology; no approximation or extra collision surface.
+        let seeds = triangles[start..end]
+            .iter()
+            .copied()
+            .filter(|t| t.flags & 1 != 0)
+            .collect::<Vec<_>>();
+        triangles.extend(seeds);
         meshes.push(Mesh {
             nodes: [root, index(nodes.len())?],
-            triangles: [index(start)?, index(triangles.len())?],
+            triangles: [index(start)?, index(end)?],
             closed: u32::from(topology.closed),
-            padding: [0; 3],
+            padding: 0,
+            solid_mask,
+            seeds: [index(end)?, index(triangles.len())?],
         });
     }
     if meshes.is_empty() {
@@ -243,6 +295,75 @@ pub(super) fn catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filled_root_cover_keeps_solids_and_exterior_holes() {
+        // A sealed 4³ shell encloses eight interior cells.
+        let interior = 0x0000_0660_0660_0000_u64;
+        let boundary = !interior;
+        let bytes = boundary.to_le_bytes();
+        let mask = [
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+            u32::from_le_bytes(bytes[4..].try_into().unwrap()),
+        ];
+        assert_eq!(solid_cover(mask), [u32::MAX; 2]);
+        // Remove one face cell adjacent to the interior; all connected
+        // empty cells must now be reachable from the outside.
+        let vented = boundary & !(1_u64 << 5);
+        let bytes = vented.to_le_bytes();
+        let mask = [
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+            u32::from_le_bytes(bytes[4..].try_into().unwrap()),
+        ];
+        assert_eq!(solid_cover(mask), mask);
+        assert_eq!(solid_cover([0; 2]), [0; 2]);
+        assert_eq!(solid_cover([1, 1 << 31]), [1, 1 << 31]);
+    }
+
+    #[test]
+    fn indexed_component_seeds_preserve_original_faces() -> io::Result<()> {
+        let positions = [
+            [0., 0., 0.],
+            [1., 0., 0.],
+            [0., 1., 0.],
+            [1., 1., 0.],
+            [10., 0., 0.],
+            [11., 0., 0.],
+            [10., 1., 0.],
+        ];
+        let indices = [0, 1, 2, 2, 1, 3, 4, 5, 6];
+        let source = MeshSource {
+            positions: &positions,
+            indices: &indices,
+        };
+        let (nodes, triangles, meshes) = catalog(&[
+            source,
+            MeshSource {
+                positions: &positions,
+                indices: &indices,
+            },
+        ])?;
+        for mesh in &meshes {
+            let [start, end] = mesh.triangles.map(|i| i as usize);
+            let [seed_start, seed_end] = mesh.seeds.map(|i| i as usize);
+            let originals = triangles[start..end]
+                .iter()
+                .filter(|t| t.flags & 1 != 0)
+                .map(bytemuck::bytes_of)
+                .collect::<Vec<_>>();
+            let indexed = triangles[seed_start..seed_end]
+                .iter()
+                .map(bytemuck::bytes_of)
+                .collect::<Vec<_>>();
+            assert_eq!(originals, indexed);
+            assert_eq!(originals.len(), 2);
+            assert_eq!(end - start, 3);
+            assert_eq!(seed_start, end);
+            assert_eq!(nodes[mesh.nodes[0] as usize].end, mesh.triangles[1]);
+        }
+        assert_eq!(meshes[0].seeds[1], meshes[1].triangles[0]);
+        Ok(())
+    }
+
     #[test]
     fn grid_projection_preserves_exhaustive_sat() {
         // Reproduce the exhaustive old implementation on isolated

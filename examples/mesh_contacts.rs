@@ -3,6 +3,8 @@
 mod compact;
 #[path = "mesh_contacts/containment.rs"]
 mod containment;
+#[path = "mesh_contacts/envelope.rs"]
+mod envelope;
 #[path = "mesh_contacts/impact.rs"]
 mod impact;
 #[path = "mesh_contacts/order.rs"]
@@ -192,6 +194,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     containment::check(device, queue)?;
     impact::check(device, queue)?;
     compact::check(device, queue, &geometry)?;
+    envelope::check(device, queue, &geometry)?;
     order::check(device, queue, &geometry)?;
     let catalog = MeshCatalog::new(
         device,

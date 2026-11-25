@@ -41,6 +41,7 @@ pub enum Midphase {
     VoxelBvh,
     DualBvh,
     DualVoxelBvh,
+    ClusteredVoxelBvh,
 }
 
 /// Surface-only distance or physical closed-shell containment as well.
@@ -55,6 +56,9 @@ pub enum Domain {
 pub enum CandidateDispatch {
     Direct,
     Compact,
+    /// Root AABB followed by a conservative occupied-brick envelope
+    /// before indirect narrow-phase dispatch.
+    CompactEnvelope,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,7 +116,9 @@ struct Mesh {
     nodes: [u32; 2],
     triangles: [u32; 2],
     closed: u32,
-    padding: [u32; 3],
+    padding: u32,
+    solid_mask: [u32; 2],
+    seeds: [u32; 2],
 }
 
 #[repr(C)]
@@ -130,9 +136,9 @@ pub struct MeshCatalog {
     triangles: wgpu::Buffer,
     meshes: wgpu::Buffer,
     count: u32,
-    kernels: [OnceLock<Arc<Kernel>>; 8],
-    prefilter: OnceLock<Arc<Kernel>>,
-    sweep_kernel: OnceLock<Arc<Kernel>>,
+    kernels: [OnceLock<Arc<Kernel>>; 10],
+    prefilters: [OnceLock<Arc<Kernel>>; 2],
+    sweep_kernels: [OnceLock<Arc<Kernel>>; 2],
 }
 
 impl MeshCatalog {
@@ -156,8 +162,8 @@ impl MeshCatalog {
             )?,
             count: u32::try_from(meshes.len()).map_err(io::Error::other)?,
             kernels: std::array::from_fn(|_| OnceLock::new()),
-            prefilter: OnceLock::new(),
-            sweep_kernel: OnceLock::new(),
+            prefilters: std::array::from_fn(|_| OnceLock::new()),
+            sweep_kernels: std::array::from_fn(|_| OnceLock::new()),
         })
     }
 
@@ -173,8 +179,9 @@ impl MeshCatalog {
             Midphase::VoxelBvh => 1,
             Midphase::DualBvh => 2,
             Midphase::DualVoxelBvh => 3,
+            Midphase::ClusteredVoxelBvh => 4,
         };
-        self.kernels[mode_index + 4 * usize::from(compact)].get_or_init(|| {
+        self.kernels[mode_index + 5 * usize::from(compact)].get_or_init(|| {
             Arc::new(Kernel::specialized(
                 device,
                 "specialized mesh contact query",
@@ -186,15 +193,24 @@ impl MeshCatalog {
                 if compact { "query_compact" } else { "query" },
                 &[
                     ("DUAL", f64::from(u32::from(mode_index & 2 != 0))),
-                    ("VOXELS", f64::from(u32::from(mode_index & 1 != 0))),
+                    (
+                        "VOXELS",
+                        f64::from(u32::from(mode_index & 1 != 0 || mode_index == 4)),
+                    ),
+                    ("CLUSTERS", f64::from(u32::from(mode_index == 4))),
                 ],
             ))
         })
     }
 
-    fn make_prefilter(&self, device: &wgpu::Device, buffers: &[&wgpu::Buffer]) -> Prefilter {
-        let filter = self.prefilter.get_or_init(|| {
-            Arc::new(Kernel::new(
+    fn make_prefilter(
+        &self,
+        device: &wgpu::Device,
+        buffers: &[&wgpu::Buffer],
+        envelope: bool,
+    ) -> Prefilter {
+        let filter = self.prefilters[usize::from(envelope)].get_or_init(|| {
+            Arc::new(Kernel::specialized(
                 device,
                 "mesh root prequalification",
                 concat!(
@@ -203,6 +219,7 @@ impl MeshCatalog {
                     include_str!("mesh_contacts/query.wgsl")
                 ),
                 "prequalify",
+                &[("ENVELOPE", f64::from(u32::from(envelope)))],
             ))
         });
         let args = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -261,7 +278,7 @@ impl MeshCatalog {
         }
         let pairs = storage(device, "mesh contact pairs", bytemuck::cast_slice(pairs))?;
         let output = output_buffer::<MeshContact>(device, count, "mesh contact results")?;
-        let compact = matches!(dispatch, CandidateDispatch::Compact);
+        let compact = !matches!(dispatch, CandidateDispatch::Direct);
         let kernel = self.query_kernel(device, mode, compact);
         let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh contact config"),
@@ -291,7 +308,11 @@ impl MeshCatalog {
             .transpose()?;
         let prefilter = candidates.as_ref().map(|candidates| {
             buffers.push(candidates);
-            self.make_prefilter(device, &buffers)
+            self.make_prefilter(
+                device,
+                &buffers,
+                matches!(dispatch, CandidateDispatch::CompactEnvelope),
+            )
         });
         let bind = kernel.bind(device, "resident mesh contact queries", &buffers)?;
         Ok(MeshQueries {
