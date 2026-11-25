@@ -136,7 +136,7 @@ pub struct MeshCatalog {
     triangles: wgpu::Buffer,
     meshes: wgpu::Buffer,
     count: u32,
-    kernels: [OnceLock<Arc<Kernel>>; 10],
+    kernels: [OnceLock<Arc<Kernel>>; 20],
     prefilters: [OnceLock<Arc<Kernel>>; 2],
     sweep_kernels: [OnceLock<Arc<Kernel>>; 2],
 }
@@ -173,7 +173,13 @@ impl MeshCatalog {
         self.nodes.size() + self.triangles.size() + self.meshes.size()
     }
 
-    fn query_kernel(&self, device: &wgpu::Device, mode: Midphase, compact: bool) -> &Arc<Kernel> {
+    fn query_kernel(
+        &self,
+        device: &wgpu::Device,
+        mode: Midphase,
+        compact: bool,
+        planes: bool,
+    ) -> &Arc<Kernel> {
         let mode_index = match mode {
             Midphase::Bvh => 0,
             Midphase::VoxelBvh => 1,
@@ -181,26 +187,29 @@ impl MeshCatalog {
             Midphase::DualVoxelBvh => 3,
             Midphase::ClusteredVoxelBvh => 4,
         };
-        self.kernels[mode_index + 5 * usize::from(compact)].get_or_init(|| {
-            Arc::new(Kernel::specialized(
-                device,
-                "specialized mesh contact query",
-                concat!(
-                    include_str!("mesh_contacts/common.wgsl"),
-                    include_str!("mesh_contacts/containment.wgsl"),
-                    include_str!("mesh_contacts/query.wgsl")
-                ),
-                if compact { "query_compact" } else { "query" },
-                &[
-                    ("DUAL", f64::from(u32::from(mode_index & 2 != 0))),
-                    (
-                        "VOXELS",
-                        f64::from(u32::from(mode_index & 1 != 0 || mode_index == 4)),
+        self.kernels[mode_index + 5 * usize::from(compact) + 10 * usize::from(planes)].get_or_init(
+            || {
+                Arc::new(Kernel::specialized(
+                    device,
+                    "specialized mesh contact query",
+                    concat!(
+                        include_str!("mesh_contacts/common.wgsl"),
+                        include_str!("mesh_contacts/containment.wgsl"),
+                        include_str!("mesh_contacts/query.wgsl")
                     ),
-                    ("CLUSTERS", f64::from(u32::from(mode_index == 4))),
-                ],
-            ))
-        })
+                    if compact { "query_compact" } else { "query" },
+                    &[
+                        ("DUAL", f64::from(u32::from(mode_index & 2 != 0))),
+                        (
+                            "VOXELS",
+                            f64::from(u32::from(mode_index & 1 != 0 || mode_index == 4)),
+                        ),
+                        ("CLUSTERS", f64::from(u32::from(mode_index == 4))),
+                        ("PLANES", f64::from(u32::from(planes))),
+                    ],
+                ))
+            },
+        )
     }
 
     fn make_prefilter(
@@ -254,6 +263,30 @@ impl MeshCatalog {
         pairs: &[MeshPair],
         settings: QuerySettings,
     ) -> io::Result<MeshQueries> {
+        self.queries_impl(device, transforms, pairs, settings, true)
+    }
+
+    /// Unfiltered feature-test reference for differential diagnostics.
+    /// # Errors
+    /// Same input validation as the optimized query.
+    pub fn reference_queries(
+        &self,
+        device: &wgpu::Device,
+        transforms: &wgpu::Buffer,
+        pairs: &[MeshPair],
+        settings: QuerySettings,
+    ) -> io::Result<MeshQueries> {
+        self.queries_impl(device, transforms, pairs, settings, false)
+    }
+
+    fn queries_impl(
+        &self,
+        device: &wgpu::Device,
+        transforms: &wgpu::Buffer,
+        pairs: &[MeshPair],
+        settings: QuerySettings,
+        planes: bool,
+    ) -> io::Result<MeshQueries> {
         let QuerySettings {
             margin,
             mode,
@@ -279,7 +312,7 @@ impl MeshCatalog {
         let pairs = storage(device, "mesh contact pairs", bytemuck::cast_slice(pairs))?;
         let output = output_buffer::<MeshContact>(device, count, "mesh contact results")?;
         let compact = !matches!(dispatch, CandidateDispatch::Direct);
-        let kernel = self.query_kernel(device, mode, compact);
+        let kernel = self.query_kernel(device, mode, compact, planes);
         let config = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh contact config"),
             contents: bytemuck::bytes_of(&Config {

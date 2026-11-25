@@ -9,6 +9,8 @@ mod envelope;
 mod impact;
 #[path = "mesh_contacts/order.rs"]
 mod order;
+#[path = "mesh_contacts/planes.rs"]
+mod planes;
 #[path = "mesh_contacts/sweep.rs"]
 mod sweep;
 use i_love_proland::terrain::gpu::mesh_contacts::{
@@ -196,6 +198,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     compact::check(device, queue, &geometry)?;
     envelope::check(device, queue, &geometry)?;
     order::check(device, queue, &geometry)?;
+    planes::check(device, queue, &geometry)?;
     let catalog = MeshCatalog::new(
         device,
         &geometry.iter().map(Geometry::source).collect::<Vec<_>>(),
