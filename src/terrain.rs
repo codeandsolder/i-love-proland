@@ -5,3 +5,6 @@ mod region;
 pub use region::{Region, RegionCell, RegionChart, RegionSample, WaterKind};
 mod channel_mesh;
 pub use channel_mesh::{ChannelPatch, ChannelVertex, ShorelinePartition, partition_triangle};
+
+mod relief;
+pub use relief::ReliefAtlas;

@@ -11,6 +11,10 @@ use super::{
 };
 use std::{fs, io, path::Path};
 
+pub(super) fn export_relief(source: &Grid, path: &Path) -> io::Result<()> {
+    rock::RockAtlas::new(source).export(path)
+}
+
 type V3 = [f64; 3];
 const WIDTH: u16 = 800;
 const HEIGHT: u16 = 450;

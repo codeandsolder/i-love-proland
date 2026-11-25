@@ -779,6 +779,7 @@ pub fn run_natural(
 ) -> Result<(), Box<dyn Error>> {
     let biomes = Biomes::read(biome)?;
     let atlas = exemplars::Atlas::read_broad(dem)?;
+    view::export_relief(atlas.source(), &output.join("geology.plrelief"))?;
     for (label, center) in [
         ("mountains", stock.select_region()),
         ("coast", coast_region(stock)),
@@ -899,6 +900,11 @@ fn export_region(
     Ok(())
 }
 
+pub fn export_relief(dem: &Path, path: &Path) -> io::Result<()> {
+    let atlas = exemplars::Atlas::read_broad(dem)?;
+    view::export_relief(atlas.source(), path)
+}
+
 pub fn run_sharp(
     stock: &StockMap,
     biome: &Path,
@@ -909,6 +915,7 @@ pub fn run_sharp(
 ) -> Result<(), Box<dyn Error>> {
     let biomes = Biomes::read(biome)?;
     let atlas = exemplars::Atlas::read_broad(dem)?;
+    view::export_relief(atlas.source(), &output.join("geology.plrelief"))?;
     for (label, center) in [
         ("mountains", stock.select_region()),
         ("coast", coast_region(stock)),

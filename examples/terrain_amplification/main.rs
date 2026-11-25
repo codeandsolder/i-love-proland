@@ -519,6 +519,12 @@ fn statistics(grid: &Grid, label: &str) {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let [command, dem, output] = args.as_slice()
+        && command == "--export-relief"
+    {
+        landscape::export_relief(Path::new(dem), Path::new(output))?;
+        return Ok(());
+    }
     if let [map, output, biome, dem, mode] = args.as_slice() {
         if mode != "natural" && mode != "sharp" && mode != "material" && mode != "weathered" {
             return Err("expected natural, sharp, material, or weathered".into());

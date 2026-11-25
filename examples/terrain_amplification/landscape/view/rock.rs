@@ -19,6 +19,15 @@ impl RockAtlas {
         Self { residual }
     }
 
+    pub(super) fn export(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let atlas = i_love_proland::terrain::ReliefAtlas::from_residual(
+            self.residual.cells + 1,
+            self.residual.spacing,
+            &self.residual.heights,
+        )?;
+        atlas.write(std::fs::File::create(path)?)
+    }
+
     // Translate overlapping source patches deterministically. Each source
     // patch has a full support halo so no atlas wrap seam is ever sampled.
     fn plane(&self, point: [f64; 2], pixel: f64, seed: u64) -> (f64, [f64; 2]) {
