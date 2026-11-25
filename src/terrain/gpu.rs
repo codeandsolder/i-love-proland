@@ -13,6 +13,7 @@ pub use projection::{GRID_PROJECTION_WGSL, GridProjection};
 mod readback;
 use kernel::Kernel;
 pub use readback::{PendingReadback, RecordedReadback};
+pub mod mesh_contacts;
 pub mod physics;
 use wgpu::util::DeviceExt;
 

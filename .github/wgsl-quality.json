@@ -81,6 +81,12 @@
         "src/terrain/gpu/physics/ellipsoid_pair_math.wgsl",
         "src/terrain/gpu/physics/compound_pairs.wgsl"
       ]
+    },
+    {
+      "name": "mesh contact hierarchy",
+      "sources": [
+        "src/terrain/gpu/mesh_contacts/query.wgsl"
+      ]
     }
   ],
   "negative_tests": []
