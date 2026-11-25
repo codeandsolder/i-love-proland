@@ -1,7 +1,8 @@
 use super::{Geometry, IDENTITY, Result};
 use i_love_proland::terrain::gpu::{
     mesh_contacts::{
-        BodyMeshInstance, BodyMeshPoses, Domain, MeshCatalog, MeshImpulses, MeshPair, Midphase,
+        BodyMeshInstance, BodyMeshPoses, Domain, MeshCatalog, MeshImpact, MeshImpulses, MeshPair,
+        Midphase,
     },
     physics::RigidBody,
 };
@@ -109,6 +110,11 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let impacts = impacts
         .try_take()?
         .ok_or_else(|| io::Error::other("missing mesh impulse snapshot"))?;
+    validate(&states, &output, &impacts);
+    Ok(())
+}
+
+fn validate(states: &[RigidBody], output: &[RigidBody], impacts: &[MeshImpact]) {
     assert_eq!(
         impacts.iter().map(|e| e.metadata[0]).collect::<Vec<_>>(),
         [1, 1, 3],
@@ -130,5 +136,4 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         "MESH_IMPACT elastic_exchange=true panel_speed={:.6} impulse={:.6} panel_spin={:.6} crossing_requires_refinement=true",
         impacts[1].point_speed[3], impacts[1].impulse_normal[3], output[2].angular[2]
     );
-    Ok(())
 }

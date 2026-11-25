@@ -215,15 +215,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         assert_eq!(a.point_b, b.point_b, "point mismatch {i}");
         assert_eq!(a.features[3], 0);
     }
-    for (i, expected) in [true, false, false, true, true, true, false, false]
-        .into_iter()
-        .enumerate()
-    {
-        assert_eq!(a[i].features[2] > 0, expected, "fixture {i}: {:?}", a[i]);
-    }
-    assert!((a[0].point_a[3] - 0.0025).abs() < 1e-6);
-    assert!(a[4].point_a[3] < 1e-10);
-    assert!(a[5].point_a[3] < 0.000_401);
+    check_fixtures(&a);
     let rotating = &a[rotations];
     check_rotations(rotating)?;
     let hits = rotating.iter().filter(|c| c.features[2] > 0).count();
@@ -275,6 +267,18 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         benchmark(device, queue, name, q, results)?;
     }
     Ok(())
+}
+
+fn check_fixtures(a: &[MeshContact]) {
+    for (i, expected) in [true, false, false, true, true, true, false, false]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(a[i].features[2] > 0, expected, "fixture {i}: {:?}", a[i]);
+    }
+    assert!((a[0].point_a[3] - 0.0025).abs() < 1e-6);
+    assert!(a[4].point_a[3] < 1e-10);
+    assert!(a[5].point_a[3] < 0.000_401);
 }
 
 fn check_rotations(rotating: &[MeshContact]) -> Result<()> {
