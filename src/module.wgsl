@@ -52,6 +52,7 @@ fn module_vs(
         out.uv = vec2<f32>(0.0);
         out.kind = 0u;
         out.stable_id = 0u;
+        out.triangle_seed = 0u;
         out.normal = vec3<f32>(0.0,1.0,0.0);
         out.up = out.normal;
         return out;
@@ -97,12 +98,13 @@ fn module_vs(
     out.up = rotate(object.rotation,vec3<f32>(0.0,1.0,0.0));
     out.normal = rotate(object.rotation,safe_normal(local_normal/object.axis_radii.xyz,vec3<f32>(0.0,1.0,0.0)));
     out.kind = module_data.metadata.x;
+    out.triangle_seed = object.object_id.x ^ (object.object_id.y * 0x9e3779b9u) ^
+        (object.object_id.z * 0x85ebca6bu) ^ (object.object_id.w * 0xc2b2ae35u);
     out.stable_id = module_hash(object.object_id.x ^ module_data.metadata.y);
     return out;
 }
 
-@fragment
-fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
+fn module_material(input:MeshOutput)->vec4<f32> {
     let dx = dpdx(input.uv);
     let dy = dpdy(input.uv);
     if input.kind == 0u {
@@ -111,7 +113,7 @@ fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
     if input.kind == 1u {
         let texel = textureSampleGrad(source_texture, source_sampler, input.uv, dx, dy);
         if texel.a * input.color.a < camera.material.x {discard;}
-        return vec4<f32>(texel.rgb * input.color.rgb * foliage_light(input.normal,input.up), 1.0);
+        return vec4<f32>(texel.rgb * input.color.rgb, 1.0);
     }
     let texel = textureSampleGrad(canopy_texture, atlas_sampler, input.uv, dx, dy);
     let alpha = texel.a * input.color.a;
@@ -126,5 +128,11 @@ fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
         let threshold = (f32(value & 65535u) + 0.5) / 65536.0;
         if alpha < threshold {discard;}
     }
-    return vec4<f32>(texel.rgb / texel.a * input.color.rgb * foliage_light(input.normal,input.up), alpha);
+    return vec4<f32>(texel.rgb / texel.a * input.color.rgb, alpha);
+}
+
+@fragment
+fn module_fs(input:MeshOutput)->@location(0) vec4<f32> {
+    let material = module_material(input);
+    return vec4<f32>(material.rgb * foliage_light(input.normal,input.up), material.a);
 }

@@ -47,6 +47,7 @@ struct MeshOutput {
     @location(3) @interpolate(flat) stable_id: u32,
     @location(4) normal: vec3<f32>,
     @location(5) @interpolate(flat) up: vec3<f32>,
+    @location(6) @interpolate(flat) triangle_seed: u32,
 }
 
 // Quaternion XYZW rotation without constructing a matrix per vertex.
@@ -143,6 +144,8 @@ fn mesh_vs(input: MeshVertex, @builtin(instance_index) instance_id: u32) -> Mesh
     out.up = rotate(object.rotation,vec3<f32>(0.0,1.0,0.0));
     let local_normal = select(input.normal.xyz,vec3<f32>(0.0,1.0,0.0),source.w>0.0);
     out.normal = rotate(object.rotation, safe_normal(local_normal/object.axis_radii.xyz,vec3<f32>(0.0,1.0,0.0)));
+    out.triangle_seed = object.object_id.x ^ (object.object_id.y * 0x9e3779b9u) ^
+        (object.object_id.z * 0x85ebca6bu) ^ (object.object_id.w * 0xc2b2ae35u);
     return out;
 }
 
@@ -174,6 +177,7 @@ struct ImpostorOutput {
     @location(4) @interpolate(flat) atlas_base: u32,
     @location(5) @interpolate(flat) rotation: vec4<f32>,
     @location(6) @interpolate(flat) axis_radii: vec3<f32>,
+    @location(7) @interpolate(flat) triangle_seed: u32,
 }
 
 @vertex
@@ -228,6 +232,8 @@ fn impostor_vs(
     out.atlas_base = object.render_model.x * 32u;
     out.rotation = object.rotation;
     out.axis_radii = object.axis_radii.xyz;
+    out.triangle_seed = object.object_id.x ^ (object.object_id.y * 0x9e3779b9u) ^
+        (object.object_id.z * 0x85ebca6bu) ^ (object.object_id.w * 0xc2b2ae35u);
     return out;
 }
 
@@ -246,12 +252,7 @@ fn angular_sample(tex: texture_2d_array<f32>,input: ImpostorOutput) -> vec4<f32>
     return mix(lower,upper,input.blend.y);
 }
 
-@fragment
-fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
-    let color = angular_sample(atlas_texture,input);
-    // Both texture planes use the same exact coverage at every mip.
-    let encoded_normal = angular_sample(normal_atlas,input);
-    let alpha = color.a * input.tint.a;
+fn impostor_cutout(input:ImpostorOutput,alpha:f32){
     if (alpha <= 0.0) {
         discard;
     }
@@ -269,6 +270,15 @@ fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
             discard;
         }
     }
+}
+
+@fragment
+fn impostor_fs(input: ImpostorOutput) -> @location(0) vec4<f32> {
+    let color = angular_sample(atlas_texture,input);
+    // Both texture planes use the same exact coverage at every mip.
+    let encoded_normal = angular_sample(normal_atlas,input);
+    let alpha = color.a * input.tint.a;
+    impostor_cutout(input,alpha);
     // With multisample targets, hardware alpha-to-coverage uses this alpha.
     // Unpremultiply after both spatial mip filtering and angular blending.
     let up = rotate(input.rotation,vec3<f32>(0.0,1.0,0.0));

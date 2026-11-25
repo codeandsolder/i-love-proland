@@ -778,6 +778,13 @@ pub struct TreeRenderer {
     impostor_indirect_offset: u64,
 }
 
+#[derive(Clone, Copy)]
+enum PassOutput {
+    Color,
+    Coverage,
+    PrimitiveIds,
+}
+
 fn render_pipeline(
     device: &wgpu::Device,
     pipeline_layout: &wgpu::PipelineLayout,
@@ -785,7 +792,7 @@ fn render_pipeline(
     pass_kind: PassKind,
     vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     config: TreeRenderConfig,
-    coverage: bool,
+    output: PassOutput,
 ) -> wgpu::RenderPipeline {
     let (name, vertex_entry, fragment_entry, alpha_to_coverage) = match pass_kind {
         PassKind::Mesh => (
@@ -807,16 +814,24 @@ fn render_pipeline(
             config.sample_count > 1,
         ),
     };
-    let (fragment_entry, alpha_to_coverage) = if coverage {
-        (
+    let coverage = matches!(output, PassOutput::Coverage);
+    let (fragment_entry, alpha_to_coverage) = match output {
+        PassOutput::Color => (fragment_entry, alpha_to_coverage),
+        PassOutput::Coverage => (
             match pass_kind {
                 PassKind::Mesh | PassKind::Module => "mesh_coverage_fs",
                 PassKind::Impostor => "impostor_coverage_fs",
             },
             false,
-        )
-    } else {
-        (fragment_entry, alpha_to_coverage)
+        ),
+        PassOutput::PrimitiveIds => (
+            match pass_kind {
+                PassKind::Mesh => "mesh_ids_fs",
+                PassKind::Module => "module_ids_fs",
+                PassKind::Impostor => "impostor_ids_fs",
+            },
+            false,
+        ),
     };
     let additive = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
@@ -1237,6 +1252,36 @@ impl TreePipelines {
     /// # Errors
     /// Rejects an invalid multisample count.
     pub fn new(compaction: &CompactionPipeline, config: TreeRenderConfig) -> Result<Self> {
+        Self::compile(compaction, config, false)
+    }
+
+    /// Build a diagnostic pipeline that writes primitive IDs instead of color.
+    /// Requires the `wgpu::Features::PRIMITIVE_INDEX` feature and a single-sample target.
+    ///
+    /// # Errors
+    /// Rejects unsupported sample settings or a device without the feature.
+    pub fn new_triangle_ids(
+        compaction: &CompactionPipeline,
+        config: TreeRenderConfig,
+    ) -> Result<Self> {
+        if config.sample_count != 1
+            || !compaction
+                .device()
+                .features()
+                .contains(wgpu::Features::PRIMITIVE_INDEX)
+        {
+            return Err(Error::InvalidConfiguration(
+                "triangle identity capture requires one sample and PRIMITIVE_INDEX",
+            ));
+        }
+        Self::compile(compaction, config, true)
+    }
+
+    fn compile(
+        compaction: &CompactionPipeline,
+        config: TreeRenderConfig,
+        triangle_ids: bool,
+    ) -> Result<Self> {
         if config.sample_count == 0 || !config.sample_count.is_power_of_two() {
             return Err(Error::InvalidConfiguration("invalid tree sample count"));
         }
@@ -1249,9 +1294,17 @@ impl TreePipelines {
             ..Default::default()
         });
         let source_sampler = make_source_sampler(device);
+        let source = if triangle_ids {
+            format!(
+                "enable primitive_index;\n{SHADER}\n{}",
+                include_str!("triangle_ids.wgsl")
+            )
+        } else {
+            SHADER.to_owned()
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("i-love-proland mesh and 32-angle impostor shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let material_layout = render_layout(device);
         let instance_layout = instance_layout(device);
@@ -1276,7 +1329,7 @@ impl TreePipelines {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x2],
         })];
-        let make = |coverage| DrawPipelines {
+        let make = |output| DrawPipelines {
             mesh: render_pipeline(
                 device,
                 &pipeline_layout,
@@ -1284,7 +1337,7 @@ impl TreePipelines {
                 PassKind::Mesh,
                 &vertex_layout,
                 config,
-                coverage,
+                output,
             ),
             modules: render_pipeline(
                 device,
@@ -1293,7 +1346,7 @@ impl TreePipelines {
                 PassKind::Module,
                 &[],
                 config,
-                coverage,
+                output,
             ),
             impostor: render_pipeline(
                 device,
@@ -1302,11 +1355,15 @@ impl TreePipelines {
                 PassKind::Impostor,
                 &[],
                 config,
-                coverage,
+                output,
             ),
         };
-        let normal = make(false);
-        let coverage = config.triangle_coverage.then(|| make(true));
+        let normal = make(if triangle_ids {
+            PassOutput::PrimitiveIds
+        } else {
+            PassOutput::Color
+        });
+        let coverage = config.triangle_coverage.then(|| make(PassOutput::Coverage));
         let quad_indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("i-love-proland billboard quad 6 indices"),
             contents: bytemuck::cast_slice(&[0_u32, 1, 2, 2, 1, 3]),
@@ -1570,8 +1627,15 @@ impl TreeRenderer {
             eye: [camera.eye[0], camera.eye[1], camera.eye[2], 0.0],
             sun: [camera.sun[0], camera.sun[1], camera.sun[2], 0.0],
         };
-        for material in &self.mesh_draws {
+        for (material_id, material) in self.mesh_draws.iter().enumerate() {
             uniform.material[0] = material.cutoff;
+            // Diagnostic-only immutable draw identity, not used by production shading.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "one material draw ordinal per GPU binding, always much smaller than 2^24"
+            )]
+            let draw_id = material_id as f32;
+            uniform.material[2] = draw_id;
             uniform.billboard_source = material.billboard.map_or([0.0; 4], |b| {
                 let [x, y, z] = b.center();
                 [x, y, z, b.radius()]
@@ -1595,6 +1659,7 @@ impl TreeRenderer {
             queue.write_buffer(&material.uniforms, 0, bytemuck::bytes_of(&uniform));
         }
         uniform.material[0] = 0.0;
+        uniform.material[2] = -1.0; // composite impostor is a different primitive namespace
         uniform.wind_parameters = [0.0; 4];
         queue.write_buffer(&self.impostor_uniforms, 0, bytemuck::bytes_of(&uniform));
     }
@@ -1710,6 +1775,22 @@ mod tests {
         Validator::new(ValidationFlags::all(), Capabilities::all())
             .validate(&module)
             .unwrap_or_else(|error| panic!("{}", error.emit_to_string(SHADER)));
+    }
+
+    #[test]
+    fn primitive_identity_shader_parses_and_validates_with_production_entries() {
+        let source = format!(
+            "enable primitive_index;\n{SHADER}\n{}",
+            include_str!("triangle_ids.wgsl")
+        );
+        let module =
+            naga::front::wgsl::parse_str(&source).expect("primitive-ID shader WGSL must parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("production and primitive-ID shader entries must validate");
     }
 
     #[test]
