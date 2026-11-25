@@ -13,7 +13,7 @@ fn hole_cases() -> Result<(Vec<Matrix>, Vec<MeshPair>)> {
         let x = if i % 16 == 0 {
             4.8
         } else {
-            f32::from(j % 7) * 0.5 - 1.5
+            f32::from(j % 7).mul_add(0.5, -1.5)
         };
         let id = u32::try_from(fixture.poses.len())?;
         let mut m = pose(angle, x, 0.0, 0.025);
