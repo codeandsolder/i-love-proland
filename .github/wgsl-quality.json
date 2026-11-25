@@ -97,6 +97,23 @@
         "src/terrain/gpu/mesh_contacts/containment.wgsl",
         "src/terrain/gpu/mesh_contacts/sweep.wgsl"
       ]
+    },
+    {
+      "name": "mesh body pose composition",
+      "sources": [
+        "src/terrain/gpu/physics/body.wgsl",
+        "src/terrain/gpu/physics/body_math.wgsl",
+        "src/terrain/gpu/mesh_contacts/body_poses.wgsl"
+      ]
+    },
+    {
+      "name": "mesh impact impulses",
+      "sources": [
+        "src/terrain/gpu/physics/body.wgsl",
+        "src/terrain/gpu/physics/body_math.wgsl",
+        "src/terrain/gpu/physics/sphere_pair_math.wgsl",
+        "src/terrain/gpu/mesh_contacts/impulse.wgsl"
+      ]
     }
   ],
   "negative_tests": []

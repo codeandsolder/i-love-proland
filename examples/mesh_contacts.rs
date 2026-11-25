@@ -1,6 +1,8 @@
 //! Actual GPU benchmark for arbitrary relative mesh poses.
 #[path = "mesh_contacts/containment.rs"]
 mod containment;
+#[path = "mesh_contacts/impact.rs"]
+mod impact;
 #[path = "mesh_contacts/sweep.rs"]
 mod sweep;
 use i_love_proland::terrain::gpu::mesh_contacts::{
@@ -174,6 +176,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let geometry = geometry()?;
     sweep::check(device, queue, &geometry[2])?;
     containment::check(device, queue)?;
+    impact::check(device, queue)?;
     let catalog = MeshCatalog::new(
         device,
         &geometry.iter().map(Geometry::source).collect::<Vec<_>>(),
@@ -222,30 +225,7 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     assert!(a[4].point_a[3] < 1e-10);
     assert!(a[5].point_a[3] < 0.000_401);
     let rotating = &a[rotations];
-    for (i, result) in rotating.iter().enumerate() {
-        let angle = f64::from(u16::try_from(i)?).to_radians();
-        let (sin, cos) = angle.sin_cos();
-        let mut gap = f64::INFINITY;
-        for x in [0.0_f64, 4.0] {
-            for y in [-0.2_f64, 0.2] {
-                let px = x.mul_add(cos, (-y).mul_add(sin, 2.0));
-                let py = x.mul_add(sin, y * cos);
-                gap = gap.min(5.0 - px.abs()).min(5.0 - py.abs());
-            }
-        }
-        let expected = gap.max(0.0).hypot(0.025);
-        assert_eq!(
-            result.features[2] > 0,
-            expected <= 0.1,
-            "analytic rotating case {i}"
-        );
-        if result.features[2] > 0 {
-            assert!(
-                (f64::from(result.point_a[3]).sqrt() - expected).abs() < 2e-5,
-                "analytic distance case {i}: {result:?} expected {expected}"
-            );
-        }
-    }
+    check_rotations(rotating)?;
     let hits = rotating.iter().filter(|c| c.features[2] > 0).count();
     assert!(hits > 0 && hits < rotating.len());
     // Modify only the resident pose, not the mesh or bind group.
@@ -297,6 +277,33 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     Ok(())
 }
 
+fn check_rotations(rotating: &[MeshContact]) -> Result<()> {
+    for (i, result) in rotating.iter().enumerate() {
+        let angle = f64::from(u16::try_from(i)?).to_radians();
+        let (sin, cos) = angle.sin_cos();
+        let mut gap = f64::INFINITY;
+        for x in [0.0_f64, 4.0] {
+            for y in [-0.2_f64, 0.2] {
+                let px = x.mul_add(cos, (-y).mul_add(sin, 2.0));
+                let py = x.mul_add(sin, y * cos);
+                gap = gap.min(5.0 - px.abs()).min(5.0 - py.abs());
+            }
+        }
+        let expected = gap.max(0.0).hypot(0.025);
+        assert_eq!(
+            result.features[2] > 0,
+            expected <= 0.1,
+            "analytic rotating case {i}"
+        );
+        if result.features[2] > 0 {
+            assert!(
+                (f64::from(result.point_a[3]).sqrt() - expected).abs() < 2e-5,
+                "analytic distance case {i}: {result:?} expected {expected}"
+            );
+        }
+    }
+    Ok(())
+}
 fn benchmark(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

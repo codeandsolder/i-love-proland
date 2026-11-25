@@ -20,7 +20,7 @@ fn cube(half: f32) -> Geometry {
         ],
     }
 }
-pub(super) fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
     let outer = cube(2.0);
     let inner = cube(0.2);
     let disconnected = Geometry {

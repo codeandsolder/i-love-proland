@@ -53,21 +53,32 @@ impl Kernel {
         label: &str,
         buffers: &[&wgpu::Buffer],
     ) -> std::io::Result<wgpu::BindGroup> {
-        let entries = buffers
+        let numbered = buffers
             .iter()
             .enumerate()
-            .map(|(index, buffer)| {
-                Ok(wgpu::BindGroupEntry {
-                    binding: u32::try_from(index).map_err(std::io::Error::other)?,
-                    resource: buffer.as_entire_binding(),
-                })
-            })
+            .map(|(i, &buffer)| Ok((u32::try_from(i).map_err(std::io::Error::other)?, buffer)))
             .collect::<std::io::Result<Vec<_>>>()?;
-        Ok(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        Ok(self.bind_numbered(device, label, &numbered))
+    }
+
+    pub(super) fn bind_numbered(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        buffers: &[(u32, &wgpu::Buffer)],
+    ) -> wgpu::BindGroup {
+        let entries = buffers
+            .iter()
+            .map(|&(binding, buffer)| wgpu::BindGroupEntry {
+                binding,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect::<Vec<_>>();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
             layout: &self.layout,
             entries: &entries,
-        }))
+        })
     }
     pub(super) fn dispatch(
         &self,

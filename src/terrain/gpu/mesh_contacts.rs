@@ -11,7 +11,9 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use wgpu::util::DeviceExt;
+mod body_response;
 mod build;
+pub use body_response::{BodyMeshInstance, BodyMeshPoses, MeshImpact, MeshImpulses};
 mod sweep;
 mod topology;
 pub use sweep::{MeshSweeps, RigidPose, SweepPair, SweepResult, SweepSettings};
@@ -54,6 +56,9 @@ pub struct MeshContact {
     pub point_a: [f32; 4],
     /// Corresponding point on B, reserved.
     pub point_b: [f32; 4],
+    /// B-to-A unit separation normal and separation in metres. Zero
+    /// normal means coincident witnesses, not a penetration axis.
+    pub normal: [f32; 4],
     /// Authored triangle IDs on A and B, count of near pairs, status.
     /// Status flags: 1 invalid transform, 2 traversal overflow,
     /// 4 closed-shell containment, 8 unresolved containment classification.

@@ -29,7 +29,7 @@ fn run(
         .try_take()?
         .ok_or_else(|| io::Error::other("missing mesh sweep results"))?)
 }
-pub(super) fn check(device: &wgpu::Device, queue: &wgpu::Queue, panel: &Geometry) -> Result<()> {
+pub fn check(device: &wgpu::Device, queue: &wgpu::Queue, panel: &Geometry) -> Result<()> {
     let point = Geometry {
         positions: vec![[0.0; 3]],
         indices: vec![0, 0, 0],

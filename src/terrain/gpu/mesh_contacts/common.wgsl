@@ -10,6 +10,7 @@ struct Mesh { nodes:vec2<u32>, triangles:vec2<u32>, closed:u32, pad0:u32, pad1:u
 struct Contact {
     point_a:vec4<f32>,
     point_b:vec4<f32>,
+    normal:vec4<f32>,
     features:vec4<u32>,
     statistics:vec4<u32>,
 }
@@ -130,14 +131,16 @@ fn voxel_overlap(node:Node,lo:vec3<f32>,hi:vec3<f32>)->bool{
     let extent=node.hi-node.lo;
     let a=vec3<u32>(clamp(floor((lo-node.lo)/extent*4.0-0.0001),vec3<f32>(0.0),vec3<f32>(3.0)));
     let b=vec3<u32>(clamp(floor((hi-node.lo)/extent*4.0+0.0001),vec3<f32>(0.0),vec3<f32>(3.0)));
-    let bits=((1u<<(b.x-a.x+1u))-1u)<<a.x;
-    for(var z=a.z;z<=b.z;z+=1u){
-        for(var y=a.y;y<=b.y;y+=1u){
-            let row=(z%2u)*16u+y*4u;
-            if (select(node.mask_low,node.mask_high,z>=2u)&(bits<<row))!=0u{return true;}
-        }
-    }
-    return false;
+    // Generate the entire rectangular 4^3 mask with bit arithmetic.
+    // X repeats one nibble in every row, Y repeats one 16-bit slab,
+    // and Z selects the two slabs in each u32. No per-row loops.
+    let x=(((1u<<(b.x-a.x+1u))-1u)<<a.x)*0x11111111u;
+    let y_row=((1u<<(4u*(b.y-a.y+1u)))-1u)<<(4u*a.y);
+    let y=y_row|(y_row<<16u);
+    let z=((1u<<(b.z-a.z+1u))-1u)<<a.z;
+    let low=select(0u,0xffffu,(z&1u)!=0u)|select(0u,0xffff0000u,(z&2u)!=0u);
+    let high=select(0u,0xffffu,(z&4u)!=0u)|select(0u,0xffff0000u,(z&8u)!=0u);
+    return (node.mask_low&x&y&low)!=0u||(node.mask_high&x&y&high)!=0u;
 }
 fn choose(a:Contact,b:Contact)->Contact{
     var result=a;
@@ -152,7 +155,7 @@ fn choose(a:Contact,b:Contact)->Contact{
     return result;
 }
 fn empty()->Contact{
-    return Contact(vec4<f32>(0.0,0.0,0.0,FAR),vec4<f32>(0.0),vec4<u32>(0xffffffffu,0xffffffffu,0u,0u),vec4<u32>(0u));
+    return Contact(vec4<f32>(0.0,0.0,0.0,FAR),vec4<f32>(0.0),vec4<f32>(0.0),vec4<u32>(0xffffffffu,0xffffffffu,0u,0u),vec4<u32>(0u));
 }
 struct QueryFrame {
     la:mat3x3<f32>, lb:mat3x3<f32>,
@@ -198,6 +201,8 @@ fn test_triangle(ta:Triangle,wa:mat3x3<f32>,tb:Triangle,bounds:Bounds,f:QueryFra
             (w.distance2==(*r).point_a.w && (ta.id<(*r).features.x||(ta.id==(*r).features.x&&tb.id<(*r).features.y))){
             (*r).point_a=vec4<f32>(w.a+f.origin,w.distance2);
             (*r).point_b=vec4<f32>(w.b+f.origin,0.0);
+            let distance=sqrt(w.distance2);
+            (*r).normal=vec4<f32>((w.a-w.b)/max(distance,1e-20),distance);
             (*r).features.x=ta.id;
             (*r).features.y=tb.id;
         }
