@@ -1,6 +1,6 @@
 //! GPU timestamps with balanced rotating execution order.
 use super::{MeshContact, MeshQueries, Result};
-use std::{io, sync::mpsc};
+use std::sync::mpsc;
 
 const ROUNDS: usize = 8;
 const REPEATS: u32 = 8;
@@ -63,21 +63,31 @@ pub fn compare(
             .collect::<Vec<_>>()
     };
     readback.unmap();
-    summarize(entries, &times, queue.get_timestamp_period())
+    if !summarize(entries, &times, queue.get_timestamp_period()) {
+        eprintln!("MESH_GPU_BENCH invalid timestamp samples; use synchronized wall-clock fallback");
+        for (label, queries, results) in entries {
+            super::benchmark(device, queue, label, queries, results)?;
+        }
+    }
+    Ok(())
 }
 
 fn summarize(
     entries: &[(String, MeshQueries, Vec<MeshContact>)],
     times: &[u64],
     period: f32,
-) -> Result<()> {
+) -> bool {
+    let mut valid = true;
     for (i, (label, _, results)) in entries.iter().enumerate() {
         let mut samples = Vec::with_capacity(ROUNDS);
         for round in 0..ROUNDS {
             let start = (round * entries.len() + i) * 2;
-            let elapsed = times[start + 1]
+            let Some(elapsed) = times[start + 1]
                 .checked_sub(times[start])
-                .ok_or_else(|| io::Error::other("invalid GPU timestamp order"))?;
+                .filter(|&ticks| ticks != 0)
+            else {
+                continue;
+            };
             // Keep the whole native timestamp range, including long
             // batches delayed by another GPU workload.
             let bytes = elapsed.to_le_bytes();
@@ -87,11 +97,16 @@ fn summarize(
             samples.push(ticks * f64::from(period) / f64::from(REPEATS) * 1e-6);
         }
         samples.sort_by(f64::total_cmp);
+        if samples.len() < ROUNDS / 2 {
+            valid = false;
+            continue;
+        }
         println!(
-            "MESH_GPU_BENCH mode={label} pairs={} median_ms={:.6}",
+            "MESH_GPU_BENCH mode={label} pairs={} samples={} median_ms={:.6}",
             results.len(),
-            samples[ROUNDS / 2]
+            samples.len(),
+            samples[samples.len() / 2]
         );
     }
-    Ok(())
+    valid
 }
