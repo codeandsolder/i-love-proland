@@ -7,7 +7,7 @@ struct Node {
     hi:vec3<f32>, count:u32,
     escape:u32, mask_low:u32, mask_high:u32, end:u32,
 }
-struct Mesh { nodes:vec2<u32>, triangles:vec2<u32>, closed:u32, pad0:u32, solid_mask:vec2<u32> }
+struct Mesh { nodes:vec2<u32>, triangles:vec2<u32>, closed:u32, pad0:u32, solid_mask:vec2<u32>, seeds:vec2<u32> }
 struct Contact {
     point_a:vec4<f32>,
     point_b:vec4<f32>,

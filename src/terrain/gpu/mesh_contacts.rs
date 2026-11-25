@@ -118,6 +118,7 @@ struct Mesh {
     closed: u32,
     padding: u32,
     solid_mask: [u32; 2],
+    seeds: [u32; 2],
 }
 
 #[repr(C)]
