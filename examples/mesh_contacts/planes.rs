@@ -1,5 +1,5 @@
 //! Differential broad and narrow phase test with the same feature solver.
-use super::{Geometry, Matrix, Result, benchmark, cases, direct_settings, sample};
+use super::{Geometry, IDENTITY, Matrix, Result, benchmark, cases, direct_settings, sample};
 use i_love_proland::terrain::gpu::mesh_contacts::{MeshCatalog, MeshPair, Midphase};
 use wgpu::util::DeviceExt;
 
@@ -53,20 +53,85 @@ fn oblique_cases() -> Result<(Vec<Matrix>, Vec<MeshPair>)> {
     Ok((fixture.poses, fixture.pairs))
 }
 
+fn baked_oblique(frame: &Geometry) -> Geometry {
+    let (sin, cos) = 0.7_f32.sin_cos();
+    Geometry {
+        positions: frame
+            .positions
+            .iter()
+            .map(|p| [cos * p[0] - sin * p[2], p[1], sin * p[0] + cos * p[2]])
+            .collect(),
+        indices: frame.indices.clone(),
+    }
+}
+
+fn baked_cases(poses: &mut Vec<Matrix>, pairs: &mut Vec<MeshPair>) -> Result<()> {
+    let (sin, cos) = 0.7_f32.sin_cos();
+    // Author oblique triangles inside each asset, rather than simply
+    // rotating an axis-aligned mesh: local BVH bounds now overlap.
+    for i in 0..32_u16 {
+        let a = u32::try_from(poses.len())?;
+        let shift = f32::from(i) * 0.12;
+        let gap = if i % 4 == 0 { 0.05 } else { 0.25 };
+        let mut b = IDENTITY;
+        b[3] = [
+            cos.mul_add(shift, -sin * gap),
+            0.0,
+            sin.mul_add(shift, cos * gap),
+            1.0,
+        ];
+        poses.extend([IDENTITY, b]);
+        pairs.push(MeshPair {
+            meshes: [3, 3],
+            transforms: [a, a + 1],
+        });
+    }
+    Ok(())
+}
+
 pub fn check(device: &wgpu::Device, queue: &wgpu::Queue, geometry: &[Geometry]) -> Result<()> {
-    let catalog = MeshCatalog::new(
-        device,
-        &geometry.iter().map(Geometry::source).collect::<Vec<_>>(),
-    )?;
-    let (poses, pairs) = oblique_cases()?;
+    let oblique = baked_oblique(&geometry[1]);
+    let mut sources = geometry.iter().map(Geometry::source).collect::<Vec<_>>();
+    sources.push(oblique.source());
+    let catalog = MeshCatalog::new(device, &sources)?;
+    let (mut poses, mut pairs) = oblique_cases()?;
+    let original_count = pairs.len();
+    baked_cases(&mut poses, &mut pairs)?;
     let matrices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("oblique and near threshold triangles"),
         contents: bytemuck::cast_slice(&poses),
         usage: wgpu::BufferUsages::STORAGE,
     });
+    compare(
+        device,
+        queue,
+        &catalog,
+        &matrices,
+        &pairs[..original_count],
+        "mixed",
+    )?;
+    compare(
+        device,
+        queue,
+        &catalog,
+        &matrices,
+        &pairs[original_count..],
+        "baked_oblique",
+    )?;
+    Ok(())
+}
+
+fn compare(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    catalog: &MeshCatalog,
+    matrices: &wgpu::Buffer,
+    pairs: &[MeshPair],
+    label: &str,
+) -> Result<()> {
     let settings = direct_settings(Midphase::VoxelBvh);
-    let reference = catalog.reference_queries(device, &matrices, &pairs, settings)?;
-    let optimized = catalog.queries(device, &matrices, &pairs, settings)?;
+    let reference = catalog.reference_queries(device, matrices, pairs, settings)?;
+    let optimized = catalog.queries(device, matrices, pairs, settings)?;
     let a = sample(device, queue, &reference)?;
     let b = sample(device, queue, &optimized)?;
     for (i, (a, b)) in a.iter().zip(&b).enumerate() {
@@ -79,10 +144,22 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue, geometry: &[Geometry]) 
         assert_eq!(a.normal, b.normal, "plane rejection normal {i}");
         assert!(b.statistics[1] <= a.statistics[1]);
     }
-    benchmark(device, queue, "plane_reference", &reference, &a)?;
-    benchmark(device, queue, "plane_filtered", &optimized, &b)?;
+    benchmark(
+        device,
+        queue,
+        &format!("{label}_plane_reference"),
+        &reference,
+        &a,
+    )?;
+    benchmark(
+        device,
+        queue,
+        &format!("{label}_plane_filtered"),
+        &optimized,
+        &b,
+    )?;
     println!(
-        "MESH_PLANES cases={} exact_features_and_witnesses=true",
+        "MESH_PLANES workload={label} cases={} exact_features_and_witnesses=true",
         pairs.len()
     );
     Ok(())
