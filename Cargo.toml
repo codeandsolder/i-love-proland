@@ -13,7 +13,7 @@ categories = ["game-development", "graphics", "algorithms"]
 [dependencies]
 lorax-rs = { git = "https://github.com/codeandsolder/lorax-rs", rev = "a20e2b5058dc88524131aeb68d609e6a4194936e" }
 bytemuck = { version = "1.23", features = ["derive"], optional = true }
-wgpu = { version = "30.0.2", optional = true }
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "wgsl", "vulkan", "parking_lot"], optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
